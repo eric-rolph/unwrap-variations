@@ -693,6 +693,14 @@ def test_every_chart_is_a_disk(name, threshold):
         "%s: module counted %d charts, independent count found %d"
         % (name, report.charts, len(chis))
     )
+    # ORGANIC.md section 0.6 hardened the disk definition after a bowtie was
+    # found passing ``chi == 1`` with a single boundary cycle.  Requiring
+    # exactly one boundary loop as well is cheap and closes that door.
+    topology = seams.cut_topology(sample, mask)
+    assert (topology.chart_loops == 1).all(), (
+        "%s @ %g: boundary loop counts %s -- a disk has exactly one"
+        % (name, threshold, topology.chart_loops.tolist())
+    )
 
 
 @pytest.mark.parametrize("name", sorted(SHAPES))
@@ -718,6 +726,35 @@ def test_boundary_edges_are_never_seams(name):
     assert not (mask & rim).any(), (
         "%s marked %d boundary edges as seams" % (name, int((mask & rim).sum()))
     )
+
+
+def test_the_disk_oracle_has_teeth():
+    """The Euler count must FAIL on cuts that are not disks, or it proves nothing.
+
+    Four uncut shapes and one real bad cut, all of which it has to reject:
+    a sphere reads ``chi = 2``, a torus, an annulus and an open tube read
+    ``0``, and ``SHARP`` on a capped cylinder reads ``[0, 1, 1]`` -- two caps
+    that came off cleanly and a **tube that was never opened**.  That last one
+    is docs/BENCHMARKS.md section 4.3 reproduced here from first principles:
+    64 rim seams, none lengthwise, an annulus handed to a solver that reports
+    ``{'FINISHED'}`` and returns L2 stretch 30.6.
+    """
+    for name in ("uv_sphere", "torus", "annulus", "open_tube"):
+        sample = SHAPES[name]
+        chis = chart_euler(sample, np.zeros(sample.n_edges, dtype=bool))
+        assert not all(c == 1 for c in chis), (
+            "%s uncut reported every chart as a disk: %s" % (name, chis)
+        )
+
+    cylinder = capped_cylinder(seg=24, rings=3)
+    sharp = compute_seams(cylinder, "SHARP", angle_deg=30.0)
+    assert sharp.any(), "SHARP found no rim on a capped cylinder"
+    chis = chart_euler(cylinder, sharp)
+    assert sorted(chis) == [0, 1, 1], (
+        "expected two disk caps and one un-opened tube from SHARP, got %s" % chis
+    )
+    # And the strategy under test opens the same mesh properly.
+    assert_all_disks(cylinder, compute_seams(cylinder, "CONCAVE"), "capped_cylinder")
 
 
 def test_a_disk_is_left_completely_uncut():

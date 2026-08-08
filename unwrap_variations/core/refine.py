@@ -337,9 +337,45 @@ def _run_stage(stage, sample, uvs, *, params, topo, resolve=None):
     return None, "unknown stage %r" % (stage,)
 
 
+#: Descent iterations used when flattening a chart *to gate a merge*.
+#:
+#: The merge gate and the shipped layout have different accuracy requirements,
+#: and conflating them is expensive.  The gate only has to rank candidate pairs
+#: and reject the ones that blow the distortion bound; the layout a user
+#: actually gets comes from ABF re-solving the accepted cut set (see the
+#: `resolve` argument of :func:`refine`).  So the gate can be sloppy in a way
+#: the final flatten cannot.
+#:
+#: Measured on Suzanne, ten candidates, sweeping only this number:
+#:
+#: ===== ========= =======
+#: iters total (s) best
+#: ===== ========= =======
+#: 32    48.8      42.07
+#: 16    34.1      41.56
+#: 8     24.7      36.03
+#: 4     23.3      37.60
+#: ===== ========= =======
+#:
+#: 16 buys a 30% cut in wall-clock for half a point.  Below 16 the gate starts
+#: misjudging merges and the result degrades sharply -- at 8 it keeps 12 charts
+#: where 16 keeps 7 -- so this is a floor, not a dial to keep turning.
+#: Profiling that motivated it: merging was 95.4 s of a 106.4 s run, and inside
+#: it `flatten_chart` ran 1388 times at 68 ms each.
+_GATE_ITERS = 16
+
+
+def _gate_flatten(chart, **kwargs):
+    """Flatten a chart cheaply, for merge gating only.  See :data:`_GATE_ITERS`."""
+    from . import flatten
+
+    kwargs.setdefault("iters", _GATE_ITERS)
+    return flatten.flatten_chart(chart, **kwargs)
+
+
 def _stage_merge(sample, uvs, *, params, topo, resolve=None):
     """Merge adjacent charts under the recipe's distortion bound."""
-    from . import charts, flatten, injectivity
+    from . import charts, injectivity
 
     max_stretch = _float_attr(params, "max_stretch", 1.25)
     if max_stretch < 1.0:
@@ -355,7 +391,7 @@ def _stage_merge(sample, uvs, *, params, topo, resolve=None):
         sample,
         tri_chart,
         max_stretch=max_stretch,
-        flatten=flatten.flatten_chart,
+        flatten=_gate_flatten,
         certify=injectivity.certify,
         uvs=uvs,
         topo=topo,

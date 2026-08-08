@@ -1307,11 +1307,12 @@ def cut_topology(
         loop_of_vertex = np.full(n_sides, -1, dtype=np.int64)
         loop_of_vertex[touched] = remap[broot[touched]]
         corner_loop = loop_of_vertex[croot]
+        # A boundary component never spans two charts -- cut-vertices only weld
+        # across glued sides, which are intra-chart by construction -- so one
+        # representative per label is enough to say which chart owns each loop.
+        first = np.unique(loop_of_vertex[touched], return_index=True)[1]
         chart_loops = np.bincount(
-            tri_chart[touched // 3][loop_of_vertex[touched] >= 0][
-                np.unique(loop_of_vertex[touched], return_index=True)[1]
-            ],
-            minlength=n_charts,
+            tri_chart[touched[first] // 3], minlength=n_charts
         ).astype(np.int64)
 
     # -- Euler characteristic per chart --------------------------------------
@@ -2169,10 +2170,16 @@ def concave_seams(
 
     Args:
         sample: The mesh to cut.
-        curvature_threshold: Escalation sensitivity.  Multiplied by ``pi`` to
-            give the per-vertex angle-defect threshold in radians, so the
-            default ``0.35`` fires at roughly 63 degrees of defect -- a cube
-            corner (90) escalates, a smooth sphere vertex (1.5) does not.
+        curvature_threshold: Escalation sensitivity, and the only "how many
+            islands" dial this strategy has.  **Lower cuts more.**  It sets
+            three things at once: the per-vertex cone threshold
+            (``threshold * pi`` radians, so the default 0.35 fires at about 63
+            degrees of angle defect -- a cube corner at 90 escalates, a smooth
+            sphere vertex at 1.5 does not), the per-chart curvature budget
+            (``threshold * 4 pi``), and the share of ``max_extra_cuts`` the
+            escalation may spend.  The last of those exists because the first
+            two alone leave the dial inert on a high-curvature mesh; see
+            :meth:`_ConcaveCutter.run`.
         seed: Rotates the source among a closed shell's sharpest few curvature
             extremes, so different grid candidates get different valid cuts.
         bias: Concavity preference strength; see :func:`concavity_weights`.

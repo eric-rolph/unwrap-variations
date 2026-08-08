@@ -666,7 +666,28 @@ class TestScreening:
         )
         assert report.changed
         assert 5 in seen, "screening must ask for the cheap budget"
-        assert None in seen, "an accepted merge must be re-flattened at full quality"
+        assert None in seen, "a surviving chart must be re-flattened at full quality"
+
+    def test_full_quality_polish_runs_once_per_surviving_chart(self):
+        """Not once per accepted merge -- that work is thrown away by the next one.
+
+        Three charts collapsing to one is two merges but only one surviving
+        chart, so exactly one full-quality solve is owed.
+        """
+        full = []
+
+        def recording(chart, *, iters=None):
+            if iters is None:
+                full.append(chart.n_tris)
+            return plane_flatten(chart)
+
+        sample = quad_grid(3, 2)
+        labels = np.repeat(np.arange(3, dtype=np.int64), 4)
+        _, report = merge_charts(sample, labels, flatten=recording, screen_iters=5)
+        assert len(report.steps) == 2
+        assert report.chart_count_after == 1
+        assert len(full) == 1
+        assert full[0] == sample.n_tris, "the polish must be of the *final* union"
 
     def test_the_default_budget_tracks_the_flatteners_own(self, monkeypatch):
         """A pinned constant already went stale here once, silently.

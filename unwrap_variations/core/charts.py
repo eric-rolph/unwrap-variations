@@ -41,8 +41,9 @@ Measured on Suzanne
 -------------------
 
 Blender 5.1.2 and 4.5.4, ``--factory-startup``, ``generate(count=10, seed=1)``,
-``balanced`` scorer, ``max_stretch=1.25``.  Identical to four decimal places on
-both versions:
+``balanced`` scorer, ``max_stretch=1.25``, taken against the layout the backend
+produced at the time (score 23.189).  Identical to four decimal places on both
+versions:
 
 ===========================  ======  =========  ==========  =======  =======
 layout                       score   seam_ratio  stretch_l2  overlap  islands
@@ -1471,7 +1472,8 @@ class MergeReport:
         rejected_stretch: Candidates refused for exceeding ``max_stretch``.
         rejected_injectivity: Candidates refused by certification.
         rejected_flatten: Candidates the flattener could not solve.
-        rejected_gain: Candidates whose shared boundary was not worth taking.
+        rejected_gain: Adjacent pairs never entered on the queue because their
+            shared boundary did not exceed ``min_gain``.
         out_of_time: Candidate pairs left unscreened because ``time_budget``
             ran out.  Non-zero means the merge is a prefix of what an unbudgeted
             run would have found, never that it took a shortcut on a gate.
@@ -1912,23 +1914,35 @@ def _greedy_merge(
         added = max(hit.stretch - baseline(a, b), 0.0)
         return hit, shared[a].get(b, 0.0) / max(added, _DISTORTION_EPS)
 
-    def finalise(a: int, b: int, screened: _Candidate) -> _Candidate:
-        """Re-flatten an accepted merge at full quality before its UVs are used.
+    def finalise(chart: int, screened: _Candidate) -> _Candidate:
+        """Re-flatten a *surviving* merged chart at full quality.
+
+        Done once per chart at the end of the run rather than once per accepted
+        merge, because a chart that merges again throws its predecessor's
+        polish away: on a 121-chart Suzanne candidate that was 102 full-quality
+        solves of which 6 survived, and at ~250 ms each it was most of the
+        stage's cost.
 
         More descent can only lower the energy, so the full result is normally
-        both less distorted and still certified.  If it somehow is not -- or if
-        the time budget has run out -- the screened layout is kept: it already
-        passed every gate, and a certified more-distorted chart beats an
-        uncertified less-distorted one.
+        both less distorted and still certified.  If it is not -- or if the time
+        budget has run out -- the screened layout is kept: it already passed
+        every gate, and a certified more-distorted chart beats an uncertified
+        less-distorted one.
         """
         if screen_iters is None:
             return screened
         if deadline is not None and time.perf_counter() >= deadline:
-            # Past the deadline nothing new is flattened, polish included.  A
-            # budget that only stopped screening would still pay a full solve
-            # per accepted merge and overshoot by several seconds.
             return screened
-        final = measure(a, b, None)
+        key = (members[chart], None)
+        final = cache.get(key)
+        if final is None:
+            mask = np.zeros(sample.n_tris, dtype=bool)
+            mask[tri_of[chart]] = True
+            report.flatten_calls += 1
+            final = _measure_union(
+                sample, mask, solver, certifier, max_stretch, "final%d" % chart
+            )
+            cache[key] = final
         if final.ok and final.uv is not None:
             return final
         return screened
@@ -1975,8 +1989,12 @@ def _greedy_merge(
 
     for a in range(k):
         for b, length in shared[a].items():
-            if b > a and length > min_gain:
+            if b <= a:
+                continue
+            if length > min_gain:
                 heapq.heappush(pending, (-length, *stamp(a, b)))
+            else:
+                report.rejected_gain += 1
 
     steps: list[MergeStep] = []
     seam_left = graph.seam_length
@@ -2020,10 +2038,9 @@ def _greedy_merge(
 
         neg_ratio, a, b, _, _ = heapq.heappop(ready)
         length = shared[a].get(b, 0.0)
-        screened = cache[(tuple(sorted(members[a] + members[b])), screen_iters)]
-        if not screened.ok:  # pragma: no cover - defensive
+        candidate = cache[(tuple(sorted(members[a] + members[b])), screen_iters)]
+        if not candidate.ok:  # pragma: no cover - defensive
             continue
-        candidate = finalise(a, b, screened)
 
         before = baseline(a, b)
         seam_left -= length
@@ -2069,6 +2086,22 @@ def _greedy_merge(
 
         if max_merges is not None and len(steps) >= int(max_merges):
             break
+
+    # Polish, once per surviving chart.  See finalise() for why this is here and
+    # not in the accept path.  ``max_stretch_seen`` is then restated over the
+    # layouts that actually ship: the per-step figures stay as the screening
+    # measurements the gate ruled on, which are upper bounds on these.
+    for chart in list(accepted):
+        accepted[chart] = finalise(chart, accepted[chart])
+    if accepted:
+        report.max_stretch_seen = max(
+            1.0,
+            max(
+                float(c.stretch)
+                for c in accepted.values()
+                if math.isfinite(c.stretch)
+            ),
+        )
 
     return labels, steps, accepted
 

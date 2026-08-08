@@ -477,10 +477,20 @@ ARCHETYPES: tuple[dict[str, Any], ...] = (
     # would, so it is the natural counterpart to the chart cuts above -- those
     # open a closed mesh too, but land their seams on cube-map boundaries in
     # the middle of a face (BENCHMARKS.md section 4.4).
+    #
+    # The threshold is 0.15 and not the field default of 0.35 because it was
+    # measured, one recipe at a time on Blender 5.1.2 with refinement off:
+    # Suzanne 41.19 against 35.40, cone 63.38 against 49.31, cube 73.48 against
+    # 73.47, at the cost of sphere 62.58 against 68.45 and torus 52.26 against
+    # 59.45.  It has the higher mean and, more to the point, the higher
+    # *minimum* -- the top of the range is where this strategy gets dangerous
+    # (0.90 cuts Suzanne into 5 charts for a stretch of 5.25 and a score of
+    # 0.55), and a pinned archetype should not sit near that edge.  The grid
+    # samples the rest of the range itself.
     {
         "method": "ANGLE_BASED",
         "seam_strategy": "CONCAVE",
-        "curvature_threshold": 0.35,
+        "curvature_threshold": 0.15,
         "island_margin": 0.01,
     },
     # The cube-map charts relaxed for stretch: best texel-density uniformity.

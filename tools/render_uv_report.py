@@ -290,7 +290,19 @@ def overlapping_triangles(tri_uv: np.ndarray, *, cells: int = 128) -> np.ndarray
 
 
 def _clip_area(a: np.ndarray, b: np.ndarray) -> float:
-    """Return the exact intersection area of two UV triangles, both re-wound CCW."""
+    """Return the exact intersection area of two UV triangles, both re-wound CCW.
+
+    The zero-area guard is not defensive padding.  A collapsed clip triangle has
+    zero-length edges, and a zero-length edge's half-plane test is vacuously
+    true, so Sutherland-Hodgman clips *nothing* and hands back the subject
+    triangle's entire area -- reporting a pair that does not overlap at all as
+    fully overlapping.  The same bug was found and fixed in
+    ``tests/reference.py``.  It matters most on ``pinched``, whose whole purpose
+    is to carry exactly zero-area faces: without this guard that mesh renders as
+    a field of false red.
+    """
+    if _abs_area(a) <= 0.0 or _abs_area(b) <= 0.0:
+        return 0.0
     a = _ccw(a)
     b = _ccw(b)
     poly = [tuple(p) for p in a]
@@ -321,12 +333,22 @@ def _clip_area(a: np.ndarray, b: np.ndarray) -> float:
     return abs(total) * 0.5
 
 
+def _abs_area(tri: np.ndarray) -> float:
+    """Return the absolute UV area of a triangle."""
+    return abs(_signed_area(tri))
+
+
+def _signed_area(tri: np.ndarray) -> float:
+    """Return the signed UV area of a triangle; negative means clockwise."""
+    return 0.5 * float(
+        (tri[1][0] - tri[0][0]) * (tri[2][1] - tri[0][1])
+        - (tri[1][1] - tri[0][1]) * (tri[2][0] - tri[0][0])
+    )
+
+
 def _ccw(tri: np.ndarray) -> np.ndarray:
     """Return the triangle wound counter-clockwise."""
-    area = (tri[1][0] - tri[0][0]) * (tri[2][1] - tri[0][1]) - (tri[1][1] - tri[0][1]) * (
-        tri[2][0] - tri[0][0]
-    )
-    return tri if area >= 0 else np.asarray([tri[0], tri[2], tri[1]])
+    return tri if _signed_area(tri) >= 0.0 else np.asarray([tri[0], tri[2], tri[1]])
 
 
 def island_labels(sample) -> np.ndarray:

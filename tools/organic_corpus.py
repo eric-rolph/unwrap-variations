@@ -308,6 +308,15 @@ class CorpusMesh:
         invariants: Measured at build time and checked against
             :data:`EXPECTED`.
         source: ``"numpy"`` or ``"blender"``.
+        faces: The mesh's **original** polygons as a list of vertex-index
+            tuples, when it has any that are not already triangles.  Suzanne is
+            a quad mesh; rebuilding her from ``tris`` would hand Blender a
+            968-face triangle soup with 1473 edges in place of a 500-face quad
+            mesh with 1005, and every seam, chart and packing decision would
+            differ.  The resulting ``suzanne`` row would then quietly mean
+            something other than every other Suzanne number in the repository,
+            including all of ORGANIC.md section 0.  ``None`` when the mesh is
+            genuinely triangles, which is every procedural entry.
     """
 
     name: str
@@ -317,6 +326,7 @@ class CorpusMesh:
     uvs: np.ndarray | None
     invariants: Invariants
     source: str
+    faces: list | None = None
 
     @property
     def n_tris(self) -> int:
@@ -768,7 +778,7 @@ def _rotation_minimising_frame(points: np.ndarray) -> tuple[np.ndarray, np.ndarr
 # ---------------------------------------------------------------------------
 
 
-def _build_blob_limbs() -> tuple[np.ndarray, np.ndarray, None]:
+def _build_blob_limbs() -> tuple:
     """Metaball creature: a body with five clearly separated protruding limbs.
 
     Each limb is a capsule metaball whose axis runs outward from inside the
@@ -786,10 +796,10 @@ def _build_blob_limbs() -> tuple[np.ndarray, np.ndarray, None]:
     ]
     field = _blob_field(balls)
     verts, tris = _marching_tets(field, (-1.7, -1.7, -1.1), (1.7, 1.7, 1.1), 26, 0.14)
-    return verts, tris, None
+    return verts, tris, None, None
 
 
-def _build_hand() -> tuple[np.ndarray, np.ndarray, None]:
+def _build_hand() -> tuple:
     """Palm plus five fingers whose charts collide in UV even when each is fine.
 
     The fingers sit 0.30 apart with an effective surface radius of 0.116, so the
@@ -816,10 +826,10 @@ def _build_hand() -> tuple[np.ndarray, np.ndarray, None]:
     verts, tris = _marching_tets(
         field, (-1.45, -1.15, -0.80), (1.20, 1.30, 0.80), (32, 32, 16), 0.22
     )
-    return verts, tris, None
+    return verts, tris, None, None
 
 
-def _build_displaced_sphere() -> tuple[np.ndarray, np.ndarray, None]:
+def _build_displaced_sphere() -> tuple:
     """Closed genus 0 with a smooth radial displacement and no sharp edge.
 
     ``SHARP`` seam selection at 30 degrees finds **nothing** here, which is the
@@ -830,10 +840,10 @@ def _build_displaced_sphere() -> tuple[np.ndarray, np.ndarray, None]:
     unit, tris = _icosphere(3)
     displace = _band_limited_bumps(_fibonacci_directions(7), 7)
     radius = 1.0 + 0.24 * displace(unit)
-    return unit * radius[:, None], tris, None
+    return unit * radius[:, None], tris, None, None
 
 
-def _build_torus_knot() -> tuple[np.ndarray, np.ndarray, None]:
+def _build_torus_knot() -> tuple:
     """A (2, 3) torus knot swept with an organic, varying cross-section.
 
     A tube around any closed space curve is topologically a torus: genus 1,
@@ -855,7 +865,7 @@ def _build_torus_knot() -> tuple[np.ndarray, np.ndarray, None]:
         + 0.72 * np.sin(phi)[None, :, None] * binormal[:, None, :]
     )
     verts = (curve[:, None, :] + thickness[:, None, None] * ring).reshape(-1, 3)
-    return verts, _grid_tris(n_ring, n_side, wrap_u=True, wrap_v=True), None
+    return verts, _grid_tris(n_ring, n_side, wrap_u=True, wrap_v=True), None, None
 
 
 #: The ``folded_ribbon`` grid, as ``(along, across)`` vertex counts.  Exposed
@@ -894,7 +904,7 @@ def folded_ribbon_flat_uvs() -> np.ndarray:
     return uv[_grid_tris(n_u, n_v, wrap_u=False, wrap_v=False)]
 
 
-def _build_folded_ribbon() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _build_folded_ribbon() -> tuple:
     """A ribbon shipping a locally injective, globally non-injective UV layout.
 
     ORGANIC.md section 0.3 is the most consequential fact in the contract:
@@ -958,7 +968,7 @@ def _build_folded_ribbon() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
     corner_uv = uv[tris]  # (T, 3, 2)
     _assert_ribbon_defect(corner_uv, 2.0 * math.pi * b, 2.0 * half_w)
-    return verts, tris, corner_uv
+    return verts, tris, corner_uv, None
 
 
 def _assert_ribbon_defect(corner_uv: np.ndarray, pitch: float, width: float) -> None:
@@ -981,7 +991,7 @@ def _assert_ribbon_defect(corner_uv: np.ndarray, pitch: float, width: float) -> 
         )
 
 
-def _build_pinched() -> tuple[np.ndarray, np.ndarray, None]:
+def _build_pinched() -> tuple:
     """A blob deliberately damaged with zero-area faces and coincident vertices.
 
     Three distinct kinds of damage, because they fail differently:
@@ -1013,16 +1023,23 @@ def _build_pinched() -> tuple[np.ndarray, np.ndarray, None]:
 
     # 3. A duplicate position with a distinct index.
     verts[int(tris[40, 0])] = verts[int(tris[41, 1])]
-    return verts, tris, None
+    return verts, tris, None, None
 
 
-def _build_suzanne(subdivisions: int) -> tuple[np.ndarray, np.ndarray, None]:
+def _build_suzanne(subdivisions: int) -> tuple:
     """Return Suzanne, optionally Catmull-Clark subdivided, as triangle arrays.
 
     Blender's own asset, so this is the one entry that cannot be procedural.
     Subdivision is applied with a real ``SUBSURF`` modifier and evaluated, then
     triangulated through ``calc_loop_triangles`` -- the same path
-    ``core/bridge.py`` uses, so the arrays here match what the engine will see.
+    ``core/bridge.py`` uses, so the triangle arrays here match what the
+    evaluator will see.
+
+    The **quad** faces are returned alongside them, and they are what
+    :func:`to_object` rebuilds from.  Suzanne is a 500-face quad mesh; handing
+    Blender the 968-triangle soup instead changes the edge count from 1005 to
+    1473 and with it every seam, chart and packing decision, so the two are not
+    the same benchmark subject even though they are the same surface.
     """
     import bpy  # noqa: PLC0415 -- optional; the numpy corpus must import cleanly
 
@@ -1040,7 +1057,13 @@ def _build_suzanne(subdivisions: int) -> tuple[np.ndarray, np.ndarray, None]:
     mesh.vertices.foreach_get("co", verts)
     tris = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int32)
     mesh.loop_triangles.foreach_get("vertices", tris)
-    return verts.reshape(-1, 3).astype(np.float64), tris.reshape(-1, 3).astype(np.int64), None
+    faces = [tuple(int(v) for v in poly.vertices) for poly in mesh.polygons]
+    return (
+        verts.reshape(-1, 3).astype(np.float64),
+        tris.reshape(-1, 3).astype(np.int64),
+        None,
+        faces,
+    )
 
 
 _BUILDERS = {
@@ -1089,7 +1112,7 @@ def build(name: str, *, strict: bool = True) -> CorpusMesh:
     """
     if name not in _BUILDERS:
         raise KeyError("unknown corpus mesh %r; known: %s" % (name, ", ".join(NAMES)))
-    verts, tris, uvs = _BUILDERS[name]()
+    verts, tris, uvs, faces = _BUILDERS[name]()
     verts = np.ascontiguousarray(verts, dtype=np.float64)
     tris = np.ascontiguousarray(tris, dtype=np.int32).reshape(-1, 3)
     inv = invariants_of(verts, tris)
@@ -1107,6 +1130,7 @@ def build(name: str, *, strict: bool = True) -> CorpusMesh:
         uvs=None if uvs is None else np.ascontiguousarray(uvs, dtype=np.float64),
         invariants=inv,
         source="blender" if name in BLENDER_NAMES else "numpy",
+        faces=faces,
     )
 
 
@@ -1166,8 +1190,12 @@ def to_object(mesh: CorpusMesh, *, name: str | None = None):
 
     The mesh is built with :meth:`bpy.types.Mesh.from_pydata` from the corpus's
     own arrays rather than by re-running an operator, so what Blender unwraps is
-    byte-for-byte what the invariants were measured on.  A UV layer always
-    exists afterwards, carrying the corpus layout when there is one.
+    byte-for-byte what the invariants were measured on.  When the entry carries
+    original polygons (Suzanne does) those are used instead of the triangle
+    soup, because a quad mesh and its triangulation are different benchmark
+    subjects -- different edge counts, different charts, different packing.  A
+    UV layer always exists afterwards, carrying the corpus layout when there is
+    one.
 
     Args:
         mesh: The corpus mesh to instantiate.
@@ -1180,7 +1208,8 @@ def to_object(mesh: CorpusMesh, *, name: str | None = None):
 
     obj_name = name or mesh.name
     data = bpy.data.meshes.new(obj_name)
-    data.from_pydata(mesh.verts.tolist(), [], mesh.tris.tolist())
+    faces = mesh.faces if mesh.faces else mesh.tris.tolist()
+    data.from_pydata(mesh.verts.tolist(), [], faces)
     data.update()
     obj = bpy.data.objects.new(obj_name, data)
     bpy.context.collection.objects.link(obj)

@@ -138,12 +138,17 @@ def _clear_scene() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _signed_area(tri: np.ndarray) -> float:
+    """Return the signed UV area of a triangle; negative means clockwise."""
+    return 0.5 * float(
+        (tri[1][0] - tri[0][0]) * (tri[2][1] - tri[0][1])
+        - (tri[1][1] - tri[0][1]) * (tri[2][0] - tri[0][0])
+    )
+
+
 def _ccw(tri: np.ndarray) -> np.ndarray:
     """Return the triangle wound counter-clockwise."""
-    a = (tri[1][0] - tri[0][0]) * (tri[2][1] - tri[0][1]) - (tri[1][1] - tri[0][1]) * (
-        tri[2][0] - tri[0][0]
-    )
-    return tri if a >= 0 else np.array([tri[0], tri[2], tri[1]])
+    return tri if _signed_area(tri) >= 0.0 else np.array([tri[0], tri[2], tri[1]])
 
 
 def clip_area(a: np.ndarray, b: np.ndarray) -> float:
@@ -159,9 +164,21 @@ def clip_area(a: np.ndarray, b: np.ndarray) -> float:
     zero** -- a false clean bill of health on the single most consequential
     measurement in the contract.  :func:`monte_carlo_area` exists to make sure
     that can never happen silently again.
+
+    The zero-area guard is the same clipper's other failure mode, and it fails
+    the opposite way.  A collapsed clip triangle has zero-length edges, and a
+    zero-length edge's half-plane test is vacuously true, so the routine clips
+    *nothing* and returns the subject triangle's whole area for a pair that does
+    not overlap at all.  ``tests/reference.py`` carried that bug too.  It bites
+    hardest on the ``pinched`` corpus mesh, which exists precisely to carry
+    exactly zero-area faces.
     """
-    a = _ccw(np.asarray(a, dtype=np.float64))
-    b = _ccw(np.asarray(b, dtype=np.float64))
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    if _signed_area(a) == 0.0 or _signed_area(b) == 0.0:
+        return 0.0
+    a = _ccw(a)
+    b = _ccw(b)
     poly = [tuple(p) for p in a]
     for i in range(3):
         p0, p1 = b[i], b[(i + 1) % 3]

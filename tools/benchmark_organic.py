@@ -521,7 +521,15 @@ def main() -> int:
     say("  after  root %s  engine.py %s" % (after.root, after.engine_hash))
     if before is not None:
         say("  before root %s  engine.py %s" % (before.root, before.engine_hash))
-        say("  before package resolved to %s" % before.package_file())
+        # Resolve each root for real before reporting it.  Reading
+        # `sys.modules` without activating first prints whichever package
+        # happens to be loaded -- which is the after one, so the line would
+        # claim the before column was measuring the current code.  A provenance
+        # line that can be wrong is worse than no provenance line.
+        before.activate()
+        say("  before package resolves to %s" % before.package_file())
+        after.activate()
+        say("  after  package resolves to %s" % after.package_file())
         if before.engine_hash == after.engine_hash:
             say("  WARNING: identical engine.py in both roots -- the before column is")
             say("           measuring the same code and cannot show an improvement.")
