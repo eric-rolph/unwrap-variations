@@ -569,7 +569,7 @@ ARCHETYPES: tuple[dict[str, Any], ...] = (
 #: handful that carry the common cases are pinned to the front and only the tail
 #: is shuffled.  Measured across seeds 1, 2, 7 and 42 the winner is the same
 #: recipe on every mesh with this in place.
-_ARCHETYPE_CORE = 6
+_ARCHETYPE_CORE = 7
 
 #: Cluster counts and solvers the grid's quasi-random fill draws chart cuts
 #: from.  Kept separate from :data:`ARCHETYPES` because these exist to fill
@@ -670,9 +670,22 @@ def sample_grid(
 
     # Pin the leading archetypes so the grid's coverage does not depend on the
     # seed, and shuffle only the tail.  See _ARCHETYPE_CORE.
-    # Never pin more than two thirds of the slots, so a small grid still gets
-    # variety and a seed still means something.
-    core = min(_ARCHETYPE_CORE, max(1, (count * 2) // 3), len(ARCHETYPES))
+    # Never pin more than three quarters of the slots, so a small grid still
+    # gets variety and a seed still means something.
+    #
+    # This was two thirds, which capped a 10-slot grid at six pinned entries and
+    # left CONCAVE -- the organic-mesh strategy, at index 6 -- in the shuffled
+    # tail.  It then appeared in only 13 of 30 seeds, which made the flagship
+    # result partly luck.  Measured on Suzanne over seeds 1, 2, 3, 7 and 42,
+    # refinement on, Blender 5.1.2:
+    #
+    #   two thirds (CONCAVE unpinned): median 46.28, min 38.45, spread 10.00
+    #   three quarters (CONCAVE pinned): median 46.49, min 43.13, spread 5.32
+    #
+    # Same median, but the floor rises nearly five points and the spread halves.
+    # A user pressing Generate should not get 38 or 48 depending on a seed they
+    # never chose, so this trades a lucky maximum for a dependable one.
+    core = min(_ARCHETYPE_CORE, max(1, (count * 3) // 4), len(ARCHETYPES))
     order = list(range(core))
     tail = list(range(core, len(ARCHETYPES)))
     if seed:

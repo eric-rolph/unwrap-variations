@@ -1041,3 +1041,174 @@ def test_many_charts_within_budget(inj):
     elapsed = time.perf_counter() - started
     assert crossings == 0
     assert elapsed < PERF_BUDGET_S, "%d segments took %.3f s" % (uv.shape[0], elapsed)
+
+
+# ---------------------------------------------------------------------------
+# Critic regressions: three ways the certificate said "proved" and was wrong.
+# ---------------------------------------------------------------------------
+
+
+def make_branched_cover(half: int = 6, wraps: int = 2):
+    """Return a fan whose rim traces the *same* convex polygon ``wraps`` times.
+
+    The construction is the sharpest counterexample the module has to survive,
+    because it clears every condition except the one it was missing:
+
+    * all ``half * wraps`` triangles are positively oriented, so ``flipped`` is 0;
+    * ``chi = V - E + F = (n + 1) - 2n + n = 1``;
+    * the rim is a single boundary cycle;
+    * every rim vertex is a **distinct mesh vertex**, so nothing welds and no
+      welded vertex repeats -- the bowtie test cannot see it;
+    * the second wrap reuses the first wrap's coordinates *bit for bit*, so
+      every boundary segment of the second wrap is exactly collinear with one of
+      the first and no pair crosses transversally.
+
+    And the map is exactly ``wraps``-to-one over the whole polygon.  Only
+    "the boundary revisits a UV point" catches it, which is why
+    ``_chart_topology`` tests positions and not just welded vertices.
+    """
+    hexagon = [(4.0, 0.0), (2.0, 3.0), (-2.0, 3.0), (-4.0, 0.0), (-2.0, -3.0), (2.0, -3.0)]
+    hexagon = hexagon[:half] if half <= 6 else hexagon
+    half = len(hexagon)
+    rim = half * wraps
+    uvs = [(0.0, 0.0)] + [hexagon[k % half] for k in range(rim)]
+    tri_loops = [(0, 1 + k, 1 + (k + 1) % rim) for k in range(rim)]
+    n_loops = len(uvs)
+    return make_sample(
+        verts=np.stack(
+            [np.arange(n_loops, dtype=np.float64), np.zeros(n_loops), np.zeros(n_loops)],
+            axis=1,
+        ),
+        tri_verts=np.asarray(tri_loops, dtype=np.int64),
+        tri_loops=np.asarray(tri_loops, dtype=np.int64),
+        uvs=np.asarray(uvs, dtype=np.float64),
+        edge_verts=np.asarray([(0, 1)], dtype=np.int64),
+        edge_seam=np.zeros(1, dtype=bool),
+        loop_verts=np.arange(n_loops, dtype=np.int64),
+        name="branched_cover",
+    )
+
+
+@pytest.mark.parametrize("compute_overlap", [True, False])
+def test_branched_cover_is_never_certified(inj, compute_overlap):
+    """A two-to-one branched cover must never be certified, overlap or not.
+
+    Regression.  ``globally_injective`` used to be True with
+    ``compute_overlap=False`` -- the configuration the module's own docstring
+    called "still exact for a single disk chart" -- because a fan wrapping the
+    same hexagon twice has no flips, ``chi = 1``, one boundary loop, no repeated
+    *welded* vertex and, since the second wrap is bit-identical to the first, no
+    transversal crossing anywhere.  With ``compute_overlap=True`` only the
+    evaluator's area measurement stood between it and a certificate, and that
+    measurement is not always available (see the module docstring).  The disk
+    test now refuses it on its own.
+    """
+    sample = make_branched_cover()
+    report = inj.certify(sample, compute_overlap=compute_overlap)
+    assert report.flipped == 0
+    assert report.boundary_crossings == 0, "the two wraps are exactly collinear"
+    assert report.non_disk_charts == 1, "a doubly traced boundary is not simple"
+    assert report.globally_injective is False
+    naive = ref.naive_certify(sample, do_overlap=compute_overlap)
+    assert naive["non_disk_charts"] == report.non_disk_charts
+    assert naive["globally_injective"] is report.globally_injective
+
+
+def test_branched_cover_boundary_is_not_simple_but_never_crosses(inj):
+    """Pin *why* it is refused: zero crossings, one loop, repeated positions."""
+    sample = make_branched_cover()
+    loops = inj.boundary_loops(sample)
+    assert len(loops) == 1
+    assert inj.boundary_crossings(sample.uvs, loops) == 0
+    points = np.asarray(sample.uvs, dtype=np.float64)[np.asarray(loops[0])]
+    assert len(loops[0]) == 12
+    assert len({tuple(p) for p in points.tolist()}) == 6, "each point is visited twice"
+
+
+@pytest.mark.parametrize("scale", [1e-300, 1e-200, 1e-160, 1.0, 1e160, 1e200, 1e300])
+def test_exact_predicate_survives_underflow_and_overflow(inj, scale):
+    """``_orient2d_sign`` stays exact at every representable coordinate scale.
+
+    Regression.  Shewchuk's static bound is a *relative* one, so it is only a
+    proof while both partial products are normal floats.  Two escapes both
+    reported "exactly collinear", which reads as "not a crossing" and so
+    under-reported:
+
+    * below about ``1e-155`` both products flush to zero, the bound flushes to
+      zero with them, and ``0 >= 0`` accepted the wrong sign;
+    * above about ``1e155`` the determinant overflows -- either a product does,
+      or two finite products of opposite sign sum past the range -- the bound
+      becomes ``inf`` too, and ``inf >= inf`` accepted the zeroed sign.
+
+    The existing ULP test could not see either: it builds its triples with
+    ``uniform(-1, 1)``, where no intermediate is anywhere near the exponent
+    limits.  The corner set below deliberately includes ``2**1023``, whose
+    differences give products that are individually finite and whose difference
+    is not.
+    """
+    corners = np.array(
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [-1.0, 0.5], [0.25, -1.0]]
+    ) * scale
+    if scale > 1.0:
+        corners = np.vstack(
+            [corners, [[2.0**1023, 2.0**1023], [2.0**1023, -1.0], [0.3, 2.0**1023]]]
+        )
+    n = corners.shape[0]
+    triples = [(i, j, k) for i in range(n) for j in range(n) for k in range(n)
+               if i != j and j != k and i != k]
+    a = corners[[t[0] for t in triples]]
+    b = corners[[t[1] for t in triples]]
+    c = corners[[t[2] for t in triples]]
+    fast = inj._orient2d_sign(a, b, c).tolist()
+    slow = [ref.naive_orient2d_sign(a[i], b[i], c[i]) for i in range(len(triples))]
+    assert fast == slow
+
+
+@pytest.mark.parametrize("scale", [1e-300, 1e-200, 1.0, 1e200, 1e300])
+def test_boundary_crossings_are_scale_free(inj, scale):
+    """A clean X crosses, whatever exponent it is written at.
+
+    Regression for the same defect one level up: at ``1e-200`` and at ``1e300``
+    ``boundary_crossings`` reported 0 for two segments that plainly cross, which
+    is the unsafe direction -- a fold that certifies clean.
+    """
+    uv = np.array([[-1.0, -1.0], [1.0, 1.0], [-1.0, 1.0], [1.0, -1.0]]) * scale
+    loops = [[0, 1], [2, 3]]
+    assert inj.boundary_crossings(uv, loops) == ref.naive_boundary_crossings(uv, loops)
+    assert inj.boundary_crossings(uv, loops) > 0
+
+
+def test_orient2d_raises_no_numpy_warning(inj):
+    """Extreme coordinates must not spray RuntimeWarnings into Blender's console.
+
+    The overflow and underflow the predicate now handles are *expected*, so the
+    arithmetic that produces them belongs inside ``np.errstate``.  It was not,
+    and numpy printed ``overflow encountered in multiply`` to stderr on every
+    call, which inside Blender is console noise an artist cannot act on.
+    """
+    import warnings
+
+    corners = np.array([[0.0, 0.0], [1e300, 1e300], [-1e300, 0.0], [1e-300, 1e-300]])
+    a = corners[[0, 0, 3]]
+    b = corners[[1, 3, 1]]
+    c = corners[[2, 1, 2]]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        inj._orient2d_sign(a, b, c)
+    assert [str(w.message) for w in caught] == []
+
+
+def test_exact_orientation_tolerates_non_finite_input(inj):
+    """The exact fallback must not raise on ``inf``/``nan``.
+
+    No public path feeds it non-finite coordinates -- they are dropped before
+    the broad phase -- but ``float.as_integer_ratio`` raises ``ValueError`` on
+    them, and this module's contract is that nothing escapes into a Blender
+    operator.  A point with no position lies to neither side, so ``0`` is the
+    answer that keeps it out of every crossing.
+    """
+    for bad in (math.inf, -math.inf, math.nan):
+        for slot in range(6):
+            values = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0]
+            values[slot] = bad
+            assert inj._orient2d_sign_exact(*values) == 0

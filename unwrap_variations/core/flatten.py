@@ -903,9 +903,21 @@ class _Rest:
         x1 = np.sqrt(np.einsum("ij,ij->i", e1, e1))
         safe_x1 = np.where(x1 > 0.0, x1, 1.0)
         x2 = np.einsum("ij,ij->i", e2, e1) / safe_x1
-        len2_sq = np.einsum("ij,ij->i", e2, e2)
-        y2 = np.sqrt(np.maximum(len2_sq - x2 * x2, 0.0))
-        area = 0.5 * x1 * y2
+        # The height comes from the cross product, not from
+        # ``sqrt(|e2|^2 - x2^2)``.  Algebraically they are the same number; in
+        # float64 the subtraction is catastrophic cancellation on a thin
+        # triangle, losing roughly ``2*log10(aspect)`` digits and clamping to
+        # exactly zero past aspect 1e8.  That is not a cosmetic difference: a
+        # zero area sets ``good`` False, which excludes the triangle from the
+        # symmetric-Dirichlet barrier, which lets the descent collapse and then
+        # invert it -- breaking the no-flip invariant on a chart whose triangles
+        # all have perfectly good area.  Every other area in this module
+        # (:func:`_circle_boundary`, :func:`_mean_value_weights`,
+        # :func:`_cotan_pattern`) already uses the cross product; this makes the
+        # module agree with itself.
+        normal = np.cross(e1, e2)
+        area = 0.5 * np.sqrt(np.einsum("ij,ij->i", normal, normal))
+        y2 = 2.0 * area / safe_x1
 
         mean = float(area.mean()) if area.size else 0.0
         floor = _DEGENERATE_EPS * mean if mean > 0.0 else 0.0
@@ -1770,6 +1782,21 @@ def _certified_descent(
     return best
 
 
+def _majority_sign(uv: np.ndarray, tris: np.ndarray) -> float:
+    """Return ``+1`` or ``-1`` for the winding most of a layout's triangles have.
+
+    The same rule :func:`_certify_layout` counts ``flipped`` by, and the one
+    ``docs/ORGANIC.md`` section 4.1 states: a chart's orientation is what the
+    majority of its triangles agree on, not what its signed areas sum to.  Ties
+    and layouts with no measurable area read ``+1``.
+    """
+    signed = _signed_areas(uv, tris)
+    finite = np.isfinite(signed)
+    negative = int(np.count_nonzero(finite & (signed < 0.0)))
+    positive = int(np.count_nonzero(finite & (signed > 0.0)))
+    return -1.0 if negative > positive else 1.0
+
+
 def _align_to_target(
     uv: np.ndarray, chart: Chart, target: np.ndarray | None
 ) -> np.ndarray:
@@ -1797,11 +1824,15 @@ def _align_to_target(
     tris = np.asarray(chart.tris, dtype=np.int64).reshape(-1, 3)
     if not _indexes(tris, uv.shape[0]):
         tris = np.zeros((0, 3), dtype=np.int64)
-    if tris.shape[0]:
-        want = float(np.sum(_signed_areas(dst, tris)))
-        have = float(np.sum(_signed_areas(src, tris)))
-        if want * have < 0.0:
-            src = src * np.array([-1.0, 1.0])
+    # Majority winding, not the sign of the area sum.  This function is only
+    # reached for a chart that *failed* certification -- one with mixed-sign
+    # areas -- which is exactly when a signed sum cancels and a majority does
+    # not.  Two large triangles of the minority sign were enough to flip the sum
+    # and mirror an island the artist had packed the other way round, invisibly,
+    # because ``flipped = min(positive, negative)`` reads 0 for a wholly
+    # mirrored chart just as it does for an un-mirrored one.
+    if tris.shape[0] and _majority_sign(dst, tris) * _majority_sign(src, tris) < 0.0:
+        src = src * np.array([-1.0, 1.0])
 
     src_mean = src.mean(axis=0)
     dst_mean = dst.mean(axis=0)

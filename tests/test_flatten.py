@@ -390,6 +390,58 @@ def test_descent_never_introduces_a_flip(flatten, iters):
         )
 
 
+@pytest.mark.parametrize("thickness", [1e-4, 1e-7, 1e-8, 1e-10, 1e-12])
+def test_rest_area_matches_the_cross_product_on_slivers(flatten, thickness):
+    """``_Rest``'s rest areas must agree with the stable cross-product area.
+
+    ``_Rest`` laid the triangle out in its own frame and read the height off
+    ``sqrt(|e2|^2 - x2^2)``.  That subtracts two nearly equal numbers on a thin
+    triangle: it loses about ``2*log10(aspect)`` digits and clamps to exactly
+    zero past aspect 1e8.  Every other area in this module -- the boundary
+    circle, the mean-value weights, the cotan pattern -- uses the cross product,
+    so the module disagreed with itself about which triangles have area.
+
+    That mattered because ``rest.good`` gates the symmetric-Dirichlet barrier:
+    a triangle wrongly called degenerate is charged nothing for collapsing, and
+    the descent is free to invert it.  See the flip test below.
+    """
+    chart = sliver_chart(flatten, 20, thickness=thickness)
+    rest = flatten._Rest(chart)
+    tris = np.asarray(chart.tris, dtype=np.int64)
+    corners = np.asarray(chart.verts, dtype=np.float64)[tris]
+    cross = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+    exact = 0.5 * np.sqrt(np.einsum("ij,ij->i", cross, cross))
+
+    assert (exact > 0.0).all(), "the fixture itself must have no degenerate triangle"
+    assert rest.n_good == tris.shape[0], "%d of %d triangles wrongly called degenerate" % (
+        tris.shape[0] - rest.n_good,
+        tris.shape[0],
+    )
+    assert rest.area == pytest.approx(exact, rel=1e-12)
+
+
+@pytest.mark.parametrize("thickness", [1e-10, 1e-12, 1e-14])
+def test_descent_never_introduces_a_flip_on_an_extreme_sliver(flatten, thickness):
+    """The no-flip invariant has to survive past the aspect ratio the corpus uses.
+
+    The corpus stops at ``thickness=1e-7``; the barrier stopped working at
+    ``1e-10``, one decade further on, and the descent inverted a triangle from a
+    flip-free Tutte start -- exactly the failure the invariant forbids.
+    """
+    chart = sliver_chart(flatten, 20, thickness=thickness)
+    start = flatten.tutte_embed(chart)
+    if not (signed_areas(flatten, start, chart) > 0.0).all():
+        pytest.skip("Tutte start is not flip-free at this aspect ratio")
+    for iters in (4, 8, 16, 64):
+        moved = flatten.minimize_distortion(start, chart, iters=iters)
+        areas = signed_areas(flatten, moved, chart)
+        assert (areas > 0.0).all(), "thickness %g flipped %d triangles after %d iters" % (
+            thickness,
+            int((areas <= 0.0).sum()),
+            iters,
+        )
+
+
 @pytest.mark.parametrize("seed", range(10))
 def test_descent_never_flips_from_a_random_valid_start(flatten, seed):
     """The invariant is about the *step*, so it must hold from any valid start."""
@@ -554,6 +606,40 @@ def test_flatten_chart_aligns_onto_a_target_and_preserves_its_area(flatten):
     got = float(np.abs(flatten._signed_areas(result.uv, tris)).sum())
     assert got == pytest.approx(want, rel=1e-9)
     assert np.abs(result.uv.mean(axis=0) - target.mean(axis=0)).max() < 1e-9
+
+
+@pytest.mark.parametrize("mirrored", [False, True])
+def test_flatten_chart_matches_the_targets_majority_winding(flatten, mirrored):
+    """The repair keeps the island's *majority* winding, not the sign of its area sum.
+
+    ``_align_to_target`` decided whether to reflect from
+    ``sum(signed_areas) < 0``.  But it is only ever reached for a chart that
+    *failed* certification -- one with mixed-sign areas -- which is exactly when
+    a signed sum cancels and a majority does not.  Two large triangles of the
+    minority sign flip the sum, and the island comes back mirrored relative to
+    the layout the artist packed.  Nothing downstream can notice, because
+    ``flipped = min(positive, negative)`` reads 0 for a wholly mirrored chart
+    and a wholly un-mirrored one alike.
+    """
+    chart = sliver_chart(flatten, 20, thickness=0.25)
+    tris = np.asarray(chart.tris, dtype=np.int64)
+    target = np.asarray(chart.verts, dtype=np.float64)[:, :2].copy()
+    if mirrored:
+        target = target * np.array([-1.0, 1.0])
+    # Drag one vertex far out, so a couple of triangles of the minority sign
+    # dominate the signed sum without touching the majority.
+    target[21] = [-0.5, -60.0] if mirrored else [0.5, -60.0]
+
+    want = flatten._signed_areas(target, tris)
+    want_majority = int(np.count_nonzero(want > 0.0)) > int(np.count_nonzero(want < 0.0))
+    assert np.sign(want.sum()) != (1.0 if want_majority else -1.0), (
+        "the fixture must be one where the area sum and the majority disagree"
+    )
+
+    result = flatten.flatten_chart(chart, target=target)
+    got = flatten._signed_areas(result.uv, tris)
+    got_majority = int(np.count_nonzero(got > 0.0)) > int(np.count_nonzero(got < 0.0))
+    assert got_majority == want_majority, "island came back with the opposite winding"
 
 
 def test_flatten_chart_accepts_a_duck_typed_chart(flatten):

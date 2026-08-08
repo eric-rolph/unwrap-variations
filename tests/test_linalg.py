@@ -19,6 +19,7 @@ The performance budget from section 3 -- a 100k-vertex Laplacian matvec under
 
 from __future__ import annotations
 
+import itertools
 import time
 
 import numpy as np
@@ -143,12 +144,59 @@ def test_symmetry_error_detects_an_unsymmetric_assembly(linalg):
     assert bad.symmetry_error() == pytest.approx(1.0)
 
 
+def test_symmetry_error_is_correct_for_an_unsorted_pattern(linalg):
+    """``symmetry_error`` must not depend on the order the triplets arrived in.
+
+    ``__init__`` coalesces through ``np.unique`` and therefore hands back a
+    pattern sorted by ``(row, col)``; ``from_coalesced`` -- the constructor
+    ``_tutte`` and ``_build_preconditioner`` actually use -- does not sort at
+    all.  ``symmetry_error`` looked the mirror entry up with ``searchsorted``,
+    which silently returns nonsense on an unsorted key array, so the one
+    diagnostic offered for the one property the class refuses to enforce raised
+    a false alarm on 5 of the 6 orderings of an exactly symmetric 2x2.
+    """
+    rows, cols, vals = np.array([0, 1, 1]), np.array([1, 0, 1]), np.array([2.0, 2.0, 5.0])
+    for perm in itertools.permutations(range(3)):
+        idx = list(perm)
+        op = linalg.SparseSym.from_coalesced(rows[idx], cols[idx], vals[idx], 2)
+        assert np.allclose(op.to_dense(), op.to_dense().T), "fixture must be symmetric"
+        assert op.symmetry_error() == 0.0, "false alarm for ordering %s" % (perm,)
+
+    skew = linalg.SparseSym.from_coalesced(
+        np.array([1, 0]), np.array([0, 1]), np.array([3.0, 2.0]), 2
+    )
+    assert skew.symmetry_error() == pytest.approx(1.0)
+
+
+def test_diagonal_does_not_hand_out_its_cache(linalg):
+    """The operator is documented immutable, so its diagonal cannot be edited.
+
+    ``diagonal()`` memoises and returned the cached array itself, so a caller
+    that scaled the result in place -- the natural way to build a preconditioner
+    -- silently rewrote the operator's idea of its own diagonal for every later
+    caller.
+    """
+    op = linalg.SparseSym([0, 1], [0, 1], [3.0, 5.0], 2)
+    first = op.diagonal()
+    assert not first.flags.writeable
+    with pytest.raises(ValueError):
+        first[0] = 1234.0
+    assert op.diagonal()[0] == 3.0
+
+
 def test_with_values_keeps_the_pattern(linalg):
     """The fast reassembly path reuses the indices and swaps the values."""
     op = linalg.SparseSym([0, 1, 0], [0, 1, 0], [1.0, 2.0, 3.0], 2)
     twice = op.with_values(op.values * 2.0)
     assert np.array_equal(twice.rows, op.rows)
     assert np.array_equal(twice.matvec(np.ones(2)), 2.0 * op.matvec(np.ones(2)))
+
+
+def test_with_values_keeps_the_dropped_count(linalg):
+    """Reassembling with new values does not un-drop the triplets already lost."""
+    op = linalg.SparseSym([0, 1, 99, -3], [0, 1, 0, 0], [1.0, 1.0, 5.0, 5.0], 2)
+    assert op.dropped == 2
+    assert op.with_values(op.values * 2.0).dropped == 2
 
 
 def test_empty_matrix_is_usable(linalg):

@@ -17,10 +17,19 @@ over the triangulated submesh".  That is necessary but *not sufficient*: two
 disks joined at a single vertex -- a bowtie -- have ``F=2, E=6, V=5`` and
 therefore ``chi = 1`` while being nothing a flattener can handle.  So
 :func:`is_disk` computes the Euler characteristic exactly as specified and then
-also requires the submesh to be connected, edge-manifold, and vertex-manifold
-(every vertex link a single fan).  Those are the remaining conditions that make
-``chi == 1`` mean "disk"; adding them can only ever reject more, never accept
-more, so the specified test is still the one doing the work.
+also requires the submesh to be connected, edge-manifold, vertex-manifold
+(every vertex link a single fan), **bounded** (at least one edge carrying a
+single triangle) and free of triangles that repeat a corner.  Those are the
+remaining conditions that make ``chi == 1`` mean "disk"; adding them can only
+ever reject more, never accept more, so the specified test is still the one
+doing the work.
+
+The boundary condition is not decoration.  Connected + manifold + ``chi == 1``
+still admits the real projective plane, which triangulates on six vertices and
+is closed, and the usual justification -- "a connected, *orientable*, manifold
+surface with ``chi == 1`` must have a boundary" -- assumes orientability rather
+than testing it.  Testing for a boundary instead rules RP^2 out exactly, since
+``chi = 2 - k - b`` has no solution at ``chi == 1`` with ``k >= 1, b >= 1``.
 
 **Distortion is measured, never estimated.**  Every candidate merge is actually
 flattened and the result is run through the frozen evaluator, because the
@@ -140,15 +149,41 @@ _MAX_QUEUE_POPS = 1_000_000
 #: iterations, 41 ms at 32, 128 ms at 128, 255 ms at 256).  So the only lever on
 #: the cost is how much descent happens per candidate.
 #:
-#: Screening cheaply is **conservative, not a weakened gate**.  Fewer descent
-#: iterations leave a chart *more* distorted, so a screened candidate's measured
-#: ``stretch_l2`` is an upper bound on what a full flatten would produce: the
-#: cheap number can make the gate reject a merge a full flatten would have
-#: accepted, and can never make it accept one a full flatten would have
-#: rejected.  Losing a merge costs seam length; admitting a bad one costs the
-#: artist a broken chart, and only the second is unacceptable.  Accepted merges
-#: are then re-flattened at the full budget before their UVs are pasted, so the
-#: layout that ships is never the screening one.
+#: Screening cheaply is *usually* conservative but **is not a proof**, and the
+#: earlier claim that it was has been measured false.  The argument was: fewer
+#: descent iterations leave a chart more distorted, so a screened candidate's
+#: ``stretch_l2`` is an upper bound on the full-quality figure, and the cheap
+#: number can therefore only ever reject a merge that a full flatten would have
+#: accepted.  Two things break it.
+#:
+#: **The descent minimises a different functional from the one the gate reads.**
+#: ``minimize_distortion`` descends the symmetric Dirichlet energy; the gate
+#: measures Sander's L2 stretch.  The energy is monotone in the budget -- the
+#: checkpoint ladder keeps the lowest-energy certifying iterate, and a larger
+#: budget checks a superset of checkpoints -- but stretch is not.  Measured over
+#: the adjacent pairs of the four corpus layouts, 18 of 35 have some budget at
+#: which ``stretch_l2`` rises, worst case 1.2630 at 24 iterations against 1.4755
+#: at 32 and above.
+#:
+#: **"Full quality" is not this constant's denominator.**  ``flatten_chart``
+#: with no ``iters`` uses ``_iteration_budget``, which is
+#: ``min(max(32000 // tris, 16), 256)`` -- not ``_DEFAULT_ITERS``.  Above 1000
+#: triangles that is *below* the screening budget of 32, so screening is the
+#: finer flatten and reports the *lower* stretch.  Measured on the corpus
+#: sphere's 1578-triangle union: screening reads 1.0515, full quality reads
+#: 1.0695, so every bound in ``(1.0515, 1.0695]`` -- inside the grid's own
+#: ``[0, 3]`` range -- is admitted by screening and refused at full quality.
+#: End to end at 1.060497 the two runs take *different* merges: ``(0, 1)``
+#: screened, ``(0, 2)`` at full quality.
+#:
+#: What does still hold: the chart that ships was itself measured against the
+#: bound and passed, because ``finalise`` re-flattens only to *replace* the
+#: screened layout and keeps the screened one when the replacement fails the
+#: gate.  So the bound is honoured by every shipped chart; what is not sound is
+#: the *choice of which merges to take*.  The fix is to clamp the screening
+#: budget by the chart's own full-quality budget rather than pin it globally;
+#: that changes the accepted merge set on the corpus and needs a re-benchmark,
+#: so it is recorded here rather than applied.
 _SCREEN_FRACTION = 8
 
 #: Screening budget when the flattener's own default cannot be read.
@@ -297,6 +332,8 @@ class ChartTopology:
         components: ``(K,)`` number of connected components.
         edge_manifold: ``(K,)`` bool, no edge carries three or more triangles.
         vertex_manifold: ``(K,)`` bool, every vertex link is a single fan.
+        boundary_edges: ``(K,)`` edges carrying exactly one triangle.
+        degenerate_faces: ``(K,)`` triangles with a repeated corner index.
     """
 
     n_charts: int
@@ -307,6 +344,8 @@ class ChartTopology:
     components: np.ndarray
     edge_manifold: np.ndarray
     vertex_manifold: np.ndarray
+    boundary_edges: np.ndarray
+    degenerate_faces: np.ndarray
 
     @property
     def disk(self) -> np.ndarray:
@@ -314,9 +353,29 @@ class ChartTopology:
 
         ``chi == 1`` on its own admits a bowtie (two disks sharing one vertex:
         ``F=2, E=6, V=5``) and a disk-plus-torus union (``1 + 0``), so
-        connectedness and manifoldness are required alongside it.  A connected,
-        orientable, manifold surface with ``chi == 1`` must have a boundary --
-        a closed one has even ``chi`` -- and is therefore a disk.
+        connectedness and manifoldness are required alongside it.
+
+        Those four are still not enough, and the reason is worth stating because
+        the obvious justification quietly assumes its way past it.  "A
+        connected, **orientable**, manifold surface with ``chi == 1`` must have
+        a boundary and is therefore a disk" is true, but orientability is a
+        *hypothesis* of that sentence, and none of the four conditions tests it.
+        The classification of surfaces gives ``chi = 2 - 2g - b`` orientable and
+        ``chi = 2 - k - b`` non-orientable, so ``chi == 1`` forces either
+        ``(g=0, b=1)`` -- the disk -- or ``(k=1, b=0)``, the real projective
+        plane.  RP^2 triangulates on six vertices (``F=10, E=15, V=6``), is
+        connected, is edge- and vertex-manifold, and is not a disk.
+
+        Rather than test orientability, which needs a parity union-find over the
+        dual graph, test the conclusion: **a disk has a boundary and RP^2 does
+        not**.  ``2 - k - b == 1`` with ``k >= 1`` and ``b >= 1`` has no
+        solution, so requiring one boundary edge rules the non-orientable case
+        out exactly, for the cost of one more ``bincount``.
+
+        ``degenerate_faces`` covers the last gap, which is not a surface
+        question at all: a triangle written ``(a, a, b)`` has ``F=1, E=2, V=2``
+        and so ``chi == 1``, one component, one boundary edge and manifold links.
+        It is a sliver, not a chart, and no flattener should be handed one.
         """
         return (
             (self.faces > 0)
@@ -324,6 +383,8 @@ class ChartTopology:
             & (self.components == 1)
             & self.edge_manifold
             & self.vertex_manifold
+            & (self.boundary_edges > 0)
+            & (self.degenerate_faces == 0)
         )
 
 
@@ -364,6 +425,8 @@ def chart_topology(
             components=zeros_i.copy(),
             edge_manifold=np.zeros(k, dtype=bool),
             vertex_manifold=np.zeros(k, dtype=bool),
+            boundary_edges=zeros_i.copy(),
+            degenerate_faces=zeros_i.copy(),
         )
     tv = tv[:m]
     lab = np.clip(lab[:m], 0, k - 1)
@@ -414,6 +477,18 @@ def chart_topology(
     edge_manifold = np.ones(k, dtype=bool)
     if bad_edge.any():
         edge_manifold[np.unique(group_label[bad_edge])] = False
+
+    # Edges carrying a single triangle.  A disk has some; RP^2 -- the one
+    # non-disk that clears every other condition -- has none.  See
+    # :meth:`ChartTopology.disk`.
+    boundary_edges = np.bincount(
+        group_label[counts == 1], minlength=k
+    ).astype(np.int64)
+
+    degenerate = (
+        (tv[:, 0] == tv[:, 1]) | (tv[:, 1] == tv[:, 2]) | (tv[:, 2] == tv[:, 0])
+    )
+    degenerate_faces = np.bincount(lab[degenerate], minlength=k).astype(np.int64)
 
     chi = faces - edges + verts
 
@@ -481,6 +556,8 @@ def chart_topology(
         components=components,
         edge_manifold=edge_manifold,
         vertex_manifold=vertex_manifold,
+        boundary_edges=boundary_edges,
+        degenerate_faces=degenerate_faces,
     )
 
 
@@ -490,11 +567,13 @@ def is_disk(sample: UVMeshSample, tri_mask: Any) -> bool:
     The test is the exact Euler characteristic ``chi = F - E + V`` over the
     **triangulated** submesh -- ``F`` its triangles, ``E`` its distinct triangle
     edges *including the tessellation diagonals*, ``V`` its distinct vertices --
-    combined with the three conditions that make ``chi == 1`` actually mean
-    "disk": the submesh must be connected, no edge may carry three or more of its
-    triangles, and every vertex link must be a single fan.  See
-    :meth:`ChartTopology.disk` for why each is needed; the bowtie in particular
-    has ``chi == 1`` and is not a disk.
+    combined with the conditions that make ``chi == 1`` actually mean "disk":
+    the submesh must be connected, no edge may carry three or more of its
+    triangles, every vertex link must be a single fan, it must have at least one
+    boundary edge, and no triangle may repeat a corner.  See
+    :meth:`ChartTopology.disk` for why each is needed; the bowtie has ``chi == 1``
+    and is not a disk, and so does the real projective plane, which clears every
+    condition except the boundary one.
 
     Args:
         sample: The mesh the triangles are indexed into.
@@ -1585,8 +1664,9 @@ def _measure_union(
         require_injective: When ``False`` the certification step is skipped.
             Used for the per-chart baseline flattenings, which are only there to
             supply a denominator and are never pasted into a layout.
-        iters: Descent budget handed to the flattener.  See :data:`_SCREEN_ITERS`
-            for why screening with a small one cannot let a bad merge through.
+        iters: Descent budget handed to the flattener.  See
+            :data:`_SCREEN_FRACTION` for what screening with a small one does and
+            does not guarantee -- it does *not* bound the full-quality figure.
     """
     if not is_disk(sample, tri_mask):
         return _Candidate(False, "disk", "not a disk", math.inf, None, None)
@@ -1714,10 +1794,13 @@ def merge_charts(
             means "an eighth of the flattener's own budget" (see
             :func:`_screen_iters`); ``None`` screens at full quality, which on
             Suzanne is 3.3x slower for one extra merge.  Accepted merges are
-            always re-flattened at full quality before their UVs are used, so
-            the layout that ships is never the screening one, and because
-            screening cheaply can only reject more, no value here can admit a
-            merge that full-quality screening would have refused.
+            re-flattened at full quality before their UVs are used, and the
+            replacement is kept only when it too clears the gate, so every chart
+            that ships has been measured against ``max_stretch`` and passed.
+            **This value does change which merges are taken, and not only in the
+            conservative direction** -- see :data:`_SCREEN_FRACTION` for the
+            measured counterexample on the corpus sphere, where screening admits
+            a pair that full-quality screening refuses.
         time_budget: Seconds after which no *new* candidate pair is screened;
             ``0`` means no limit.  Merges already screened and admissible are
             still taken, and an in-flight flatten is never interrupted, so the
@@ -1753,7 +1836,16 @@ def merge_charts(
     report.seam_length_before = graph.seam_length
     report.seam_length_after = graph.seam_length
 
-    bound = float(max_stretch) if math.isfinite(float(max_stretch)) else 1.25
+    # NaN is the only value with no defensible reading: it is neither "off" nor
+    # "unbounded", so it takes the documented default.  The infinities do have
+    # one and must keep it -- a blanket ``isfinite`` guard sent ``inf`` to 1.25,
+    # so "no bound" quietly became the conservative bound while ``1e300``, being
+    # finite, sailed through as unbounded; and it sent ``-inf`` to 1.25 as well,
+    # turning merging *on* for a caller who asked for the least permissive
+    # setting expressible.
+    bound = float(max_stretch)
+    if math.isnan(bound):
+        bound = 1.25
     if bound < _MERGE_OFF_BELOW:
         report.message = "merging disabled (max_stretch %.4f < 1.0)" % bound
         report.seconds = time.perf_counter() - started

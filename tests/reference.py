@@ -944,9 +944,17 @@ def naive_certify(sample, tri_chart=None, *, do_overlap: bool = True) -> dict:
         # than two incident triangles, and no boundary loop through the same UV
         # vertex twice.  The last rules out a bowtie, which has chi == 1 and a
         # single boundary cycle and is still not a disk.
+        # A simple closed curve repeats neither a welded vertex (a bowtie) nor a
+        # *position* (a degree-2 branched cover, whose second wrap is a distinct
+        # set of mesh vertices sitting on bit-identical UVs).  Both leave the
+        # crossing count and the overlap area with nothing to object to, so the
+        # disk test is the only thing standing between them and a certificate.
         loops_here = grouped.get(chart, [])
         pinched = any(
             len({node_of_loop[i] for i in chain}) != len(chain) for chain in loops_here
+        ) or any(
+            len({(float(uvs[i][0]), float(uvs[i][1])) for i in chain}) != len(chain)
+            for chain in loops_here
         )
         non_manifold = any(count > 2 for count in incident.values())
         if euler[chart] != 1 or len(loops_here) != 1 or pinched or non_manifold:

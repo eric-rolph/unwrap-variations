@@ -209,7 +209,12 @@ class SparseSym:
             raise ValueError(
                 "expected %d values, got %d" % (self._vals.shape[0], arr.shape[0])
             )
-        return SparseSym.from_coalesced(self._rows, self._cols, arr, self._n)
+        out = SparseSym.from_coalesced(self._rows, self._cols, arr, self._n)
+        # The triplets this operator threw away are still thrown away; only the
+        # values changed.  Resetting the count would report a clean assembly for
+        # a pattern that is missing entries.
+        out._dropped = self._dropped
+        return out
 
     # -- sizes ----------------------------------------------------------------
 
@@ -294,7 +299,12 @@ class SparseSym:
                     diag = np.bincount(idx, weights=self._vals[on], minlength=self._n)[
                         : self._n
                     ]
+            diag.setflags(write=False)
             self._diag = diag
+        # Read-only, because the operator is immutable and the natural thing to
+        # do with a diagonal is scale it in place to build a preconditioner --
+        # which, on the cached array, would rewrite the operator's own answer
+        # for every later caller.
         return self._diag
 
     # -- diagnostics ----------------------------------------------------------
@@ -310,10 +320,19 @@ class SparseSym:
             return 0.0
         key = self._rows.astype(np.int64) * self._n + self._cols.astype(np.int64)
         mirror = self._cols.astype(np.int64) * self._n + self._rows.astype(np.int64)
-        where = np.searchsorted(key, mirror)
-        where = np.clip(where, 0, key.shape[0] - 1)
-        found = key[where] == mirror
-        other = np.where(found, self._vals[where], 0.0)
+        # ``searchsorted`` needs a sorted haystack.  ``__init__`` coalesces
+        # through ``np.unique`` and so hands one over, but
+        # :meth:`from_coalesced` -- the constructor the flattener actually uses
+        # -- sorts nothing, and looking a mirror up in an unsorted key array
+        # returns whichever entry happens to sit at that offset.  Sorting here
+        # costs one argsort on a diagnostic that is never on the solve path,
+        # and makes the answer independent of the order the triplets arrived in.
+        order = np.argsort(key, kind="stable")
+        sorted_key = key[order]
+        where = np.searchsorted(sorted_key, mirror)
+        where = np.clip(where, 0, sorted_key.shape[0] - 1)
+        found = sorted_key[where] == mirror
+        other = np.where(found, self._vals[order][where], 0.0)
         return float(np.abs(self._vals - other).max())
 
     def to_dense(self) -> np.ndarray:

@@ -54,7 +54,21 @@ separately.  Precisely where the proof stops:
   not counted (see the convention below).  A chart folded so its boundary lies
   exactly along another part of its boundary therefore has zero crossings and a
   positive ``overlap_area``.  Carrying both numbers is what makes the pair
-  complete.
+  complete.  Within a *single* chart the important case does not need
+  ``overlap_area`` at all: a boundary that revisits the same UV point is not a
+  simple closed curve, so ``_chart_topology`` refuses the chart outright.  That
+  is what stops a **degree-2 branched cover** -- a fan whose rim traces the same
+  polygon twice, orientation-consistent, ``chi = 1``, one boundary cycle, no
+  repeated welded vertex, zero transversal crossings, and two-to-one everywhere.
+  See :func:`_loops_revisit_a_point`.
+* **A zero from the evaluator is not always a measurement.**
+  ``evaluator._overlap_area`` returns ``0.0`` both when it measured no overlap
+  and when it abandoned the attempt -- its insert cap can be exhausted by a
+  layout mixing very small and very large triangles -- and it discards any pair
+  whose area is below ``1e-12`` of the layout's *total*.  ``certify`` cannot
+  tell the two apart, so the ``overlap_area == 0.0`` conjunct is a proof only
+  for layouts within those limits.  The conjuncts that do not depend on it --
+  local injectivity, simple boundary, disk topology -- are unconditional.
 
 Conventions, all of them deliberate
 -----------------------------------
@@ -106,6 +120,7 @@ safe direction.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from math import isfinite as _isfinite
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -170,6 +185,13 @@ _MAX_GRID_DIM = 65_536
 #: the summed magnitudes of the two products, the float64 sign is certain.
 _ORIENT_EPS = 2.0**-53
 _ORIENT_ERRBOUND = (3.0 + 16.0 * _ORIENT_EPS) * _ORIENT_EPS
+
+#: Smallest positive *normal* float64.  Shewchuk's bound is a **relative** error
+#: bound and holds only while every intermediate is normal: below this a
+#: rounding error is absolute (``2**-1074``) and no multiple of the operand
+#: magnitudes covers it.  A product that lands here, or that overflowed to
+#: infinity, sends its triple to the exact path -- see :func:`_orient2d_sign`.
+_SMALLEST_NORMAL = 2.0**-1022
 
 
 # ---------------------------------------------------------------------------
@@ -579,17 +601,21 @@ def _chart_topology(
       failed and is what a repair stage needs;
     * no edge with more than two incident triangles -- a non-manifold fin has no
       well-defined boundary walk at all;
-    * no boundary loop visiting the same UV vertex twice.  This is the one that
-      is easy to miss: a **bowtie** -- two lobes joined at a single vertex --
-      has ``chi = 1`` *and* a single boundary cycle, and is still not a disk.
-      Its boundary passes through the shared vertex twice, so it is not a simple
-      closed curve and the theorem simply does not apply: one lobe can sit
-      wholly inside the other, touching only at the pinch, with no transversal
-      crossing anywhere for :func:`boundary_crossings` to find.  The test is
-      deliberately conservative -- it also refuses a bowtie whose lobes lie side
-      by side, which *is* injective -- because refusing to certify something
-      valid costs a needless re-flatten, while certifying something invalid
-      ships a broken bake.
+    * no boundary loop visiting the same UV vertex **or the same UV point**
+      twice.  This is the one that is easy to miss, and it has two distinct
+      teeth.  Repeating a welded *vertex* is a **bowtie** -- two lobes joined at
+      a single vertex -- which has ``chi = 1`` *and* a single boundary cycle and
+      is still not a disk; one lobe can sit wholly inside the other, touching
+      only at the pinch, with no transversal crossing anywhere for
+      :func:`boundary_crossings` to find.  Repeating a *position* without
+      repeating a vertex is the **degree-2 branched cover** described in
+      :func:`_loops_revisit_a_point`, which is two-to-one everywhere and clears
+      all three of the other conditions.  Both make the boundary image a
+      non-simple closed curve, which is exactly the hypothesis the theorem
+      needs.  The test is deliberately conservative -- it also refuses a bowtie
+      whose lobes lie side by side, which *is* injective -- because refusing to
+      certify something valid costs a needless re-flatten, while certifying
+      something invalid ships a broken bake.
     """
     node, n_nodes = _weld_uv_vertices(sample)
     corners = node[tri_loops]  # (T, 3) welded UV vertex per triangle corner
@@ -638,6 +664,9 @@ def _chart_topology(
         head[picked],
         tail_loop[picked],
     )
+    pinched |= _loops_revisit_a_point(
+        np.asarray(sample.uvs, dtype=np.float64).reshape(-1, 2), loops
+    )
 
     loops_per_chart = np.bincount(loop_chart, minlength=n_charts)
     fins = run_live & ((n_fwd + n_bwd) > 2)
@@ -646,6 +675,46 @@ def _chart_topology(
     bad = (euler != 1) | (loops_per_chart != 1) | non_manifold | pinch
     non_disk = int(np.count_nonzero(bad)) if n_tris else 0
     return _ChartTopology(loops, loop_chart, non_disk, euler)
+
+
+def _loops_revisit_a_point(uv: np.ndarray, loops: Sequence[Sequence[int]]) -> np.ndarray:
+    """Return a mask: does each loop pass through the same UV **point** twice?
+
+    The disk theorem needs the boundary image to be a *simple* closed curve, and
+    :func:`boundary_crossings` only sees **transversal** crossings.  A curve that
+    touches itself without crossing -- two boundary vertices landing on exactly
+    the same UV -- is not simple, has zero crossings, and encloses zero extra
+    area, so neither the crossing count nor ``overlap_area`` can object to it.
+
+    The case that makes this load-bearing rather than pedantic is a **degree-2
+    branched cover**: a triangle fan whose rim visits the *same* polygon twice.
+    Every triangle keeps its orientation, ``chi`` is 1, there is one boundary
+    cycle, no edge has three faces, and no *welded vertex* repeats -- the second
+    wrap is a different set of mesh vertices.  The boundary polyline is
+    bit-for-bit the first wrap traced again, so nothing crosses transversally
+    anywhere, and the map is exactly two-to-one.  Testing repeated welded
+    vertices (which is what catches a bowtie) does not see it; testing repeated
+    *positions* does, and does so without any appeal to ``overlap_area``.
+
+    Args:
+        uv: ``(N, 2)`` coordinates the loop indices refer to.
+        loops: Closed polylines of indices into ``uv``.
+
+    Returns:
+        ``(len(loops),)`` bool array.  Out-of-range indices report ``False`` --
+        those triangles were already dropped and counted as degenerate.
+    """
+    out = np.zeros(len(loops), dtype=bool)
+    if uv.shape[0] == 0:
+        return out
+    for k, loop in enumerate(loops):
+        idx = np.asarray(loop, dtype=np.int64).reshape(-1)
+        if idx.shape[0] < 2 or idx.min() < 0 or idx.max() >= uv.shape[0]:
+            continue
+        # Same complex128 view trick as _weld_uv_vertices: one column, not two.
+        points = np.ascontiguousarray(uv[idx]).view(np.complex128).reshape(-1)
+        out[k] = np.unique(points).shape[0] != idx.shape[0]
+    return out
 
 
 def _run_ids(*keys: np.ndarray) -> tuple[np.ndarray, int]:
@@ -980,27 +1049,47 @@ def _orient2d_sign(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
     Returns:
         ``(N,)`` int8 array of ``-1``, ``0`` or ``+1``.
     """
-    acx = a[:, 0] - c[:, 0]
-    acy = a[:, 1] - c[:, 1]
-    bcx = b[:, 0] - c[:, 0]
-    bcy = b[:, 1] - c[:, 1]
-    det_left = acx * bcy
-    det_right = acy * bcx
-    det = det_left - det_right
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        acx = a[:, 0] - c[:, 0]
+        acy = a[:, 1] - c[:, 1]
+        bcx = b[:, 0] - c[:, 0]
+        bcy = b[:, 1] - c[:, 1]
+        det_left = acx * bcy
+        det_right = acy * bcx
+        det = det_left - det_right
 
-    # Using |left| + |right| as the bound unconditionally is more conservative
-    # than Shewchuk's branch on matching signs: it can only send extra pairs to
-    # the exact path, never accept a wrong sign.  When both products are zero
-    # the bound is zero and the comparison passes, which is correct -- the
-    # determinant is then exactly zero with no cancellation at all.
-    bound = _ORIENT_ERRBOUND * (np.abs(det_left) + np.abs(det_right))
-    with np.errstate(invalid="ignore"):
-        # A non-finite determinant -- only reachable by overflow from finite but
-        # astronomically scaled coordinates -- never clears the bound, so it is
-        # routed to the exact path below; zeroing it here only keeps the cast
-        # quiet in the meantime.
+        # Using |left| + |right| as the bound unconditionally is more
+        # conservative than Shewchuk's branch on matching signs: it can only
+        # send extra pairs to the exact path, never accept a wrong sign.
+        bound = _ORIENT_ERRBOUND * (np.abs(det_left) + np.abs(det_right))
+        # A non-finite determinant is zeroed only to keep the cast quiet; the
+        # `unreliable` mask below is what actually routes it to the exact path.
         sign = np.sign(np.where(np.isfinite(det), det, 0.0)).astype(np.int8)
-        uncertain = np.flatnonzero(~(np.abs(det) >= bound))
+
+        # Shewchuk's bound is *relative*, so it is only a proof while every
+        # intermediate is a finite normal float.  Two escapes, both of which
+        # used to be accepted as "exactly collinear" -- which reads as "not a
+        # crossing" and so under-reported, the unsafe direction:
+        #
+        # * **Overflow.**  ``det`` reaches +-inf either because a product
+        #   overflowed or because two finite products of opposite sign summed
+        #   past the range (``-8.99e307 - 8.99e307``).  ``bound`` then overflows
+        #   with it, so ``inf >= inf`` passes and the zeroed sign above stands.
+        #   Coordinates from about 1e155 up reach this.
+        # * **Underflow.**  At coordinates around 1e-160 the products fall below
+        #   the smallest normal, so their rounding error stops being relative.
+        #   Flush both to zero and the bound is zero as well, ``0 >= 0`` passes,
+        #   and a genuine crossing reads as collinear.  A product that is
+        #   exactly zero *because a factor is zero* is exact and stays on the
+        #   fast path; a product that is small with two non-zero factors did not
+        #   have to be.
+        #
+        # Neither mask fires on any layout with plausible UVs, so the exact path
+        # is entered exactly as rarely as before.
+        unreliable = ~np.isfinite(det)
+        unreliable |= (np.abs(det_left) < _SMALLEST_NORMAL) & (acx != 0.0) & (bcy != 0.0)
+        unreliable |= (np.abs(det_right) < _SMALLEST_NORMAL) & (acy != 0.0) & (bcx != 0.0)
+        uncertain = np.flatnonzero(unreliable | ~(np.abs(det) >= bound))
     if uncertain.size:
         ax = a[:, 0]
         ay = a[:, 1]
@@ -1027,10 +1116,19 @@ def _orient2d_sign_exact(
 
     Every finite float64 is exactly ``n / 2**k``.  Scaling all six coordinates
     to the common power ``2**max(k)`` makes them integers whose determinant is
-    an exact Python integer, so the sign is exact by construction.  Non-finite
-    input never reaches here: those segments are excluded before the broad
-    phase.
+    an exact Python integer, so the sign is exact by construction.
+
+    Non-finite input does not reach here through any public entry point --
+    :func:`_crossing_pairs_impl` drops those segments before the broad phase --
+    but ``as_integer_ratio`` raises on it, so the guard is kept: a point with no
+    position cannot lie to either side of a line, and ``0`` is the answer that
+    makes it not a crossing, which is how the rest of the module treats it.
     """
+    if not (
+        _isfinite(ax) and _isfinite(ay) and _isfinite(bx)
+        and _isfinite(by) and _isfinite(cx) and _isfinite(cy)
+    ):
+        return 0
     scaled: list[int] = []
     numerators: list[tuple[int, int]] = []
     widest = 0

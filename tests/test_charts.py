@@ -234,6 +234,26 @@ def bowtie():
     return make_sample(verts, tris, name="bowtie")
 
 
+#: The minimal triangulation of the real projective plane, RP^2_6 (the
+#: hemi-icosahedron): ``F=10, E=15, V=6``, so ``chi = 1``.  It is connected,
+#: every edge carries exactly two triangles, and every vertex link is a single
+#: cycle -- so it satisfies every condition :func:`is_disk` tests and is not a
+#: disk.  It is the *only* such surface: the classification of surfaces gives
+#: ``chi = 2 - 2g - b`` orientable and ``2 - k - b`` non-orientable, so
+#: ``chi == 1`` forces either ``(g=0, b=1)``, the disk, or ``(k=1, b=0)``,
+#: RP^2.  What separates them is that RP^2 is **closed**.
+RP2_TRIS = [
+    [0, 1, 2], [0, 2, 3], [0, 3, 4], [0, 4, 5], [0, 1, 5],
+    [1, 2, 4], [2, 3, 5], [3, 4, 1], [4, 5, 2], [5, 1, 3],
+]
+
+
+def projective_plane():
+    """Return RP^2_6 as a sample.  Not embeddable in R^3; the indices are legal."""
+    rng = np.random.default_rng(0)
+    return make_sample(rng.random((6, 3)), RP2_TRIS, name="rp2")
+
+
 # ---------------------------------------------------------------------------
 # is_disk
 # ---------------------------------------------------------------------------
@@ -280,6 +300,66 @@ class TestIsDisk:
         topo = charts.chart_topology(sample.tri_verts, np.zeros(2, dtype=np.int64), 1)
         assert int(topo.chi[0]) == 1, "the bowtie's Euler characteristic really is 1"
         assert not is_disk(sample, np.ones(2, dtype=bool))
+
+    def test_projective_plane_passes_every_other_condition_and_is_not_a_disk(self):
+        """RP^2 is the one surface chi==1 admits that is not a disk.
+
+        Regression for a real hole: the module's own justification reads "a
+        connected, **orientable**, manifold surface with ``chi == 1`` must have
+        a boundary ... and is therefore a disk", and orientability was named as
+        a hypothesis but never tested.  RP^2_6 is connected, edge-manifold,
+        vertex-manifold and has ``chi == 1``, so it passed all four conditions.
+
+        The fix does not test orientability directly, which would need a parity
+        union-find over the dual graph.  It tests the conclusion instead: a disk
+        has a boundary and RP^2 does not, and ``chi == 1`` with a boundary rules
+        the non-orientable case out arithmetically (``2 - k - b == 1`` with
+        ``k >= 1`` and ``b >= 1`` has no solution).
+        """
+        sample = projective_plane()
+        topo = charts.chart_topology(
+            np.asarray(RP2_TRIS, dtype=np.int64), np.zeros(10, dtype=np.int64), 1
+        )
+        assert int(topo.faces[0]) == 10
+        assert int(topo.edges[0]) == 15
+        assert int(topo.verts[0]) == 6
+        assert int(topo.chi[0]) == 1, "RP^2's Euler characteristic really is 1"
+        assert int(topo.components[0]) == 1
+        assert bool(topo.edge_manifold[0])
+        assert bool(topo.vertex_manifold[0])
+        assert int(topo.boundary_edges[0]) == 0, "RP^2 is closed"
+        assert not is_disk(sample, np.ones(10, dtype=bool))
+
+    def test_triangle_with_a_repeated_corner_is_not_a_disk(self):
+        """``(a, a, b)`` has ``F=1, E=2, V=2`` and therefore ``chi == 1``.
+
+        Its self-edge ``(a, a)`` carries one triangle and its ``(a, b)`` edge
+        carries two, so it is edge-manifold; the corner graph splits into two
+        components across two vertices, so it is vertex-manifold too.  It passed
+        every condition and is a degenerate sliver, not a disk.
+        """
+        rng = np.random.default_rng(1)
+        sample = make_sample(rng.random((2, 3)), [[0, 0, 1]], name="repeated_corner")
+        topo = charts.chart_topology(
+            np.asarray([[0, 0, 1]], dtype=np.int64), np.zeros(1, dtype=np.int64), 1
+        )
+        assert int(topo.chi[0]) == 1
+        assert int(topo.components[0]) == 1
+        assert bool(topo.edge_manifold[0])
+        assert bool(topo.vertex_manifold[0])
+        assert not is_disk(sample, np.ones(1, dtype=bool))
+
+    def test_a_real_disk_still_has_boundary_edges(self):
+        """The new condition must not cost a single legitimate disk."""
+        sample = quad_grid(3, 3)
+        topo = charts.chart_topology(
+            np.asarray(sample.tri_verts, dtype=np.int64),
+            np.zeros(sample.n_tris, dtype=np.int64),
+            1,
+        )
+        assert int(topo.boundary_edges[0]) == 12
+        assert int(topo.degenerate_faces[0]) == 0
+        assert is_disk(sample, np.ones(sample.n_tris, dtype=bool))
 
     def test_empty_selection_is_not_a_disk(self):
         sample = quad_grid(1, 1)
@@ -550,6 +630,49 @@ class TestMergeDisabled:
         assert report.flatten_calls == 0
         assert out.tolist() == labels.tolist()
         assert "disabled" in report.message
+
+    def test_positive_infinity_means_unbounded_not_the_default(self):
+        """``inf`` used to be folded into the 1.25 default by an ``isfinite``
+        guard, so a caller asking for no distortion bound silently got the
+        conservative one -- while ``1e300``, which is finite, behaved as
+        unbounded.  Two ways of writing the same request, two answers.
+        """
+        sample = quad_grid(2, 1)
+        labels = quad_grid_charts(2, 1, 1)
+        flat = anisotropic_flatten(4.0)
+        assert expected_stretch(4.0) > 1.25
+
+        _, capped = merge_charts(sample, labels, max_stretch=1.25, flatten=flat)
+        assert not capped.changed, "the merge must be out of reach at 1.25"
+
+        _, unbounded = merge_charts(
+            sample, labels, max_stretch=float("inf"), flatten=flat
+        )
+        assert unbounded.changed
+        _, huge = merge_charts(sample, labels, max_stretch=1e300, flatten=flat)
+        assert unbounded.changed == huge.changed
+
+    def test_negative_infinity_disables_merging(self):
+        """``-inf`` is below 1.0 and must mean off, not the 1.25 default."""
+        sample = quad_grid(2, 1)
+        labels = quad_grid_charts(2, 1, 1)
+        _, report = merge_charts(
+            sample, labels, max_stretch=float("-inf"), flatten=plane_flatten
+        )
+        assert not report.changed
+        assert report.flatten_calls == 0
+        assert "disabled" in report.message
+
+    def test_nan_falls_back_to_the_documented_default(self):
+        """NaN has no ordering, so neither "off" nor "unbounded" is defensible."""
+        sample = quad_grid(2, 1)
+        labels = quad_grid_charts(2, 1, 1)
+        _, nan = merge_charts(
+            sample, labels, max_stretch=float("nan"), flatten=plane_flatten
+        )
+        _, default = merge_charts(sample, labels, max_stretch=1.25, flatten=plane_flatten)
+        assert nan.changed == default.changed
+        assert len(nan.steps) == len(default.steps)
 
     def test_no_flattener_returns_the_input_untouched(self, monkeypatch):
         monkeypatch.setattr(charts, "_resolve_flatten", lambda _: None)
