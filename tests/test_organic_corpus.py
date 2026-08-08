@@ -93,6 +93,26 @@ def _load_render():
 render = _load_render()
 
 
+def _load_benchmark():
+    """Import ``tools/benchmark_organic.py`` behind the same ``bpy`` stub.
+
+    Only the bpy-free parts are exercised here -- the verdict rule and the
+    per-mesh failure handling -- but those are the parts whose bugs are silent.
+    """
+    name = "unwrap_variations_benchmark_organic"
+    if name in sys.modules:
+        return sys.modules[name]
+    sys.modules.setdefault("bpy", types.ModuleType("bpy"))
+    spec = importlib.util.spec_from_file_location(name, _TOOLS / "benchmark_organic.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+bench = _load_benchmark()
+
+
 @pytest.fixture(scope="module")
 def meshes():
     """Build every bpy-free corpus mesh once for the whole module."""
@@ -559,6 +579,35 @@ def test_island_labels_survive_a_broken_layout(meshes):
     labels = render.island_labels(sample.with_uvs(uvs))
     assert labels.shape[0] == sample.n_tris
     assert int(labels.min()) >= 0
+
+
+def test_one_unbuildable_mesh_does_not_lose_a_whole_benchmark_run():
+    """A corpus mesh that fails to build costs its own row and nothing else.
+
+    ``corpus.build`` raises by design when a mesh stops matching its pinned
+    invariants -- that is the corpus working, and it is what a numpy or builder
+    change produces.  The benchmark used to let that propagate out of its
+    measurement loop, so the *first* bad entry discarded every mesh already
+    measured.  A full run of this corpus is the better part of an hour, and
+    ``tools/render_uv_report.py`` already got this right, so the two scripts
+    disagreed about the same failure.
+    """
+    failures = []
+    assert bench.safe_build("pinched", failures) is not None
+    assert failures == []
+
+    saved = corpus.EXPECTED["pinched"]
+    corpus.EXPECTED["pinched"] = corpus.Invariants(1, 1, 1, (1,), (0,), 0)
+    try:
+        assert bench.safe_build("pinched", failures) is None
+    finally:
+        corpus.EXPECTED["pinched"] = saved
+    assert failures == ["pinched"]
+
+    # An unknown name is a caller error, not a corpus regression, and is caught
+    # up front by main(); safe_build still must not raise through the loop.
+    assert bench.safe_build("no_such_mesh", failures) is None
+    assert failures == ["pinched", "no_such_mesh"]
 
 
 def test_the_caption_names_a_disagreement_instead_of_hiding_it():

@@ -832,10 +832,21 @@ def main() -> int:
             images = [(prefix + "_uv.png",
                        uv_caption(drawn, int(metrics.island_count)))]
             if not args.no_views:
-                for path in render_views(
-                    obj, prefix, size=args.view_size, samples=args.samples
-                ):
-                    images.append((path, os.path.basename(path).rsplit("_", 1)[-1][:-4]))
+                # The 3D views go through EEVEE and the render pipeline; the UV
+                # panel above is pure numpy and has already been written.  A
+                # renderer failure -- a missing engine, a driver, a full disk --
+                # must therefore cost the three pictures it affects and not the
+                # whole report, which by then holds every measurement taken so
+                # far and is the only artefact of a run that takes minutes per
+                # mesh.
+                try:
+                    for path in render_views(
+                        obj, prefix, size=args.view_size, samples=args.samples
+                    ):
+                        images.append((path, os.path.basename(path).rsplit("_", 1)[-1][:-4]))
+                except Exception as exc:  # noqa: BLE001 -- see above
+                    print("  %-9s %-24s 3D VIEWS FAILED: %s" % (name, variant_id, exc))
+                    failures.append("%s/%s views" % (name, variant_id))
 
             variants.append(
                 {

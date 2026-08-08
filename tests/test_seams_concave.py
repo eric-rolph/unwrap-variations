@@ -598,6 +598,97 @@ def test_orientation_flip_leaves_an_open_shell_alone(name):
     np.testing.assert_array_equal(raw, fixed)
 
 
+def finned_tube(seg=16, radius=1.0, height=1.0, fin=0.4, invert=False):
+    """An open tube whose every rim edge carries **two** fins.
+
+    Every rim edge therefore has three incident faces, so the mesh contains no
+    ``face_count == 1`` edge at all even though it is plainly open.  This is the
+    shape that tells the two "is this shell closed?" tests apart: asking "does
+    any edge have one incident face?" says closed, and counting whether every
+    triangle side is paired says open, which is the truth.
+    """
+    verts = []
+    for z in (0.0, height):
+        for k in range(seg):
+            a = 2.0 * math.pi * k / seg
+            verts.append([radius * math.cos(a), radius * math.sin(a), z])
+    tris = []
+    for k in range(seg):
+        k2 = (k + 1) % seg
+        tris.append([k, k2, seg + k2])
+        tris.append([k, seg + k2, seg + k])
+    for k in range(seg):
+        k2 = (k + 1) % seg
+        a = 2.0 * math.pi * (k + 0.5) / seg
+        for base, z in ((k, -fin), (seg + k, height + fin)):
+            for scale in (1.4, 0.6):
+                verts.append([scale * radius * math.cos(a), scale * radius * math.sin(a), z])
+                other = k2 if base < seg else seg + k2
+                tris.append([base, other, len(verts) - 1])
+    arr = np.asarray(tris, dtype=np.int32)
+    if invert:
+        arr = arr[:, ::-1].copy()
+    return make_sample(np.asarray(verts, dtype=np.float64), arr, name="finned_tube")
+
+
+@pytest.mark.parametrize("invert", [False, True])
+def test_a_shell_bounded_only_by_non_manifold_edges_is_not_closed(invert):
+    """A shell with no ``face_count == 1`` edge can still be wide open.
+
+    ``_face_components`` joins triangles across ``face_count == 2`` edges only,
+    so a shell bounded entirely by non-manifold edges owns no boundary edge at
+    all.  The rim test then declares it closed, computes a "signed volume" that
+    is not a volume, and -- if the tube happens to be wound inward -- inverts
+    the sign of every edge on it.  Measured on this fixture before the fix:
+    ``face_count`` is only ever 1 (the fins' free edges, which belong to the
+    *fin* shells), 2 or 3; the tube shell itself sees no ``1``; and
+    ``invert=True`` flipped 16 of its 32 folds.
+
+    Both windings are checked, because an open shell has no inside and the
+    winding's answer is the only answer either way.
+    """
+    sample = finned_tube(invert=invert)
+    topo = seams.build_edge_topology(sample)
+    tube = topo.face_count >= 3
+    assert tube.any(), "fixture changed: no non-manifold rim edge left"
+    labels, n_shells = seams._face_components(topo)
+    shell = labels[topo.face_a[tube][0]]
+    assert not (
+        (topo.face_count == 1) & (labels[np.maximum(topo.face_a, 0)] == shell)
+    ).any(), "fixture changed: the tube shell now owns a plain boundary edge"
+    assert bool(seams._open_shells(topo, labels, n_shells)[shell]), (
+        "a shell bounded only by non-manifold edges was called closed"
+    )
+    raw = edge_signed_dihedral_deg(sample, topo, orient=False)
+    fixed = edge_signed_dihedral_deg(sample, topo, orient=True)
+    np.testing.assert_array_equal(raw, fixed)
+
+
+def test_open_shell_detection_still_calls_a_closed_shell_closed():
+    """The exact side-pairing test must not start calling closed shells open.
+
+    ``3F == 2E`` has to hold on every genuinely closed fixture, including the
+    quad-built ones whose n-gon tessellation diagonals are adjacencies with no
+    mesh edge behind them.  Without counting those the cube reads as open and
+    ``tests.conftest.make_cube`` -- signed volume ``-1.0`` -- stops being
+    corrected.
+    """
+    for sample in (outward_cube(), inverted_cube(), make_cube(), uv_sphere(), torus()):
+        topo = seams.build_edge_topology(sample)
+        labels, n_shells = seams._face_components(topo)
+        opened = seams._open_shells(topo, labels, n_shells)
+        assert not opened.any(), (
+            "%s is closed but %d of its %d shells were called open"
+            % (sample.name, int(opened.sum()), n_shells)
+        )
+    for sample in (open_tube(), make_flat_grid()):
+        topo = seams.build_edge_topology(sample)
+        labels, n_shells = seams._face_components(topo)
+        assert seams._open_shells(topo, labels, n_shells).all(), (
+            "%s has boundary edges but was called closed" % sample.name
+        )
+
+
 def test_the_crease_of_a_folded_strip_reads_as_a_valley():
     """The V-fold of an open strip is concave, and stays concave.
 

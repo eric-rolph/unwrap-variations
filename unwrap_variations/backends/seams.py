@@ -604,16 +604,61 @@ def _shell_orientation(
     volume = np.bincount(labels, weights=vol6, minlength=n_shells) / 6.0
 
     floor = _CLOSED_VOLUME_RATIO * np.power(np.maximum(weight, 0.0), 1.5)
-    is_open = np.zeros(n_shells, dtype=bool)
-    rim = topo.face_count == 1
-    if rim.any():
-        is_open[labels[topo.face_a[rim]]] = True
-    shell_sign = np.where(~is_open & (volume < -floor), -1.0, 1.0)
+    shell_sign = np.where(~_open_shells(topo, labels, n_shells) & (volume < -floor), -1.0, 1.0)
 
     has_face = topo.face_count >= 1
     out = ones.copy()
     out[has_face] = shell_sign[labels[topo.face_a[has_face]]]
     return out
+
+
+def _open_shells(topo: EdgeTopology, labels: np.ndarray, n_shells: int) -> np.ndarray:
+    """Return ``(n_shells,)`` bool: which shells are **not** closed 2-manifolds.
+
+    A closed 2-manifold shell pairs every one of its triangle sides with exactly
+    one other, so ``3F == 2E``.  Counting that directly is what makes the test
+    exact; the obvious shortcut -- "does any edge have a single incident face?"
+    -- is not equivalent and gets a real case wrong.
+
+    :func:`_face_components` joins triangles across ``face_count == 2`` edges
+    only, so a shell can be bounded **entirely** by non-manifold edges and then
+    owns no ``face_count == 1`` edge at all.  Measured on a tube with two fins
+    welded along every rim edge: ``face_count`` is 2 or 3 everywhere, the rim
+    test finds nothing, the shell is declared closed, and an inside-out tube has
+    the sign of every one of its edges flipped on a number that is not a volume
+    -- the exact mistake :func:`_shell_orientation`'s docstring says it exists
+    to avoid.
+
+    Args:
+        topo: Prebuilt edge topology.
+        labels: ``(T,)`` shell id per triangle, from :func:`_face_components`.
+        n_shells: Shell count.
+
+    Returns:
+        ``(n_shells,)`` bool, ``True`` where the shell is open or non-manifold.
+    """
+    if n_shells == 0:
+        return np.zeros(0, dtype=bool)
+    faces = np.bincount(labels, minlength=n_shells).astype(np.int64)
+    paired = np.zeros(n_shells, dtype=np.int64)
+    man = topo.face_count == 2
+    if man.any():
+        paired += np.bincount(labels[topo.face_a[man]], minlength=n_shells).astype(np.int64)
+    if topo.diag_a.size:
+        # An n-gon tessellation diagonal is a genuine adjacency with no mesh
+        # edge behind it; it pairs two sides just as a manifold edge does.
+        paired += np.bincount(labels[topo.diag_a], minlength=n_shells).astype(np.int64)
+    is_open = 3 * faces != 2 * paired
+    # Belt and braces: an edge with one incident face, or with three or more,
+    # means the shell it touches is not a closed 2-manifold whatever the count
+    # arithmetic says.
+    for mask in (topo.face_count == 1, topo.face_count >= 3):
+        if mask.any():
+            is_open[labels[topo.face_a[mask]]] = True
+    fan = topo.face_count >= 3
+    if fan.any():
+        is_open[labels[topo.face_b[fan]]] = True
+    return is_open
 
 
 def edge_curvature(topo: EdgeTopology) -> np.ndarray:

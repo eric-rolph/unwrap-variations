@@ -1829,6 +1829,7 @@ def merge_charts(
     max_merges: int | None = None,
     screen_iters: int | None = -1,
     time_budget: float = 0.0,
+    max_screens: int | None = None,
 ) -> tuple[np.ndarray, MergeReport]:
     """Greedily merge adjacent charts while each merge stays a disk and in bounds.
 
@@ -1886,6 +1887,15 @@ def merge_charts(
             conservative direction** -- see :data:`_SCREEN_FRACTION` for the
             measured counterexample on the corpus sphere, where screening admits
             a pair that full-quality screening refuses.
+        max_screens: Cap on how many candidate pairs are screened, counted in
+            flattener calls.  **Prefer this to ``time_budget``.** Both bound the
+            same work and both stop on a prefix of the greedy sequence, but a
+            wall-clock deadline makes the result depend on machine load, so the
+            same mesh and seed can produce different layouts on a busy machine.
+            Measured: with ``time_budget`` alone the seven-mesh benchmark's
+            Suzanne cell went from a run-to-run spread of 0.0 to **3.4** on
+            Blender 4.5.4.  A screen count is deterministic and bounds the same
+            thing, because screening is where essentially all the time goes.
         time_budget: Seconds after which no *new* candidate pair is screened;
             ``0`` means no limit.  Merges already screened and admissible are
             still taken, and an in-flight flatten is never interrupted, so the
@@ -1965,6 +1975,7 @@ def merge_charts(
             uvs=uvs,
             screen_iters=screen_iters,
             deadline=(started + time_budget) if time_budget > 0.0 else None,
+            max_screens=max_screens,
         )
     except Exception as exc:  # noqa: BLE001 - containment, per the contract
         report.failed = True
@@ -2009,6 +2020,7 @@ def _greedy_merge(
     uvs: np.ndarray | None = None,
     screen_iters: int | None = None,
     deadline: float | None = None,
+    max_screens: int | None = None,
 ) -> tuple[np.ndarray, list[MergeStep], dict[int, _Candidate]]:
     """Run the lazy-greedy merge loop.  See :func:`merge_charts` for the contract."""
     k = graph.n_charts
@@ -2124,6 +2136,8 @@ def _greedy_merge(
             return screened
         if deadline is not None and time.perf_counter() >= deadline:
             return screened
+        if max_screens is not None and report.flatten_calls >= max_screens:
+            return screened
         key = (members[chart], None)
         final = cache.get(key)
         if final is None:
@@ -2203,10 +2217,14 @@ def _greedy_merge(
             take_ready = -ready[0][0] >= bound
 
         if not take_ready:
-            if deadline is not None and time.perf_counter() >= deadline:
-                # Out of time for *new* screening.  Pairs already screened stay
-                # on ``ready`` and can still be accepted, so the run ends on a
-                # prefix of the greedy sequence rather than on a half-merge.
+            spent = (deadline is not None and time.perf_counter() >= deadline) or (
+                max_screens is not None and report.flatten_calls >= max_screens
+            )
+            if spent:
+                # Out of budget for *new* screening.  Pairs already screened
+                # stay on ``ready`` and can still be accepted, so the run ends
+                # on a prefix of the greedy sequence rather than on a
+                # half-merge.
                 report.out_of_time += len(pending)
                 pending.clear()
                 continue

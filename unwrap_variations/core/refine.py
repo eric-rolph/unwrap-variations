@@ -337,16 +337,23 @@ def _run_stage(stage, sample, uvs, *, params, topo, resolve=None):
     return None, "unknown stage %r" % (stage,)
 
 
-#: Seconds `merge_charts` may spend screening new candidate pairs, per
-#: candidate, per 1000 triangles.  Merging is the expensive stage by a wide
-#: margin and its result is always a prefix of the same greedy sequence, so a
-#: budget costs quality gracefully rather than producing a different kind of
-#: answer.  Measured on Suzanne over ten candidates: unbudgeted merging took
-#: 45.6 s of a 65.2 s generate for a best of 48.46; at 2.0 s it takes 16.0 s of
-#: 51.6 s for 47.33.  Roughly a point of score for a third of the wall-clock.
+#: How many candidate pairs `merge_charts` may screen, per candidate, per 1000
+#: triangles.  Merging is the expensive stage by a wide margin and its result is
+#: always a prefix of the same greedy sequence, so a budget costs quality
+#: gracefully rather than producing a different kind of answer.
+#:
+#: **This is a screen count and not a wall-clock deadline, on purpose.** A
+#: deadline makes the layout depend on machine load: the same mesh, the same
+#: seed and a busy machine give a different answer. Measured, with a wall-clock
+#: budget in place, the seven-mesh benchmark's Suzanne cell went from a
+#: run-to-run spread of 0.0 to **3.4** on Blender 4.5.4 -- our own column became
+#: the noisy one, in a document whose section 3 is about how seriously to take
+#: non-determinism. A count bounds the same work, because screening is where
+#: essentially all the time goes (profiled: 95.4 s of a 106.4 s run).
 #:
 #: It is a *rate* and not a constant because a constant tuned on Suzanne
-#: silently starves anything larger.  Measured with a flat 2.0 s:
+#: silently starves anything larger.  Measured with a flat wall-clock budget,
+#: before the rate was introduced:
 #:
 #: ============ ===== ===== =====
 #: mesh (tris)  2.0 s 8.0 s 30 s
@@ -360,18 +367,19 @@ def _run_stage(stage, sample, uvs, *, params, topo, resolve=None):
 #: chart plus 167 sliver ribbons -- a failure the score alone reported as
 #: merely "bad" and which only the rendered UV layout showed for what it was.
 #: The other two plateau early, so the rate costs them nothing.
-_MERGE_SECONDS_PER_KTRI = 2.0
-#: Floor and ceiling on the derived budget.  The floor keeps small meshes from
-#: getting a budget so short that merging cannot finish a single screen; the
-#: ceiling keeps a dense mesh from spending unbounded time in one stage.
-_MERGE_TIME_MIN = 2.0
-_MERGE_TIME_MAX = 15.0
+_MERGE_SCREENS_PER_KTRI = 120
+#: Floor and ceiling on the derived budget.  The floor keeps a small mesh from
+#: getting a budget too short to screen its way to any merge at all; the ceiling
+#: keeps a dense mesh from spending unbounded time in one stage.
+_MERGE_SCREENS_MIN = 120
+_MERGE_SCREENS_MAX = 900
 
 
-def _merge_time_budget(sample) -> float:
-    """Return the merge screening budget for this mesh, in seconds."""
+def _merge_screen_budget(sample) -> int:
+    """Return how many candidate pairs merging may screen for this mesh."""
     ktri = max(float(getattr(sample, "n_tris", 0)), 0.0) / 1000.0
-    return float(min(_MERGE_TIME_MAX, max(_MERGE_TIME_MIN, _MERGE_SECONDS_PER_KTRI * ktri)))
+    scaled = int(_MERGE_SCREENS_PER_KTRI * ktri)
+    return int(min(_MERGE_SCREENS_MAX, max(_MERGE_SCREENS_MIN, scaled)))
 
 
 def _stage_merge(sample, uvs, *, params, topo, resolve=None):
@@ -407,7 +415,7 @@ def _stage_merge(sample, uvs, *, params, topo, resolve=None):
         certify=injectivity.certify,
         uvs=uvs,
         topo=topo,
-        time_budget=_merge_time_budget(sample),
+        max_screens=_merge_screen_budget(sample),
     )
     n_after = int(np.unique(merged).size)
     if n_after >= n_before:

@@ -439,6 +439,32 @@ def verdict(ours, baseline) -> tuple[str, float, float]:
     return "tie", margin, noise
 
 
+def safe_build(name: str, failures: list):
+    """Build one corpus mesh, or record the failure and return ``None``.
+
+    ``corpus.build`` raises by design when a mesh stops matching its pinned
+    invariants -- that is the corpus doing its job, and it is exactly what a
+    numpy, Blender or builder change produces.  Letting it propagate out of the
+    measurement loop would discard every mesh already measured, and a full run
+    of this corpus takes the better part of an hour.  So one bad entry costs its
+    own row and nothing else; the run still exits non-zero because the failure
+    is real.
+
+    Args:
+        name: Corpus mesh name.
+        failures: Mutable list the failing name is appended to.
+
+    Returns:
+        The built mesh, or ``None`` when it could not be built.
+    """
+    try:
+        return corpus.build(name)
+    except Exception as exc:  # noqa: BLE001 -- one bad entry must not lose the run
+        say("%-17s BUILD FAILED: %s" % (name, str(exc).replace("\n", " | ")))
+        failures.append(name)
+        return None
+
+
 def parse_args(argv):
     """Parse the arguments Blender passed through after a bare ``--``."""
     parser = argparse.ArgumentParser(
@@ -553,8 +579,11 @@ def main() -> int:
 
     rows = []
     empty = []
+    broken = []
     for name in wanted:
-        mesh = corpus.build(name)
+        mesh = safe_build(name, broken)
+        if mesh is None:
+            continue
         smart_runs, unwrap_runs, before_runs, after_runs = [], [], [], []
         xatlas_runs = []
         stock_flags, counts, seconds = [], [], []
@@ -631,9 +660,14 @@ def main() -> int:
     say()
     _print_timings(rows)
 
+    if broken:
+        say()
+        say("FAILED: corpus mesh(es) would not build: %s" % ", ".join(broken))
+        say("  Every row above is still valid; these meshes are simply absent from it.")
     if empty:
         say()
         say("FAILED: no candidates at all for: %s" % ", ".join(empty))
+    if broken or empty:
         return 1
     say()
     say("DONE")
