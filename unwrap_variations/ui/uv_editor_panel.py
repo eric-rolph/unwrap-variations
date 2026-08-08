@@ -97,7 +97,7 @@ class UVVAR_PT_uv_editor(_UVVarImagePanel, Panel):
                 row.label(text="Scene properties not registered.", icon=ICON_WARN)
                 return
 
-            items = candidate_items(props)
+            items = candidate_items(props, context)
             count = len(items)
             if count == 0:
                 draw_empty_state(layout)
@@ -174,7 +174,7 @@ class UVVAR_PT_uv_editor_metrics(_UVVarImagePanel, Panel):
         layout = self.layout
         try:
             props = get_props(context)
-            items = candidate_items(props)
+            items = candidate_items(props, context)
             count = len(items)
             if count == 0:
                 layout.label(text="Nothing generated yet.", icon="INFO")

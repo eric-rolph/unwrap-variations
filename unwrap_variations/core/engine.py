@@ -46,6 +46,10 @@ __all__ = [
     "branch",
     "derive_uv_seams",
     "validate_object",
+    "chart_seams",
+    "chart_cut_request",
+    "CHART_CUT_KEY",
+    "CHART_SEED_KEY",
 ]
 
 #: Progress callback signature: ``(fraction_0_to_1, human_message)``.

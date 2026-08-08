@@ -253,22 +253,35 @@ def get_props(context: Context) -> Any:
         return None
 
 
-def candidate_items(props: Any) -> Sequence[Any]:
-    """Return the UI mirror collection of candidates.
+def candidate_items(props: Any, context: Context | None = None) -> Sequence[Any]:
+    """Return the UI mirror collection of candidates for the active object.
 
     ARCHITECTURE section 11 names this a ``CollectionProperty`` of
     ``UVVAR_CandidateItem``.  A couple of plausible attribute names are tried so
     a naming difference in ``properties.py`` degrades to an empty grid with a
     helpful message rather than a traceback.
 
+    Candidates belong to an object while the list lives on the scene, so when
+    ``context`` is supplied the mirror's ``mirror_object`` stamp is checked
+    against the active object and a mismatch yields nothing.  Otherwise the
+    panel shows the *previous* object's grid -- rows that look live and ranked,
+    but whose buttons the operators correctly refuse to act on.  The check is
+    one string comparison, which is what draw code can afford; the actual
+    resync happens on the message-bus callback in ``properties``.
+
     Args:
         props: The scene property group, possibly ``None``.
+        context: Current context.  Omit to skip the ownership check.
 
     Returns:
         The collection, or an empty tuple.
     """
     if props is None:
         return ()
+    if context is not None and hasattr(props, "mirror_object"):
+        obj = getattr(context, "object", None) or getattr(context, "active_object", None)
+        if str(getattr(obj, "name", "") or "") != str(props.mirror_object):
+            return ()
     for name in ("candidates", "candidate_items", "items", "grid"):
         coll = getattr(props, name, None)
         if coll is not None:
@@ -831,7 +844,7 @@ class UVVAR_PT_main(_UVVarViewportPanel, Panel):
                 return
 
             usable = draw_object_state(layout, context)
-            items = candidate_items(props)
+            items = candidate_items(props, context)
             count = len(items)
             active = _active_index(props, count)
 
@@ -911,7 +924,7 @@ class UVVAR_PT_generate(_UVVarViewportPanel, Panel):
             )
 
             layout.separator()
-            items = candidate_items(props)
+            items = candidate_items(props, context)
             branch_col = layout.column(align=True)
             branch_col.enabled = len(items) > 0
             draw_prop(branch_col, props, "mutation_strength", text="Variation")
@@ -941,7 +954,7 @@ class UVVAR_PT_candidates(_UVVarViewportPanel, Panel):
     def draw_header(self, context: Context) -> None:
         """Show the candidate count in the sub-panel header."""
         try:
-            count = len(candidate_items(get_props(context)))
+            count = len(candidate_items(get_props(context), context))
             if count:
                 self.layout.label(text="%d" % count)
         except Exception:  # noqa: BLE001
@@ -952,7 +965,7 @@ class UVVAR_PT_candidates(_UVVarViewportPanel, Panel):
         layout = self.layout
         try:
             props = get_props(context)
-            items = candidate_items(props)
+            items = candidate_items(props, context)
             if props is not None:
                 draw_prop(layout, props, "auto_preview", text="Auto Preview")
             draw_candidate_grid(
@@ -975,7 +988,7 @@ class UVVAR_PT_metrics(_UVVarViewportPanel, Panel):
         layout = self.layout
         try:
             props = get_props(context)
-            items = candidate_items(props)
+            items = candidate_items(props, context)
             count = len(items)
             if count == 0:
                 layout.label(text="Nothing generated yet.", icon="INFO")

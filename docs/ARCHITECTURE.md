@@ -176,7 +176,7 @@ class UVMetrics:
     # distortion
     angle_distortion: float      # mean abs angle deviation, DEGREES, area-weighted
     angle_distortion_max: float
-    area_distortion: float       # mean |log2(uv_area_norm / tri_area_norm)|
+    area_distortion: float       # AREA-WEIGHTED mean |log2(uv_norm / tri_norm)|
     stretch_l2: float            # Sander et al. 2001 L2 stretch, >= 1.0 ideal 1.0
     stretch_linf: float          # worst-case singular-value stretch
     conformal_error: float       # mean sigma_max/sigma_min - 1
@@ -186,7 +186,7 @@ class UVMetrics:
     seam_ratio: float            # seam_length / sqrt(total 3D area)  (scale-free)
     packing_efficiency: float    # used UV area / occupied AABB area, 0..1
     uv_coverage: float           # used UV area / 1.0 (unit square)
-    overlap_area: float          # 0.0 when clean
+    overlap_area: float          # 0.0 when clean; SATURATES at total used UV area
     flipped_tris: int
     degenerate_tris: int
     texel_density_cv: float      # coeff. of variation of sqrt(uv/3d) per triangle
