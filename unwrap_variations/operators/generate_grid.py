@@ -165,6 +165,44 @@ def _bridge_module() -> Any:
         return None
 
 
+def _drop_stale_blob(obj: Any, store: Any) -> None:
+    """Delete the persisted candidate blob before it is rewritten.
+
+    **This is a workaround for a real Blender bug, not defensive noise.**
+    Verified identically on 4.5.4 and 5.1.2: assigning ``bytes`` to a mesh
+    ID-property that *already holds* a bytes value truncates the new value at
+    its first NUL byte.  A zlib stream is full of NULs, so the second Generate
+    on the same object leaves a nine-byte stub behind -- silently, with no
+    error anywhere -- and every candidate stored in the ``.blend`` is lost.
+    ARCHITECTURE.md section 0 records that bytes ID-properties round-trip, and
+    that is true, but only for the *first* write.
+
+    Deleting the key first makes every write a first write, which does
+    round-trip correctly (proven up to 2 KB and 2 MB blobs on both versions).
+
+    Args:
+        obj: The object whose mesh carries the blob.
+        store: The store about to be saved, consulted for its ID key.
+    """
+    mesh = getattr(obj, "data", None)
+    if mesh is None:
+        return
+    key = getattr(store, "ID_KEY", None) or "uvvar_store_v1"
+    clear_id = getattr(store, "clear_id", None)
+    if callable(clear_id):
+        try:
+            clear_id(obj)
+            if mesh.get(key) is None:
+                return
+        except Exception:  # noqa: BLE001 - fall through to the direct delete.
+            _LOG.debug("store.clear_id failed", exc_info=True)
+    try:
+        if mesh.get(key) is not None:
+            del mesh[key]
+    except Exception:  # noqa: BLE001 - a failed delete only costs persistence.
+        _LOG.debug("could not delete stale %r before rewriting", key, exc_info=True)
+
+
 def adopt_report(
     context: Context,
     obj: Any,
@@ -215,6 +253,7 @@ def adopt_report(
     budget = max_persist_bytes(context)
     if budget > 0 and hasattr(store, "save_to_id"):
         try:
+            _drop_stale_blob(obj, store)
             ok, message = store.save_to_id(obj, max_bytes=budget)
             if not ok and message:
                 note = message
@@ -400,6 +439,19 @@ class UVVarModalJob:
             message: Short status text.
         """
         self._publish(bpy.context, fraction, message)
+
+    def should_cancel(self) -> bool:
+        """Cancellation probe handed to the engine.
+
+        The engine calls this between candidates
+        (``core.engine.generate(should_cancel=...)``), so a run that is already
+        marked for cancellation stops at the next candidate boundary instead of
+        working through the rest of the grid.
+
+        Returns:
+            ``True`` once the user has asked to stop.
+        """
+        return bool(self._cancel_requested)
 
     def _begin_progress(self, context: Context) -> None:
         """Open the window-manager progress bar and mark the scene as busy."""
@@ -612,6 +664,12 @@ class UVVAR_OT_generate_grid(UVVarModalJob, Operator):
             "weights": weights,
             "backends": backends,
             "compute_overlap": overlap,
+            # The operator owns storage: it merges, applies the persistence
+            # budget and refreshes the UI mirror. Letting the engine also
+            # "store" would build a throwaway CandidateStore, and building one
+            # decompresses whatever blob the mesh already carries -- up to the
+            # whole 64 MB budget, on every single run, for nothing.
+            "store": False,
         }
 
         _LOG.info(
@@ -656,6 +714,8 @@ class UVVAR_OT_generate_grid(UVVarModalJob, Operator):
             time.perf_counter() - self._started
         )
         summary = "%d candidates in %.1fs" % (total, seconds)
+        if getattr(report, "cancelled", False):
+            summary += " (cancelled early)"
         if failures:
             summary += ", %d failed" % len(failures)
         extra = uvvar_logging.format_lines(warnings + ([note] if note else []), limit=2)
@@ -709,7 +769,9 @@ def _drive_engine(
     incremental = getattr(engine, incremental_name, None)
     if callable(incremental):
         _LOG.debug("using incremental engine entry point %s", incremental_name)
-        generator = call_flexible(incremental, *args, **kwargs)
+        generator = call_flexible(
+            incremental, *args, should_cancel=job.should_cancel, **kwargs
+        )
         while True:
             try:
                 step = next(generator)
@@ -730,7 +792,13 @@ def _drive_engine(
     # before the solver takes the main thread; the engine's own progress
     # callback keeps the progress bar moving while it holds it.
     yield 0.0, "preparing %d %ss" % (total, unit_label)
-    job.job_report = call_flexible(blocking, *args, progress=job.progress_callback, **kwargs)
+    job.job_report = call_flexible(
+        blocking,
+        *args,
+        progress=job.progress_callback,
+        should_cancel=job.should_cancel,
+        **kwargs,
+    )
     yield 1.0, "scoring %d %ss" % (total, unit_label)
 
 

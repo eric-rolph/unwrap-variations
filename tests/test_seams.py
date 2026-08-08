@@ -70,7 +70,8 @@ def boundary_mask(sample) -> np.ndarray:
     order = np.argsort(edge_keys)
     sorted_keys = edge_keys[order]
     pos = np.searchsorted(sorted_keys, tri_keys)
-    valid = (pos < sorted_keys.size) & (sorted_keys[np.minimum(pos, sorted_keys.size - 1)] == tri_keys)
+    safe = np.minimum(pos, sorted_keys.size - 1)
+    valid = (pos < sorted_keys.size) & (sorted_keys[safe] == tri_keys)
     np.add.at(counts, order[pos[valid]], 1)
     return counts < 2
 
@@ -395,7 +396,7 @@ def test_dual_graph_is_deterministic():
 def test_every_strategy_is_deterministic(strategy):
     """Determinism across the board: a rerun of a seed reproduces a run."""
     sample = load_corpus("hardsurface")
-    kwargs = dict(angle_deg=33.0, curvature_threshold=0.4, seed=9)
+    kwargs = {"angle_deg": 33.0, "curvature_threshold": 0.4, "seed": 9}
     np.testing.assert_array_equal(
         compute_seams(sample, strategy, **kwargs),
         compute_seams(sample, strategy, **kwargs),

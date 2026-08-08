@@ -92,10 +92,14 @@ WEIGHT_PRESETS = (
      "Punish overlaps and flipped faces hard; favour even texel density"),
 )
 
-#: Viewport overlay modes.
+#: Viewport overlay modes.  Every identifier other than ``NONE`` must exist in
+#: ``ui.stretch_overlay.OVERLAY_MODES``: the drawing module falls back to
+#: ``STRETCH`` for anything it does not recognise, so an extra entry here shows
+#: the user a mode that quietly does something else.
 OVERLAY_MODES = (
     ("NONE", "Off", "No overlay"),
     ("STRETCH", "Stretch", "Colour faces by UV stretch, from low to high distortion"),
+    ("ANGLE", "Angle", "Colour faces by angular shear, from square to badly sheared"),
     ("CHECKER", "Checker", "Project a checker pattern to reveal texel density and flips"),
 )
 
@@ -313,7 +317,9 @@ class UVVAR_CandidateItem(PropertyGroup):
     parent: StringProperty(name="Parent", default="")
     seconds: FloatProperty(name="Seconds", default=0.0)
     has_metrics: BoolProperty(name="Has Metrics", default=False)
-    on_pareto_front: BoolProperty(name="Pareto Optimal", default=False)
+    #: Non-dominated over (stretch, seam ratio, packing).  The panel highlights
+    #: these, so the name matches what ``ui/viewport_panel.py`` reads.
+    is_pareto: BoolProperty(name="Pareto Optimal", default=False)
 
     # -- mirrored metrics (see ARCHITECTURE.md section 4) --------------------
 
@@ -501,6 +507,25 @@ class UVVAR_SceneProps(PropertyGroup):
         update=_on_overlay_mode_changed,
     )
 
+    overlay_opacity: FloatProperty(
+        name="Overlay Opacity",
+        description="Blend strength of the viewport overlay",
+        default=0.65,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+        update=_on_overlay_mode_changed,
+    )
+
+    grid_columns: IntProperty(
+        name="Grid Columns",
+        description="Columns in the candidate grid; 0 fits them to the panel width",
+        default=0,
+        min=0,
+        soft_max=6,
+        max=12,
+    )
+
     # -- transient status ----------------------------------------------------
 
     is_running: BoolProperty(
@@ -607,12 +632,15 @@ def sync_ui_list(scene: Scene | None, obj: Any, *, store: Any = None) -> int:
         kept = [c for c in items if getattr(c, "ok", True)]
         items = kept or items
 
+    pareto = _pareto_indices(items)
+
     written = 0
     restored = -1
     for rank, candidate in enumerate(items, start=1):
         row = props.candidates.add()
         try:
             row.fill_from(candidate, rank=rank)
+            row.is_pareto = int(getattr(candidate, "index", -1)) in pareto
         except Exception:  # noqa: BLE001
             _LOG.debug("could not mirror candidate %r", candidate, exc_info=True)
         if active_signature and row.signature == active_signature:
@@ -628,6 +656,35 @@ def sync_ui_list(scene: Scene | None, obj: Any, *, store: Any = None) -> int:
     else:
         _set_index_quietly(props, 0)
     return written
+
+
+def _pareto_indices(items: Any) -> set[int]:
+    """Return the store indices of the non-dominated candidates.
+
+    The Pareto front is what tells an artist "these are the genuinely different
+    good answers" as opposed to "these scored well under the current weights",
+    so the panel highlights it.  Computed here, once per resync, rather than in
+    draw code.
+
+    Args:
+        items: Candidates to consider.
+
+    Returns:
+        A set of ``Candidate.index`` values, empty when the front cannot be
+        computed (no metrics module, no metrics, or a failure -- none of which
+        is worth an error).
+    """
+    try:
+        from .core.metrics import pareto_front
+
+        usable = [c for c in items if getattr(c, "metrics", None) is not None]
+        if not usable:
+            return set()
+        front = pareto_front([c.metrics for c in usable])
+        return {int(usable[i].index) for i in front if 0 <= int(i) < len(usable)}
+    except Exception:  # noqa: BLE001 - a highlight is never worth an exception.
+        _LOG.debug("pareto front unavailable", exc_info=True)
+        return set()
 
 
 def _set_index_quietly(props: UVVAR_SceneProps, index: int) -> None:

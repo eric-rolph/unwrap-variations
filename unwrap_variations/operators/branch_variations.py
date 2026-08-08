@@ -191,6 +191,10 @@ class UVVAR_OT_branch_variations(UVVarModalJob, Operator):
             "seed": seed,
             "weights": weights,
             "compute_overlap": overlap,
+            # See generate_grid: the operator owns storage, so the engine's own
+            # commit would only cost a pointless decompress of the existing
+            # persisted blob.
+            "store": False,
         }
 
         _LOG.info(
@@ -247,6 +251,8 @@ class UVVAR_OT_branch_variations(UVVarModalJob, Operator):
             time.perf_counter() - self._started
         )
         summary = "%d new variations in %.1fs (%d total)" % (added, seconds, total)
+        if getattr(report, "cancelled", False):
+            summary += " (cancelled early)"
         if failures:
             summary += ", %d failed" % len(failures)
         extra = uvvar_logging.format_lines(warnings + ([note] if note else []), limit=2)

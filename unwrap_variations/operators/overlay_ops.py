@@ -43,6 +43,12 @@ __all__ = [
 
 _LOG = uvvar_logging.get_logger(__name__)
 
+#: One-call entry points that read ``Scene.uvvar`` themselves and put the
+#: drawing module into whatever state it describes -- mode *and* on/off.  Tried
+#: before anything else, because a module offering one of these has already
+#: solved the ordering problem that the two lists below have to guess at.
+_SYNC_NAMES: Sequence[str] = ("sync_from_props", "sync_overlay", "apply_props")
+
 #: Entry points tried, in order, to push a mode into the drawing module.
 #: The first that exists wins; all are called as ``fn(mode, context)`` with
 #: unsupported arguments dropped.
@@ -62,14 +68,26 @@ _LAST_ACTIVE_MODE = "STRETCH"
 
 
 def _overlay_module() -> Any:
-    """Return the UI drawing module, or ``None`` when it is unavailable."""
+    """Return the UI drawing module, or ``None`` when it is unavailable.
+
+    The drawing module's file name is not part of any contract, so both the
+    name it actually ships under (``ui.stretch_overlay``) and the generic
+    ``ui.overlay`` are tried.  Getting this wrong is silent: every call site
+    below degrades to "property only", so the overlay simply never appears.
+    """
+    try:
+        from ..ui import stretch_overlay
+
+        return stretch_overlay
+    except Exception:  # noqa: BLE001 - try the generic spelling next.
+        _LOG.debug("ui.stretch_overlay is not importable", exc_info=True)
     try:
         from ..ui import overlay
 
         return overlay
     except Exception:  # noqa: BLE001 - the overlay is optional.
         _LOG.debug("ui.overlay is not importable", exc_info=True)
-        return None
+    return None
 
 
 def _call_first(module: Any, names: Sequence[str], *args: Any, **kwargs: Any) -> bool:
@@ -127,12 +145,26 @@ def sync_overlay_state(context: Context | None = None) -> str:
         return mode
 
     prefs = get_prefs(ctx)
+    if _call_first(module, _SYNC_NAMES, context=ctx, prefs=prefs):
+        compat.tag_redraw(ctx)
+        return mode
+
     if mode == "NONE":
         if not _call_first(module, _DISABLE_NAMES, context=ctx):
             _call_first(module, _SET_MODE_NAMES, mode, context=ctx, prefs=prefs)
     else:
-        if not _call_first(module, _SET_MODE_NAMES, mode, context=ctx, prefs=prefs):
-            _call_first(module, _ENABLE_NAMES, mode, context=ctx, prefs=prefs)
+        # Both, not either: setting the mode says *how* to draw and does not
+        # install the draw handler, so a module that offers only ``set_mode``
+        # would change the mode of an overlay that never appears.
+        #
+        # ``mode`` is positional only for the setter, whose first parameter is
+        # the mode. The enablers' first parameter is the *context*
+        # (``enable_overlay(context, obj_name)``), so passing ``mode``
+        # positionally there would hand a string to something expecting a
+        # Context. Keywords are filtered against the real signature and are
+        # therefore safe whatever the enabler turns out to accept.
+        _call_first(module, _SET_MODE_NAMES, mode, context=ctx, prefs=prefs)
+        _call_first(module, _ENABLE_NAMES, context=ctx, mode=mode, prefs=prefs)
     compat.tag_redraw(ctx)
     return mode
 

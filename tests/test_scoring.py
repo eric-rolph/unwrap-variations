@@ -60,27 +60,27 @@ PRESET_NAMES = ("balanced", "low_distortion", "few_seams", "tight_packing", "gam
 
 def make_metrics(**kw) -> "metrics.UVMetrics":
     """Build a plausible mid-quality metrics record, overridden by ``kw``."""
-    base = dict(
-        angle_distortion=5.0,
-        angle_distortion_max=30.0,
-        area_distortion=0.15,
-        stretch_l2=1.05,
-        stretch_linf=1.8,
-        conformal_error=0.2,
-        island_count=8,
-        seam_length=12.0,
-        seam_ratio=1.5,
-        packing_efficiency=0.6,
-        uv_coverage=0.55,
-        overlap_area=0.0,
-        flipped_tris=0,
-        degenerate_tris=0,
-        texel_density_cv=0.2,
-        uv_bounds=(0.0, 0.0, 1.0, 1.0),
-        out_of_bounds_tris=0,
-        n_tris=1000,
-        eval_seconds=0.01,
-    )
+    base = {
+        "angle_distortion": 5.0,
+        "angle_distortion_max": 30.0,
+        "area_distortion": 0.15,
+        "stretch_l2": 1.05,
+        "stretch_linf": 1.8,
+        "conformal_error": 0.2,
+        "island_count": 8,
+        "seam_length": 12.0,
+        "seam_ratio": 1.5,
+        "packing_efficiency": 0.6,
+        "uv_coverage": 0.55,
+        "overlap_area": 0.0,
+        "flipped_tris": 0,
+        "degenerate_tris": 0,
+        "texel_density_cv": 0.2,
+        "uv_bounds": (0.0, 0.0, 1.0, 1.0),
+        "out_of_bounds_tris": 0,
+        "n_tris": 1000,
+        "eval_seconds": 0.01,
+    }
     base.update(kw)
     return UVMetrics(**base)
 
@@ -112,9 +112,7 @@ def improve(m, factor: float = 0.5):
     changes = {}
     for field in LOWER_IS_BETTER:
         value = getattr(m, field)
-        if field == "stretch_l2":
-            changes[field] = 1.0 + (value - 1.0) * factor
-        elif field == "stretch_linf":
+        if field == "stretch_l2" or field == "stretch_linf":
             changes[field] = 1.0 + (value - 1.0) * factor
         elif isinstance(value, int):
             changes[field] = int(value * factor)
@@ -432,6 +430,72 @@ def test_metrics_from_dict_is_tolerant():
 def test_metrics_summary_is_ascii():
     """The one-line summary is safe for a Windows cp1252 console."""
     make_metrics().summary().encode("ascii")
+
+
+@pytest.mark.xfail(
+    reason=(
+        "BUG in core/metrics.py UVMetrics.from_dict: the int/float conversions "
+        "sit inside a `try` that catches only (TypeError, ValueError). "
+        "int(float('inf')) and float(<huge python int>) both raise "
+        "OverflowError, which escapes. Same class as the ParamSpec.clamp bug. "
+        "Reachable from disk: json emits and accepts `Infinity`, and a JSON "
+        "integer literal of 400 digits parses to a Python int that float() "
+        "cannot take. Fix: add OverflowError to the except clause (and "
+        "saturate non-finite values toward the matching bound, as "
+        "ParamSpec.clamp now does)."
+    ),
+    raises=OverflowError,
+    strict=False,
+)
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"n_tris": Infinity}',
+        '{"flipped_tris": -Infinity}',
+        '{"island_count": Infinity}',
+        '{"degenerate_tris": Infinity}',
+        '{"out_of_bounds_tris": Infinity}',
+        '{"stretch_l2": %s}' % ("9" * 400),
+        '{"angle_distortion": -%s}' % ("9" * 400),
+    ],
+)
+def test_metrics_from_dict_contains_non_finite_values(payload):
+    """Deserialising metrics is a trust boundary and must never raise.
+
+    ``from_dict`` promises that "a ``.blend`` written by a newer add-on version
+    must still open in an older one".  An exception here does not degrade a
+    candidate, it propagates out of the file-load path.
+    """
+    m = UVMetrics.from_dict(json.loads(payload))
+    assert isinstance(m, UVMetrics)
+    assert math.isfinite(float(m.stretch_l2))
+    assert int(m.n_tris) >= 0
+    # And whatever came back must still be scoreable.
+    assert 0.0 <= score(m, ScoreWeights()) <= 100.0
+
+
+@pytest.mark.xfail(
+    reason=(
+        "BUG in core/metrics.py ScoreWeights.from_dict: float(value) inside a "
+        "`try` catching only (TypeError, ValueError); a JSON integer literal "
+        "too large for a float raises OverflowError and escapes. Fix: add "
+        "OverflowError to the except clause."
+    ),
+    raises=OverflowError,
+    strict=False,
+)
+def test_weights_from_dict_contains_an_oversized_integer():
+    """A stored weight too large to be a float falls back, it does not raise."""
+    w = ScoreWeights.from_dict(json.loads('{"angle": %s}' % ("9" * 400)))
+    assert math.isfinite(w.angle)
+
+
+def test_weights_from_dict_contains_infinity():
+    """A non-finite weight is accepted here and neutralised inside ``score``."""
+    w = ScoreWeights.from_dict(json.loads('{"angle": Infinity}'))
+    value = score(make_metrics(), w)
+    assert math.isfinite(value)
+    assert 0.0 <= value <= 100.0
 
 
 # ---------------------------------------------------------------------------

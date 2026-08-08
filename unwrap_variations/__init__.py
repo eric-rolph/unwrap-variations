@@ -112,10 +112,9 @@ _RELOAD_ORDER: tuple[str, ...] = (
     "operators.clear_candidates",
     "operators.overlay_ops",
     "ui",
-    "ui.overlay",
-    "ui.lists",
-    "ui.panels",
-    "ui.menus",
+    "ui.stretch_overlay",
+    "ui.viewport_panel",
+    "ui.uv_editor_panel",
 )
 
 

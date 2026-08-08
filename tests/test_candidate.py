@@ -289,7 +289,7 @@ def test_save_and_load_round_trip():
     restored = CandidateStore("Cube", 12)
     assert restored.load_from_id(obj)
     assert len(restored) == 3
-    for before, after in zip(store.all(), restored.all()):
+    for before, after in zip(store.all(), restored.all(), strict=False):
         assert after.params == before.params
         assert after.metrics == before.metrics
         assert after.score == pytest.approx(before.score)
@@ -519,6 +519,105 @@ def test_empty_store_round_trips():
     restored = CandidateStore("Cube", 12)
     assert restored.load_from_id(obj)
     assert len(restored) == 0
+
+
+def _blob_with_entry(entry: dict, *, loop_count: int = 12) -> bytes:
+    """Hand-build a persisted store blob carrying one candidate header entry."""
+    header = {
+        "version": STORE_VERSION,
+        "obj_name": "Cube",
+        "loop_count": loop_count,
+        "has_uvs": False,
+        "n_candidates": 1,
+        "created": 0.0,
+        "note": "",
+        "candidates": [entry],
+    }
+    encoded = json.dumps(header).encode("utf-8")
+    inner = struct.pack("<I", len(encoded)) + encoded
+    return STORE_MAGIC + struct.pack("<I", STORE_VERSION) + zlib.compress(inner, 1)
+
+
+_NON_FINITE_REASON = (
+    "BUG in core/candidate.py Candidate.from_header_dict: index, generation and "
+    "score are converted with bare int()/float() outside any try. "
+    "int(float('inf')) raises OverflowError, and float() of a JSON integer "
+    "literal too large for a double raises OverflowError too. Same class as the "
+    "ParamSpec.clamp bug that was just fixed. The metrics sub-dict IS guarded "
+    "(broad `except Exception`), so only these three scalars are exposed. "
+    "Consequence: CandidateStore.load_from_id -- documented as returning False "
+    "on unreadable data and never raising -- propagates OverflowError straight "
+    "out of the .blend load path. Fix: coerce through a helper that catches "
+    "(TypeError, ValueError, OverflowError) and falls back to the default."
+)
+
+
+@pytest.mark.xfail(reason=_NON_FINITE_REASON, raises=OverflowError, strict=False)
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"index": Infinity}',
+        '{"index": -Infinity}',
+        '{"generation": Infinity}',
+        '{"score": %s}' % ("9" * 400),
+        '{"seconds": -%s}' % ("9" * 400),
+    ],
+)
+def test_from_header_dict_contains_non_finite_scalars(payload):
+    """Rebuilding a candidate from a hostile header must not raise."""
+    c = Candidate.from_header_dict(json.loads(payload))
+    assert isinstance(c.index, int)
+    assert isinstance(c.generation, int)
+    assert isinstance(c.score, float)
+
+
+@pytest.mark.xfail(reason=_NON_FINITE_REASON, raises=OverflowError, strict=False)
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"index": float("inf")},
+        {"generation": float("inf")},
+        {"score": int("9" * 400)},
+    ],
+)
+def test_load_from_id_never_raises_on_a_non_finite_header(entry):
+    """The end-to-end path: a stored blob with a non-finite scalar in it.
+
+    ``load_from_id`` returns ``bool`` and is documented to leave the reason in
+    ``last_message``.  There is no signature by which it can report an
+    exception, and the caller is a file-load handler -- so raising here is not
+    a degraded candidate, it is a ``.blend`` that will not open.
+    """
+    obj = FakeObject("Cube", 12)
+    obj.data[CandidateStore.ID_KEY] = _blob_with_entry(entry)
+    store = CandidateStore("Cube", 12)
+    assert store.load_from_id(obj) in (True, False)
+
+
+def test_load_from_id_survives_a_hostile_params_payload():
+    """Garbage in the stored recipe is clamped by ``UnwrapParams.from_dict``.
+
+    Regression guard for the ``ParamSpec.clamp`` OverflowError: an ``Infinity``
+    in an int-valued parameter used to take the whole store down with it.
+    """
+    obj = FakeObject("Cube", 12)
+    obj.data[CandidateStore.ID_KEY] = _blob_with_entry(
+        {
+            "index": 0,
+            "params": {
+                "iterations": float("inf"),
+                "minimize_stretch_iters": float("-inf"),
+                "angle_limit_deg": float("nan"),
+                "method": "NONSENSE",
+            },
+        }
+    )
+    store = CandidateStore("Cube", 12)
+    assert store.load_from_id(obj) is True
+    params = store.get(0).params
+    assert params.clamped() == params
+    assert params.iterations == 100
+    assert params.minimize_stretch_iters == 0
 
 
 def test_preview_layer_and_id_key_are_contract_constants():

@@ -38,7 +38,6 @@ from tests.conftest import (
     make_nan_uvs,
     make_overlapping_pair,
     make_random_mesh,
-    make_rect_to_square,
     make_unit_triangle,
     make_zero_area_mix,
 )
@@ -594,6 +593,44 @@ def test_pathological_meshes_never_raise(evaluator, compute_overlap):
     for sample in all_pathological():
         m = evaluator.evaluate(sample, compute_overlap=compute_overlap)
         _assert_sane(m, sample.name)
+
+
+@pytest.mark.xfail(
+    reason=(
+        "BUG (cosmetic but user-visible) in core/evaluator.py: the vectorised "
+        "path emits numpy RuntimeWarnings on degenerate input -- 'overflow "
+        "encountered in divide' at the conformal-error ratio (the "
+        "np.maximum(sig_min_sq, _TINY) guard is too small to stop the overflow "
+        "when sig_max_sq is astronomically large), and 'invalid value "
+        "encountered in minimum/maximum' from the np.minimum.at / np.maximum.at "
+        "island-bounds reduction when a UV is NaN. Every returned value is "
+        "still finite, so this is noise rather than wrongness -- but it is "
+        "noise printed into Blender's console on any mesh with a collapsed "
+        "face or a NaN UV, which is exactly the mesh the user is already "
+        "confused about. Fix: wrap _evaluate_impl in "
+        "`with np.errstate(all='ignore'):`, or mask non-finite UVs before the "
+        "bounds reduction."
+    ),
+    strict=False,
+)
+def test_evaluate_emits_no_numpy_warnings(evaluator):
+    """A clean run leaves nothing in the console, even on broken geometry."""
+    import warnings
+
+    samples = all_pathological() + [
+        make_random_mesh(seed, mode=mode)
+        for mode in ("spiky", "chaotic", "jittered")
+        for seed in range(8)
+    ]
+    for sample in samples:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            evaluator.evaluate(sample, compute_overlap=True)
+        runtime = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        assert not runtime, "%s produced %s" % (
+            sample.name,
+            [str(w.message) for w in runtime],
+        )
 
 
 def test_empty_mesh(evaluator):

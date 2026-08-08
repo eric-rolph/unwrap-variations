@@ -100,32 +100,46 @@ PROJECTION_METHODS = ("SMART_PROJECT", "CUBE_PROJECT")
 
 #: ``rotate_method`` handed to ``bpy.ops.uv.pack_islands``.
 #:
-#: This is a **performance** choice, measured rather than guessed.  Blender's
-#: packer runs a rotation search per island inside a binary search over scale,
-#: and that search -- not the unwrap solver -- dominates generation time.
-#: Measured on Blender 4.5.4, ten meshes (cube/cone/cylinder/torus/Suzanne, each
-#: unwrapped both ways), summing the ``pack_islands`` call only:
+#: Left at Blender's own default so that a candidate matches what the user would
+#: get by pressing Pack Islands by hand.  Tempting though it is to pick a
+#: "faster" constant here, the cost of each rotate method is strongly
+#: input-dependent and *not* monotonic: measured on Blender 4.5.4,
+#: ``AXIS_ALIGNED_X`` totals 1.13 s across a ten-case suite where ``ANY`` totals
+#: 26.12 s -- yet on a cube smart-projected at 30 degrees with margin 0.02 it is
+#: the **worst** option (7.43 s versus 0.85 s for ``ANY``).  No constant is safe,
+#: so the real fix is :data:`CONCAVE_MIN_TRIS` below.  Overridable per recipe
+#: with ``params.extra["pack_rotate_method"]``; ``extra`` participates in
+#: :meth:`UnwrapParams.signature`, so overriding still de-duplicates correctly.
+DEFAULT_PACK_ROTATE_METHOD = "ANY"
+
+#: Triangle count below which ``shape_method='CONCAVE'`` is downgraded to
+#: ``'CONVEX'`` for packing.
 #:
-#: ===================  ==========  ==============
-#: ``rotate_method``    total time  mean coverage
-#: ===================  ==========  ==============
-#: ``AXIS_ALIGNED_X``       1.13 s          0.681
-#: ``AXIS_ALIGNED_Y``       5.49 s          0.679
-#: ``CARDINAL``            25.06 s          0.719
-#: ``ANY``                 26.12 s          0.694
-#: ``AXIS_ALIGNED``        26.29 s          0.694
-#: ===================  ==========  ==============
+#: Blender's packer runs an exhaustive placement search whose cost *rises* as the
+#: island count *falls*, and ``CONCAVE`` (which fits islands into each other's
+#: concavities) is by far its most expensive mode.  The effect is dramatic and
+#: inverted against mesh size -- measured on Blender 4.5.4, ``pack_islands``
+#: alone, subdividing one cube:
 #:
-#: ``AXIS_ALIGNED_X`` is ~23x faster than ``ANY`` for ~2% less mean packing
-#: coverage, and it also defuses a pathological case: a cone packed with
-#: ``margin_method='FRACTION'`` takes 31.8 s under ``ANY`` and 0.29 s here.
-#: Since the whole point of this add-on is generating ten candidates and
-#: comparing them, a 23x speedup at 2% coverage is the right trade -- but it is
-#: a trade, so a recipe can opt back into maximum quality with
-#: ``params.extra["pack_rotate_method"] = "ANY"``.  ``extra`` participates in
-#: :meth:`UnwrapParams.signature`, so overriding it still de-duplicates
-#: correctly.
-DEFAULT_PACK_ROTATE_METHOD = "AXIS_ALIGNED_X"
+#: ======  =======  ==========
+#: faces   islands  ``CONCAVE``
+#: ======  =======  ==========
+#: 6             6      8.46 s
+#: 24            6      0.34 s
+#: 54            6      0.23 s
+#: 96            6      0.15 s
+#: ======  =======  ==========
+#:
+#: and on a bare cube ``CONCAVE`` takes 7.18 s where ``CONVEX`` takes 0.044 s --
+#: 163x -- for a measured packing-coverage gain of **exactly zero**.  Concave
+#: packing can only pay off when there are enough islands to nestle together; on
+#: the handful of islands a small mesh produces it burns seconds to arrive at
+#: the same layout.  Above this threshold ``CONCAVE`` is both affordable
+#: (0.15-0.4 s on 500-tri meshes) and genuinely better (+0.08 coverage on a
+#: torus), so it is passed through untouched.
+#:
+#: Set ``params.extra["pack_shape_guard"] = False`` to disable the downgrade.
+CONCAVE_MIN_TRIS = 256
 
 #: Legal ``rotate_method`` identifiers for ``uv.pack_islands`` (a superset of
 #: :data:`unwrap_variations.core.params.ROTATE_METHODS`).
@@ -617,7 +631,27 @@ def _select_all_uvs(bpy: ModuleType) -> bool:
     return ok
 
 
-def _pack_islands(bpy: ModuleType, params: UnwrapParams, notes: _Notes) -> bool:
+def _pack_shape_method(params: UnwrapParams, n_tris: int, notes: _Notes) -> str:
+    """Return the ``shape_method`` to pack with, applying the small-mesh guard.
+
+    See :data:`CONCAVE_MIN_TRIS` for the measurements behind the downgrade.  The
+    guard is announced in the candidate's message, so a user who wonders why two
+    recipes differing only in ``pack_shape_method`` came out identical on a cube
+    can see exactly why.
+    """
+    requested = _enum(params.pack_shape_method, PACK_SHAPE_METHODS, "CONCAVE")
+    extra = params.extra if isinstance(params.extra, dict) else {}
+    if not extra.get("pack_shape_guard", True):
+        return requested
+    if requested == "CONCAVE" and 0 < n_tris < CONCAVE_MIN_TRIS:
+        notes.add("concave packing downgraded to convex below %d tris (no measurable "
+                  "gain, up to 160x slower)", CONCAVE_MIN_TRIS)
+        return "CONVEX"
+    return requested
+
+
+def _pack_islands(bpy: ModuleType, params: UnwrapParams, notes: _Notes,
+                  n_tris: int = 0) -> bool:
     """Pack the UV islands, with the 4.5-compatible selection fallback.
 
     Strategy, in order:
@@ -650,7 +684,7 @@ def _pack_islands(bpy: ModuleType, params: UnwrapParams, notes: _Notes) -> bool:
         "margin": float(params.island_margin),
         "pin": False,
         "pin_method": "LOCKED",
-        "shape_method": _enum(params.pack_shape_method, PACK_SHAPE_METHODS, "CONCAVE"),
+        "shape_method": _pack_shape_method(params, n_tris, notes),
     }
 
     _select_all_uvs(bpy)
@@ -674,7 +708,8 @@ def _pack_islands(bpy: ModuleType, params: UnwrapParams, notes: _Notes) -> bool:
     return False
 
 
-def _post_process(bpy: ModuleType, params: UnwrapParams, notes: _Notes) -> None:
+def _post_process(bpy: ModuleType, params: UnwrapParams, notes: _Notes,
+                  n_tris: int = 0) -> None:
     """Run the optional relax / normalise / pack passes after the main unwrap.
 
     ``minimize_stretch`` is applied only to the seam-driven solvers, matching
@@ -700,7 +735,7 @@ def _post_process(bpy: ModuleType, params: UnwrapParams, notes: _Notes) -> None:
         if not ok:
             notes.add("average_islands_scale returned %s", detail)
 
-    _pack_islands(bpy, params, notes)
+    _pack_islands(bpy, params, notes, n_tris)
 
 
 # ---------------------------------------------------------------------------
@@ -854,7 +889,7 @@ class BlenderNativeBackend(UnwrapBackend):
             if not ok:
                 notes.add("mesh.select_all returned %s", detail)
             _run_method(bpy, params, notes)
-            _post_process(bpy, params, notes)
+            _post_process(bpy, params, notes, req.sample.n_tris)
         finally:
             _call_op(bpy.ops.object.mode_set, mode="OBJECT")
 

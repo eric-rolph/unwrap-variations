@@ -118,7 +118,7 @@ _RECT_GRID_CELLS = 4_000_000
 #: Overlap guards.  A pathological layout (every triangle stacked on the same
 #: spot) would otherwise generate a quadratic number of candidate pairs.
 _OVERLAP_MAX_INSERTS = 8_000_000
-_OVERLAP_MAX_PAIRS = 8_000_000
+_OVERLAP_MAX_PAIRS = 2_000_000
 _OVERLAP_CHUNK = 65_536
 _OVERLAP_MAX_GRID_DIM = 4096
 
@@ -246,9 +246,7 @@ class _Clean:
         self.n_dropped = self.n_tris - tri_verts.shape[0]
 
         edge_verts = np.asarray(sample.edge_verts, dtype=np.int64)
-        edge_verts = (
-            edge_verts.reshape(-1, 2) if edge_verts.size else np.zeros((0, 2), np.int64)
-        )
+        edge_verts = edge_verts.reshape(-1, 2) if edge_verts.size else np.zeros((0, 2), np.int64)
         edge_seam = np.asarray(sample.edge_seam, dtype=bool).reshape(-1)
         n_edges = min(edge_verts.shape[0], edge_seam.shape[0])
         self.edge_verts = edge_verts[:n_edges]
@@ -315,9 +313,7 @@ def _evaluate_impl(sample: UVMeshSample, compute_overlap: bool) -> UVMetrics:
     finite3 = np.isfinite(e3) & np.isfinite(f3) & np.isfinite(g3)
     finite2 = np.isfinite(e2d) & np.isfinite(f2d) & np.isfinite(g2d)
     # Same rule as meshdata.degenerate_mask, expressed on the scalars.
-    good = (
-        finite3 & finite2 & (area3 > _DEGENERATE_EPS) & (abs_uv > _DEGENERATE_EPS)
-    )
+    good = finite3 & finite2 & (area3 > _DEGENERATE_EPS) & (abs_uv > _DEGENERATE_EPS)
     n_good = int(good.sum())
     degenerate_tris = int(good.shape[0] - n_good) + data.n_dropped
 
@@ -325,9 +321,15 @@ def _evaluate_impl(sample: UVMeshSample, compute_overlap: bool) -> UVMetrics:
     flipped_tris = int(np.count_nonzero(good & (signed_uv < 0.0)))
 
     seam_length, seam_ratio = _seam_metrics(data, total_area3)
-    uv_bounds, out_of_bounds = _bounds_metrics(
-        tri_lo_u, tri_lo_v, tri_hi_u, tri_hi_v, finite2
-    )
+    uv_bounds, out_of_bounds = _bounds_metrics(tri_lo_u, tri_lo_v, tri_hi_u, tri_hi_v, finite2)
+    if not finite2.all():
+        # A single NaN corner would otherwise poison its whole island's bounding
+        # box and drop that island from the count; collapse it to a point
+        # instead, which contributes nothing to the union.
+        tri_lo_u = np.where(finite2, tri_lo_u, 0.0)
+        tri_lo_v = np.where(finite2, tri_lo_v, 0.0)
+        tri_hi_u = np.where(finite2, tri_hi_u, 0.0)
+        tri_hi_v = np.where(finite2, tri_hi_v, 0.0)
     island_count, packing_efficiency = _island_metrics(
         data, abs_uv, good, uv_bounds, tri_lo_u, tri_lo_v, tri_hi_u, tri_hi_v
     )
@@ -351,10 +353,7 @@ def _evaluate_impl(sample: UVMeshSample, compute_overlap: bool) -> UVMetrics:
     # Restrict the distortion maths to measurable triangles.  ``good.all()`` is
     # the overwhelmingly common case, and skipping the fancy-index copies there
     # is worth the branch on a 500k-triangle mesh.
-    if n_good == good.shape[0]:
-        sel = slice(None)
-    else:
-        sel = np.flatnonzero(good)
+    sel = slice(None) if n_good == good.shape[0] else np.flatnonzero(good)
     g_e3, g_f3, g_g3 = e3[sel], f3[sel], g3[sel]
     g_e2, g_f2, g_g2 = e2d[sel], f2d[sel], g2d[sel]
     g_area3 = area3[sel]
@@ -362,12 +361,18 @@ def _evaluate_impl(sample: UVMeshSample, compute_overlap: bool) -> UVMetrics:
     g_signed = signed_uv[sel]
 
     stretch_l2, stretch_linf, conformal_error = _stretch_metrics(
-        g_e3, g_f3, g_g3, ds1[sel], dt1[sel], ds2[sel], dt2[sel],
-        g_area3, g_abs_uv, g_signed,
+        g_e3,
+        g_f3,
+        g_g3,
+        ds1[sel],
+        dt1[sel],
+        ds2[sel],
+        dt2[sel],
+        g_area3,
+        g_abs_uv,
+        g_signed,
     )
-    angle_mean, angle_max = _angle_metrics(
-        g_e3, g_f3, g_g3, g_e2, g_f2, g_g2, g_area3
-    )
+    angle_mean, angle_max = _angle_metrics(g_e3, g_f3, g_g3, g_e2, g_f2, g_g2, g_area3)
     area_distortion = _area_distortion(g_area3, g_abs_uv)
     texel_cv = _texel_density_cv(g_area3, g_abs_uv)
 
@@ -437,9 +442,7 @@ def _stretch_metrics(
     inv_dsq = 1.0 / (4.0 * signed_uv * signed_uv)  # 1 / D^2, D = 2 * signed area
     a = (dt2 * dt2 * e3 - 2.0 * dt1 * dt2 * f3 + dt1 * dt1 * g3) * inv_dsq
     c = (ds2 * ds2 * e3 - 2.0 * ds1 * ds2 * f3 + ds1 * ds1 * g3) * inv_dsq
-    b = (
-        (ds1 * dt2 + ds2 * dt1) * f3 - ds2 * dt2 * e3 - ds1 * dt1 * g3
-    ) * inv_dsq
+    b = ((ds1 * dt2 + ds2 * dt1) * f3 - ds2 * dt2 * e3 - ds1 * dt1 * g3) * inv_dsq
 
     half_sum = 0.5 * (a + c)
     half_diff = 0.5 * (a - c)
@@ -456,9 +459,7 @@ def _stretch_metrics(
     else:
         l2_sq = float(half_sum.mean()) if half_sum.size else 1.0
     stretch_l2 = k_norm * math.sqrt(max(l2_sq, 0.0))
-    stretch_linf = (
-        k_norm * math.sqrt(float(sig_max_sq.max())) if sig_max_sq.size else 1.0
-    )
+    stretch_linf = k_norm * math.sqrt(float(sig_max_sq.max())) if sig_max_sq.size else 1.0
 
     ratio = np.sqrt(sig_max_sq / np.maximum(sig_min_sq, _TINY))
     if total_3d > 0.0:
@@ -509,11 +510,14 @@ def _angle_metrics(
     d1 = np.abs(a1 - b1)
     d2 = np.abs(a2 - b2)
     per_tri = (d0 + d1 + d2) * (_RAD_TO_DEG / 3.0)
-    worst = max(
-        float(d0.max()) if d0.size else 0.0,
-        float(d1.max()) if d1.size else 0.0,
-        float(d2.max()) if d2.size else 0.0,
-    ) * _RAD_TO_DEG
+    worst = (
+        max(
+            float(d0.max()) if d0.size else 0.0,
+            float(d1.max()) if d1.size else 0.0,
+            float(d2.max()) if d2.size else 0.0,
+        )
+        * _RAD_TO_DEG
+    )
 
     total = float(area3.sum())
     if total > 0.0:
@@ -695,10 +699,10 @@ def _island_metrics(
 
     union_area = _union_rect_area(lo, hi)
     used_area = float(abs_uv[good].sum()) if good.any() else 0.0
-    if union_area > 0.0 and used_area > 0.0:
-        efficiency = min(1.0, used_area / union_area)
-    else:
-        efficiency = 0.0
+    # Clamped at 1.0: anything above it is overlap, which is reported separately
+    # rather than being allowed to masquerade as super-efficient packing.
+    measurable = union_area > 0.0 and used_area > 0.0
+    efficiency = min(1.0, used_area / union_area) if measurable else 0.0
     return island_count, _finite(efficiency, 0.0)
 
 
@@ -767,13 +771,20 @@ def _uv_vertex_nodes(data: _Clean, uv_bounds: tuple[float, float, float, float])
     # Keep vert * cells^2 inside int64.  1<<20 cells per axis is plenty: with a
     # 1e-6 relative tolerance nothing finer is meaningful.
     budget = (1 << 62) // max(n_slots, 1)
-    cells = max(2, min(int(math.isqrt(max(budget, 4))), 1 << 20))
+    cells = max(4, min(int(math.isqrt(max(budget, 16))), 1 << 20))
     span = float(max(hi_u - lo_u, hi_v - lo_v, 0.0))
     step = _WELD_EPS * max(span, 1.0)
     if not (step > 0.0) or not math.isfinite(step):
         step = 1.0
     if span / step > cells - 2:
         step = span / (cells - 2)
+    # The lattice index is computed as ``uv/step - lo/step``, so ``lo/step`` has
+    # to stay inside the range where float64 still resolves integers.  UVs out
+    # at 1e15 would otherwise quantise to noise; coarsening the tolerance
+    # degrades gracefully instead.
+    far = max(abs(lo_u), abs(hi_u), abs(lo_v), abs(hi_v), 0.0)
+    if far > 0.0 and far / step > 4.0e15:
+        step = far / 4.0e15
     inv_step = 1.0 / step
 
     # rel is non-negative and bounded by cells-2, so truncation after +0.5 is a
@@ -818,8 +829,7 @@ def _uv_vertex_nodes(data: _Clean, uv_bounds: tuple[float, float, float, float])
         if rest.size > 1:
             alt_key = (
                 vert[rest] * (cells * cells)
-                + (uv[rest, 1] * inv_step + (1.0 - lo_v * inv_step)).astype(np.int64)
-                * cells
+                + (uv[rest, 1] * inv_step + (1.0 - lo_v * inv_step)).astype(np.int64) * cells
                 + (uv[rest, 0] * inv_step + (1.0 - lo_u * inv_step)).astype(np.int64)
             )
             alt_uniq, alt_inv = np.unique(alt_key, return_inverse=True)
@@ -954,13 +964,11 @@ def _union_rect_area(lo: np.ndarray, hi: np.ndarray) -> float:
     j1 = j1[span]
 
     stride = ny + 1
-    flat = np.concatenate(
-        [i0 * stride + j0, i1 * stride + j1, i0 * stride + j1, i1 * stride + j0]
-    )
+    flat = np.concatenate([i0 * stride + j0, i1 * stride + j1, i0 * stride + j1, i1 * stride + j0])
     n_rect = i0.size
     weights = np.empty(4 * n_rect, dtype=np.float64)
     weights[: 2 * n_rect] = 1.0
-    weights[2 * n_rect:] = -1.0
+    weights[2 * n_rect :] = -1.0
     diff = np.bincount(flat, weights=weights, minlength=(nx + 1) * stride)
     diff = diff.reshape(nx + 1, stride)
     covered = np.cumsum(np.cumsum(diff, axis=0), axis=1)[:nx, :ny] > 0.5
@@ -980,9 +988,7 @@ def _union_rect_area(lo: np.ndarray, hi: np.ndarray) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _overlap_area(
-    uv: np.ndarray, lo: np.ndarray, hi: np.ndarray, total_uv_area: float
-) -> float:
+def _overlap_area(uv: np.ndarray, lo: np.ndarray, hi: np.ndarray, total_uv_area: float) -> float:
     """Return the total pairwise overlapping UV area.
 
     Args:
@@ -1092,6 +1098,11 @@ def _overlap_area(
             scale=np.maximum(tri_scale[sub_a], tri_scale[sub_b]),
         )
         accumulated += float(areas[areas > area_eps].sum())
+        # The answer is clamped to the used area, so once it saturates no
+        # further pair can change it.  This is what keeps a catastrophic layout
+        # (every triangle stacked on one spot) from costing seconds.
+        if total_uv_area > 0.0 and accumulated >= total_uv_area:
+            return total_uv_area
 
     if total_uv_area > 0.0:
         accumulated = min(accumulated, total_uv_area)
@@ -1185,9 +1196,7 @@ def _pair_intersection_area(
     da = tri_a[:, [1, 2, 0], :] - tri_a
     db = tri_b[:, [1, 2, 0], :] - tri_b
     if scale is None:
-        scale = np.maximum(
-            np.abs(da).max(axis=(1, 2)), np.abs(db).max(axis=(1, 2))
-        )
+        scale = np.maximum(np.abs(da).max(axis=(1, 2)), np.abs(db).max(axis=(1, 2)))
     scale = np.where(scale > 0.0, scale, 1.0)
     tol = 1e-12 * scale * scale
 

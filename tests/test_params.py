@@ -15,6 +15,7 @@ hand back the parent it was asked to vary.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 
@@ -30,7 +31,6 @@ from unwrap_variations.core.params import (
     mutate,
     sample_grid,
 )
-
 
 # ---------------------------------------------------------------------------
 # Signatures.
@@ -224,19 +224,6 @@ def test_every_param_spec_clamps_hostile_input(name, spec):
             assert spec.low <= value <= spec.high
 
 
-@pytest.mark.xfail(
-    reason=(
-        "BUG in core/params.py: ParamSpec.clamp() converts an int field with "
-        "int(value) inside a `try` that only catches (TypeError, ValueError). "
-        "float('inf') raises OverflowError, which escapes. Reachable from disk: "
-        "json.dumps writes `Infinity`, json.loads reads it back, so "
-        "UnwrapParams.from_dict({'iterations': Infinity}) raises and a stored "
-        "candidate set fails to load. Fix: add OverflowError to the except "
-        "clause, or guard with math.isfinite() before int()."
-    ),
-    raises=OverflowError,
-    strict=False,
-)
 @pytest.mark.parametrize("field", ["iterations", "minimize_stretch_iters"])
 @pytest.mark.parametrize("value", [float("inf"), float("-inf")])
 def test_infinite_values_clamp_into_int_fields(field, value):
@@ -245,10 +232,76 @@ def test_infinite_values_clamp_into_int_fields(field, value):
     ``clamped()`` is the trust boundary between stored data and the Blender
     operators, and the contract says it forces garbage into range.  Infinity is
     garbage; the only question is whether it is *contained* garbage.
+
+    Regression test.  ``ParamSpec.clamp`` used to call ``int(value)`` inside a
+    ``try`` that caught only ``(TypeError, ValueError)``; ``int(float('inf'))``
+    raises ``OverflowError``, which escaped.  That was reachable from disk --
+    ``json.dumps`` writes ``Infinity`` and ``json.loads`` reads it back -- so a
+    single stored infinity made a whole candidate set fail to load.
     """
     params = UnwrapParams(**{field: value}).clamped()
     spec = PARAM_SPACE[field]
     assert spec.low <= getattr(params, field) <= spec.high
+
+
+@pytest.mark.parametrize("name,spec", sorted(PARAM_SPACE.items()))
+def test_non_finite_values_saturate_toward_the_matching_bound(name, spec):
+    """Infinities saturate in the direction they point; NaN falls back to the low bound.
+
+    The *direction* is the part worth pinning.  Clamping everything to the low
+    bound would also "not raise", and would silently turn a corrupted
+    ``iterations = Infinity`` into 1 -- a value that looks deliberate, produces
+    a plausible-but-wrong unwrap, and gives the user nothing to notice.
+    """
+    if spec.kind in ("float", "int"):
+        assert spec.clamp(float("inf")) == spec.high, (
+            "%s: +inf should saturate to the high bound %r" % (name, spec.high)
+        )
+        assert spec.clamp(float("-inf")) == spec.low, (
+            "%s: -inf should saturate to the low bound %r" % (name, spec.low)
+        )
+        assert spec.clamp(float("nan")) == spec.low, (
+            "%s: NaN carries no direction, so it takes the low bound %r"
+            % (name, spec.low)
+        )
+    elif spec.kind == "enum":
+        for value in (float("inf"), float("-inf"), float("nan")):
+            assert spec.clamp(value) in spec.choices
+
+
+@pytest.mark.parametrize("value", [10**400, -(10**400), 10**4000])
+def test_oversized_python_ints_are_contained(value):
+    """An int too large to convert to a float lands in range rather than raising.
+
+    ``float(10**400)`` raises ``OverflowError``; a narrow ``except`` on the load
+    path turns that into a ``.blend`` that will not open.
+    """
+    for name, spec in PARAM_SPACE.items():
+        got = spec.clamp(value)
+        if spec.kind in ("float", "int"):
+            assert spec.low <= got <= spec.high, "%s: %r escaped its range" % (name, got)
+            assert math.isfinite(float(got))
+        elif spec.kind == "enum":
+            assert got in spec.choices
+
+
+def test_infinite_values_survive_a_json_round_trip():
+    """The exact path that used to break: ``Infinity`` written and read back.
+
+    ``json`` accepts and emits ``Infinity`` by default, so a metric or parameter
+    that went non-finite once is on disk forever.  Loading it must clamp.
+    """
+    payload = json.dumps(
+        {"iterations": float("inf"), "angle_limit_deg": float("-inf"),
+         "curvature_threshold": float("nan"), "minimize_stretch_iters": float("inf")}
+    )
+    assert "Infinity" in payload
+    params = UnwrapParams.from_dict(json.loads(payload))
+    assert params.iterations == PARAM_SPACE["iterations"].high
+    assert params.minimize_stretch_iters == PARAM_SPACE["minimize_stretch_iters"].high
+    assert params.angle_limit_deg == PARAM_SPACE["angle_limit_deg"].low
+    assert math.isfinite(params.curvature_threshold)
+    assert params.clamped() == params
 
 
 def test_param_space_names_are_real_fields():
@@ -261,7 +314,7 @@ def test_param_space_names_are_real_fields():
 def test_param_spec_is_frozen():
     """``ParamSpec`` is immutable -- the space cannot be mutated at runtime."""
     spec = PARAM_SPACE["island_margin"]
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         spec.weight = 99.0  # type: ignore[misc]
     assert isinstance(spec, ParamSpec)
 

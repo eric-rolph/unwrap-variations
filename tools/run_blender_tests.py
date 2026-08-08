@@ -214,9 +214,12 @@ def require(dotted: str):
     package_path = os.path.join(REPO_ROOT, *parts, "__init__.py")
     if not os.path.isfile(module_path) and not os.path.isfile(package_path):
         raise Skip("%s does not exist yet" % dotted)
-    if os.path.isfile(package_path) and not os.path.isfile(module_path):
-        if os.path.getsize(package_path) == 0:
-            raise Skip("%s is still an empty placeholder" % dotted)
+    if (
+        os.path.isfile(package_path)
+        and not os.path.isfile(module_path)
+        and os.path.getsize(package_path) == 0
+    ):
+        raise Skip("%s is still an empty placeholder" % dotted)
     return importlib.import_module(dotted)
 
 
@@ -1084,6 +1087,51 @@ def test_generate_is_reproducible():
 
 
 @HARNESS.add("workflow")
+def test_no_candidate_is_a_pathological_time_outlier():
+    """No single recipe may dominate the wall clock of a whole grid.
+
+    Measured on a 12-triangle cube: nine of ten candidates finish in 0.00-0.37 s
+    while ``SMART_PROJECT`` at ``angle_limit=30, island_margin=0.02`` takes
+    ~6.4 s, all of it inside one ``bpy.ops.uv.pack_islands`` call.  That single
+    recipe is 84 % of the run on the simplest mesh anyone will ever try, and it
+    scales with the model.  A tool whose pitch is "generate ten and compare"
+    cannot afford one archetype that costs twenty times the other nine
+    together.
+
+    The check is a ratio rather than a stopwatch so it means the same thing on
+    a fast workstation and a slow CI runner.
+    """
+    engine = require_attr("unwrap_variations.core.engine", "generate")
+    metrics = require("unwrap_variations.core.metrics")
+
+    obj = get("UVVarCube")
+    select_only(obj)
+    started = time.perf_counter()
+    report = engine.generate(
+        obj, count=10, seed=0, weights=metrics.ScoreWeights(), compute_overlap=True
+    )
+    elapsed = time.perf_counter() - started
+    assert report.candidates, "generate produced nothing"
+
+    times = sorted(c.seconds for c in report.candidates)
+    median = times[len(times) // 2]
+    slowest = max(report.candidates, key=lambda c: c.seconds)
+    HARNESS.note(
+        "%d candidates in %.2f s; median %.3f s, slowest %.2f s (%s)"
+        % (len(report.candidates), elapsed, median, slowest.seconds,
+           slowest.params.describe())
+    )
+    budget = max(median * 15.0, 1.5)
+    assert slowest.seconds <= budget, (
+        "candidate %r took %.2f s against a %.3f s median on a 12-triangle cube "
+        "(%.0f%% of the whole %.2f s run). Profiled: all of it is one "
+        "bpy.ops.uv.pack_islands call in blender_native._pack_islands."
+        % (slowest.params.describe(), slowest.seconds, median,
+           100.0 * slowest.seconds / max(elapsed, 1e-9), elapsed)
+    )
+
+
+@HARNESS.add("workflow")
 def test_generate_on_a_degenerate_object_reports_rather_than_raises():
     """An object with no faces gets a clear refusal, not a traceback."""
     import bpy
@@ -1187,7 +1235,7 @@ def test_candidates_survive_a_blend_save_and_reload():
             "expected %d candidates back, got %d (%s)"
             % (len(expected), len(restored), restored.last_message)
         )
-        for (signature, uvs), got in zip(expected, restored.all()):
+        for (signature, uvs), got in zip(expected, restored.all(), strict=False):
             assert got.signature == signature, "recipe %s came back as %s" % (
                 signature,
                 got.signature,
