@@ -37,6 +37,8 @@ from tests.reference import (
     reference_shell_topology,
     reference_union_rect_area,
 )
+from unwrap_variations.backends.seams import build_edge_topology
+from unwrap_variations.core.engine import derive_uv_seams
 from unwrap_variations.core.evaluator import evaluate
 from unwrap_variations.core.meshdata import (
     degenerate_mask,
@@ -593,4 +595,51 @@ def test_layout_oracle_agrees_with_the_evaluator(meshes, name):
     assert got.texel_density_cv == pytest.approx(want["texel_density_cv"], rel=1e-6)
     assert got.out_of_bounds_tris == want["out_of_bounds_tris"]
     assert got.uv_bounds == pytest.approx(want["uv_bounds"], abs=1e-12)
+    assert got.packing_efficiency == pytest.approx(want["packing_efficiency"], abs=0.02)
+
+
+def test_layout_oracle_agrees_on_a_layout_that_actually_has_seams(meshes):
+    """The same comparison on a cut, packed layout rather than a flat projection.
+
+    The parametrised case above hands every mesh a plain XY projection, which
+    has **no seams at all**: measured, ``seam_ratio`` is exactly 0.0 on all six,
+    so that assertion compares zero with zero and proves nothing about the
+    oracle's seam path.  Four of the six also saturate ``packing_efficiency`` at
+    1.0.  This case cuts the mesh into real charts first, so both fields carry a
+    value the two implementations have to agree on.
+    """
+    mesh = meshes["displaced_sphere"]
+    sample = corpus.to_sample(mesh)
+    # A cube-map cut: chart per dominant face normal, each laid out in its own
+    # cell of a 3x2 grid.  Genuine seams, genuine unused space between islands.
+    tri_v = sample.verts[sample.tri_verts]
+    normals = np.cross(tri_v[:, 1] - tri_v[:, 0], tri_v[:, 2] - tri_v[:, 0])
+    axis = np.argmax(np.abs(normals), axis=1)
+    sign = (normals[np.arange(normals.shape[0]), axis] >= 0).astype(np.int64)
+    cell = axis * 2 + sign
+    keep = [(1, 2), (0, 2), (0, 1)]
+    uv = np.empty((sample.n_tris, 3, 2))
+    for c in range(6):
+        m = cell == c
+        if not m.any():
+            continue
+        a, b = keep[c // 2]
+        flat = tri_v[m][:, :, [a, b]]
+        lo = flat.reshape(-1, 2).min(axis=0)
+        hi = flat.reshape(-1, 2).max(axis=0)
+        local = (flat - lo) / np.maximum(hi - lo, 1e-12)
+        uv[m] = local * 0.28 + np.array([0.34 * (c % 3) + 0.02, 0.48 * (c // 3) + 0.02])
+
+    laid = sample.with_uvs(uv.reshape(-1, 2))
+    topo = build_edge_topology(laid)
+    laid = laid.with_seams(derive_uv_seams(laid, topo, laid.uvs))
+
+    got = evaluate(laid, compute_overlap=False)
+    want = reference_layout_metrics(laid)
+    assert got.seam_ratio > 0.5, "the cut layout must actually carry seams"
+    assert got.packing_efficiency < 0.9, "and must not saturate the packing term"
+    assert got.island_count == want["island_count"]
+    assert got.seam_ratio == pytest.approx(want["seam_ratio"], rel=1e-9)
+    assert got.uv_coverage == pytest.approx(want["uv_coverage"], rel=1e-9)
+    assert got.texel_density_cv == pytest.approx(want["texel_density_cv"], rel=1e-6)
     assert got.packing_efficiency == pytest.approx(want["packing_efficiency"], abs=0.02)

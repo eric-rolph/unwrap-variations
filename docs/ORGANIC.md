@@ -410,9 +410,37 @@ Design, and why:
   compares the result. Per Rule 2, if the repair does not reduce
   `overlap_area`, return the input unchanged.
 
-Acceptance for this pair: on Suzanne's winning layout, `overlap_area` becomes
-**exactly 0.0** with `flipped_tris` still 0, and the score reaches **at least
-40** with no other change and no scorer change.
+Acceptance for this pair, measured against the pinned
+`tests/data/suzanne_organic_baseline.npz` fixture rather than "the seed-1
+winner", which moved (see 0.6):
+
+- `overlap_area` becomes **exactly 0.0**
+- `flipped_tris` stays **0**
+- `out_of_bounds_tris` stays **0**
+
+Those three are binary and are the ones that matter. **The score is reported,
+not gated.** The original criterion here was "reaches at least 40", which was
+derived from the ceiling table in 0.2 -- and that table is optimistic, as 0.6
+records. The achievable maximum for repair alone is **40.18**, and constraining
+the repaired chart to the unit square costs a further 0.17, so the measured
+result is **40.005**. Gating on 40 leaves a five-thousandth of a point of
+margin, which is not a criterion, it is a coin toss that will flake on a
+last-ULP change. Measured result, identical on both Blender versions:
+
+| | before | after |
+| --- | ---: | ---: |
+| `overlap_area` | 0.001342095131 | **exactly 0.0** |
+| `flipped_tris` | 0 | 0 |
+| `out_of_bounds_tris` | 0 | 0 |
+| balanced score | 23.189 | **40.005** |
+| loops left bit-identical | -- | 1606 of 1968 |
+| repair time, median of 5 | -- | 0.71 s |
+
+The cost is visible and worth naming: the repaired charts are **more distorted
+than the backend's originals** (scale-normalised symmetric Dirichlet: chart 9
+4.0347 -> 4.2906, chart 10 4.1345 -> 4.2915). That is the trade -- distortion
+bought global injectivity -- and quoting only raw energy would have hidden it,
+because raw symmetric Dirichlet is not scale invariant.
 
 ## 5. `core/charts.py` -- distortion-bounded chart merging
 
