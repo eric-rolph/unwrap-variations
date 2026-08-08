@@ -350,10 +350,13 @@ Blender 4.5.4 LTS and 5.1.2 -- every cell, both versions.**
 
 Three things that record does **not** mean:
 
-1. **Suzanne scores 23.2 out of 100.** That beats both baselines by 13.8 and it
-   is 14 islands rather than the 276 an earlier build produced, so the relative
-   result is real -- but 23/100 is not a good unwrap and should not be sold as
-   one. Organic meshes are the hardest case here and are not solved.
+1. **Suzanne scores 50.0 out of 100.** That is +40.5 over the better baseline,
+   `overlap_area` at exactly 0, and 7 islands rather than the 276 an earlier
+   build produced. It is still not a *good* unwrap in absolute terms: the
+   residual is seam length against angle distortion, and those two oppose each
+   other -- merging Suzanne to six charts inherently costs about 8.6 degrees of
+   mean angle. See [docs/ORGANIC.md](docs/ORGANIC.md) for the measured
+   frontier.
 2. **On smooth closed meshes the `unwrap+sharp` baseline is not a real
    unwrap.** A 30-degree threshold selects no edges on a sphere, torus or
    icosphere, so `uv.unwrap` gets no cuts, fails, and leaves the mesh's stock
@@ -446,11 +449,18 @@ it found, or exactly what to set if it found neither.
 
 Listed because you will hit them, not because they are theoretical.
 
-- **Organic meshes are not solved.** Suzanne's best candidate scores 23.2 out
-  of 100. It beats both Blender baselines, but that is a low absolute number
-  and the honest read is that a mesh with ears, creases and a closed hollow
-  interior is still hard for this add-on. The residual is a high seam ratio
-  plus a small genuine self-fold.
+- **Organic meshes are much better, not finished.** Suzanne's best candidate
+  went from 23.2 to **50.0** and its self-fold is gone -- `overlap_area` is
+  exactly 0 on every corpus mesh now, verified by an independent oracle. What
+  remains is a genuine frontier rather than a bug: seam length and angle
+  distortion trade against each other, and six charts on Suzanne cost about
+  8.6 degrees of mean angle. The worst case in the organic corpus is `hand`
+  (five fingers and a thumb, nearly touching) at 35.97 with 27 islands, four
+  times the island count of any other corpus mesh.
+- **Refinement is several times slower than a bare unwrap.** Ten candidates on
+  Suzanne take about 34s against 6s before. It is score-gated, so it can never
+  return a worse layout than it was given, but the cost is real -- hence the
+  **Refine Layouts** toggle in Advanced.
 - **Generation cost is dominated by Blender's packer**, whose cost runs inverse
   to island count, so a layout with few large islands is far more expensive to
   pack than one with many small ones. There is no meaningful single

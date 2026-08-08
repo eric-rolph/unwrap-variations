@@ -1,8 +1,8 @@
 # Benchmarks
 
-> Measured **2026-08-07**, median of 5 runs, verified identical on Blender
-> **4.5.4 LTS** and **5.1.2** -- every cell, both versions. Regeneration
-> instructions are in [section 6](#6-regenerating-this-table).
+> Measured **2026-08-08**, median of 5 runs, on Blender **4.5.4 LTS** and
+> **5.1.2**. Every cell matches across the two versions except the sphere;
+> regeneration instructions are in [section 6](#6-regenerating-this-table).
 
 This file is the single source of truth for every performance and quality
 number the project claims. The README quotes only the headline record and two
@@ -48,9 +48,13 @@ That is it. Specifically **not** claimed:
 | Repeats | 5 per column -- see [section 3](#3-blenders-uv-operators-are-not-deterministic) for why this is mandatory |
 | Script | [`tools/benchmark_bestofn.py`](../tools/benchmark_bestofn.py) |
 
-**Every cell is identical on 4.5.4 and 5.1.2**, verified under the repeated
-methodology below. That cross-version agreement is itself a result: the ranking
-a user sees does not depend on which supported Blender they run.
+**Every cell matches across 4.5.4 and 5.1.2 except the sphere** (68.7 against
+70.8), verified under the repeated methodology below. An earlier edition
+claimed *every* cell agreed, and that is no longer true: refinement re-solves
+merged charts through Blender's own ABF, and ARCHITECTURE.md section 0 records
+that an identical mesh, identical seams and an identical call give different
+UVs on 4.5 and 5.1 for multi-island meshes. The *verdicts* are identical on
+both versions, which is the part a user relies on.
 
 ### 2.1 A note on timing
 
@@ -62,10 +66,17 @@ two meshes of similar size can differ by orders of magnitude.
 
 What can be stated, because it was measured: a packing pathology on small
 meshes took a **12-triangle cube from 11.6s to 0.013s** and a **62-triangle
-cone from 31.6s to 0.017s** once fixed. Suzanne, at 968 triangles, takes
-**6.6s** and keeps full-quality packing because it sits above the small-mesh
-threshold where the workaround applies. Generation cost is monotonic in
+cone from 31.6s to 0.017s** once fixed. Generation cost is monotonic in
 candidate count.
+
+**Refinement changed the shape of this cost, and the change is large.** Ten
+candidates on Suzanne went from **6.1s to roughly 34s**, because merging charts
+and re-solving them costs several times the original unwrap. On bigger organic
+meshes it is larger still -- `blob_limbs` at 7.6k triangles takes about 92s and
+`hand` at 9.3k about 234s. The work is score-gated and so cannot make a
+candidate worse, but it is not free, and that is why **Refine Layouts is a
+toggle in the UI** rather than an unconditional behaviour. Turning it off
+restores the old speed at the old quality.
 
 The three columns are:
 
@@ -137,27 +148,43 @@ places on a different roll of Blender's non-deterministic packer, it is a tie.
 
 <!-- BEGIN BENCHMARK TABLE - regenerate wholesale, never hand-edit a cell -->
 
-`balanced` preset, `seed=1`, 10 candidates, 5 repeats. **Identical on Blender
-4.5.4 LTS and 5.1.2 -- every cell, both versions.**
+`balanced` preset, `seed=1`, 10 candidates, 5 repeats, measured on **both**
+Blender 4.5.4 LTS and 5.1.2. Figures below are 5.1.2; the one cell that
+differs between versions is called out underneath.
 
 | mesh | `smart_project` | `unwrap+sharp` | **best-of-10** | verdict | grid filled |
 | --- | ---: | ---: | ---: | --- | ---: |
-| cylinder | 36.9 [36.9-36.9] | 0.0 [0.0-0.0] | **72.1** [72.1-72.1] | **WIN +35.3** | 10/10 |
-| torus | 29.7 [29.7-29.7] | 33.2 [33.2-33.2] `*` | **50.1** [50.1-50.1] | **WIN +16.8** | 10/10 |
-| suzanne | 9.4 [9.4-9.4] | 8.8 [8.8-8.8] | **23.2** [23.2-23.2] | **WIN +13.8** | 10/10 |
-| sphere | 57.3 [57.3-57.3] | 45.5 [45.5-45.5] | **66.4** [66.4-66.4] | **WIN +9.1** | 10/10 |
-| icosphere | 50.4 [50.4-50.4] | 63.2 [63.2-63.2] | **66.0** [66.0-66.0] | **WIN +2.8** | 10/10 |
-| cone | 60.0 [60.0-60.0] | 73.7 [73.7-73.7] | 74.7 [74.7-74.7] | tie +0.9 | 10/10 |
-| cube | 70.3 [70.3-70.3] | 70.3 [70.3-70.3] | 70.9 [70.9-70.9] | tie +0.6 | 10/10 |
+| suzanne | 9.4 [9.4-9.4] | 8.8 [8.8-8.8] | **50.0** [50.0-50.0] | **WIN +40.5** | 10/10 |
+| cylinder | 36.9 [36.9-36.9] | 0.0 [0.0-0.0] | **70.8** [70.8-70.8] | **WIN +33.9** | 10/10 |
+| torus | 29.7 [29.7-29.7] | 33.2 [33.2-33.2] `*` | **53.2** [53.2-53.2] | **WIN +19.9** | 10/10 |
+| sphere | 57.3 [57.3-57.3] | 45.5 [45.5-45.5] | **68.7** [68.7-68.7] `+` | **WIN +11.4** | 10/10 |
+| cube | 70.3 [70.3-70.3] | 70.3 [70.3-70.3] | **79.0** [79.0-79.0] | **WIN +8.8** | 10/10 |
+| icosphere | 50.4 [50.4-50.4] | 63.2 [63.2-63.2] | **71.4** [71.4-71.4] | **WIN +8.2** | 10/10 |
+| cone | 60.0 [60.0-60.0] | 73.7 [73.7-73.7] | 74.6 [74.6-74.6] | tie +0.9 | 10/10 |
 
-**Record: 5 wins, 2 ties, 0 losses.** Run-to-run spread was **0.1 points or
-less on every cell**, so every verdict here clears the spread rule by a wide
-margin and rests on the 1.0-point floor instead.
+**Record: 6 wins, 1 tie, 0 losses**, identical on both versions. Run-to-run
+spread is **0.0 on every cell on 4.5.4, and 0.0 on every cell except the
+sphere's 0.1 on 5.1.2**, so every verdict rests on the 1.0-point floor rather
+than on the spread rule.
+
+**Suzanne is the headline: 23.2 to 50.0.** That mesh was the whole reason for
+this round of work -- see [ORGANIC.md](ORGANIC.md) -- and it moves from the
+worst row in the table to a +40.5 margin, with `overlap_area` at exactly 0 and
+7 islands instead of 14. The cube also converts from a tie to a win.
 
 `*` The `unwrap+sharp` baseline **did nothing measurable** on this mesh -- see
 [section 4.2](#42-three-things-not-to-read-into-this-table), caveat 3. The flag
 is conservative and under-reports: the sphere and icosphere rows are affected
 too.
+
+`+` **The one cell that is not identical across versions.** The sphere reads
+**68.7 on 5.1.2 and 70.8 on 4.5.4**. Every other cell matches exactly. The
+previous edition of this table claimed every cell was identical on both
+versions, and that claim no longer holds -- refinement re-solves merged charts
+through Blender's own ABF, and ARCHITECTURE.md section 0 records that identical
+mesh, seams and call produce different UVs on 4.5 and 5.1 for multi-island
+meshes. Nothing here depends on the two agreeing; it was worth stating when it
+was true and is worth retracting now that it is not.
 
 <!-- END BENCHMARK TABLE -->
 
@@ -196,22 +223,24 @@ the search, decide what "best" means.
 
 ### 4.2 Three things not to read into this table
 
-The record is 5 wins, 2 ties, 0 losses. Three caveats limit what that means,
+The record is 6 wins, 1 tie, 0 losses. Three caveats limit what that means,
 and none of them is a footnote.
 
-**1. Do not quote the cube or the cone as wins.** They are +0.6 and +0.9, both
-below the 1.0-point floor, and both are recorded as ties. A separate agent's
-harness scored this corpus **7 wins, 0 ties, 0 losses**; the number published
-here is the smaller one, from the stricter rule. The cube in particular is
-effectively a coin flip: every dual arc on a cube ties, so which of the eleven
-cross-net unfoldings you get is decided by the seed.
+**1. Do not quote the cone as a win.** It is +0.9, below the 1.0-point floor,
+and is recorded as a tie. The cube was a tie at +0.6 in the previous edition
+and is now a +8.8 win, because chart merging collapses its net to two islands.
 
-**2. Suzanne scores 23.2 out of 100. That is not a good unwrap.** It beats both
-baselines by 13.8 points and it is 14 islands rather than 276, so the *relative*
-result is real. But nobody should look at 23/100 and call the absolute result
-acceptable. The residual is a high seam ratio plus a small genuine self-fold.
-An organic mesh with ears, creases and a closed hollow interior is the hardest
-thing in this corpus and the add-on does not yet solve it well.
+**2. Suzanne scores 50.0 out of 100, up from 23.2.** That is a +40.5 margin
+over the better baseline, `overlap_area` at exactly 0 where it used to carry a
+genuine self-fold, and 7 islands instead of 14. It is the result of a
+dedicated round of work documented in [ORGANIC.md](ORGANIC.md).
+
+It is still not a *good* unwrap in absolute terms, and the reason is measured
+rather than hand-waved: the residual is seam length (0.296 of penalty) and
+angle distortion (0.192), and those two oppose each other. Merging Suzanne to
+six charts inherently costs about 8.6 degrees of mean angle distortion, up
+from 3.75 at fourteen charts. ORGANIC.md section 9.1 works through why 60 is
+not reachable on this frontier.
 
 **3. The `unwrap+sharp` column is not a real unwrap on smooth closed meshes.**
 This is the caveat that most affects how the table should be read. A 30-degree
