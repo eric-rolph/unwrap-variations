@@ -171,7 +171,28 @@ def baseline_unwrap(obj, weights):
     everything stays selected and ``mark_seam`` turns **every** edge into a
     seam -- which is how an earlier version of this script reported 1152
     islands on a 1152-face sphere.
+
+    **This baseline is a no-op on smooth closed meshes, and the caller must
+    say so.** On a sphere, torus or icosphere a 30-degree sharpness threshold
+    selects no edges at all, so ``uv.unwrap`` gets no cuts, fails to solve
+    (while still reporting ``FINISHED`` -- see ARCHITECTURE section 0) and
+    leaves the layout untouched. What the column then reports is the
+    **primitive's own stock UV map**, which for an icosphere is a rather good
+    icosahedron net. Presenting that as "Blender's single-pass unwrap" would
+    overstate the baseline on some meshes and understate it on others, so this
+    function returns a flag and the report labels those cells ``stock``.
+
+    Returns:
+        ``(score, is_stock)``; ``is_stock`` is True when the unwrap changed
+        nothing measurable, i.e. the cell is the primitive's stock UV map.
     """
+    # Compare the MEASURED score, not the raw UV bytes. A failed unwrap can
+    # still leave the layout flipped, rotated or rescaled by the packing step,
+    # so byte equality misses it -- but every distortion and layout metric is
+    # invariant to those, so an unchanged score is the honest test. Measured:
+    # sphere 1.1767 -> 1.1767, torus 1.5230 -> 1.5230, icosphere 1.0090 ->
+    # 1.0090 stretch L2, i.e. metrically the stock map in every case.
+    before_score = measure_current(obj, weights) if len(obj.data.uv_layers) else None
     bpy.context.view_layer.objects.active = obj
     bpy.ops.object.mode_set(mode="EDIT")
     bpy.ops.mesh.select_all(action="SELECT")
@@ -184,7 +205,9 @@ def baseline_unwrap(obj, weights):
     bpy.ops.mesh.select_all(action="SELECT")
     bpy.ops.uv.unwrap(method="ANGLE_BASED", margin=0.001)
     bpy.ops.object.mode_set(mode="OBJECT")
-    return measure_current(obj, weights)
+    value = measure_current(obj, weights)
+    is_stock = before_score is not None and abs(value - before_score) < 1e-6
+    return value, is_stock
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +290,12 @@ def main():
 
     for name, build in MESHES:
         smart_runs, unwrap_runs, our_runs, counts = [], [], [], []
+        stock_flags = []
         for _ in range(repeats):
             smart_runs.append(baseline_smart(fresh(build), weights))
-            unwrap_runs.append(baseline_unwrap(fresh(build), weights))
+            _uw_score, _uw_stock = baseline_unwrap(fresh(build), weights)
+            unwrap_runs.append(_uw_score)
+            stock_flags.append(_uw_stock)
             report = engine.generate(
                 fresh(build),
                 count=args.count,
@@ -293,8 +319,9 @@ def main():
         label, margin, noise = verdict(our_runs, baseline)
         record[label] += 1
 
-        print("%-10s | %s | %s | %s | %-4s %+6.1f (noise %.1f) %d/%d"
-              % (name, band(smart_runs), band(unwrap_runs), band(our_runs),
+        stock_note = " *stock" if stock_flags and all(stock_flags) else ""
+        print("%-10s | %s | %s%-6s | %s | %-4s %+6.1f (noise %.1f) %d/%d"
+              % (name, band(smart_runs), band(unwrap_runs), stock_note, band(our_runs),
                  label, margin, noise, min(counts), args.count))
 
     print("-" * 104)

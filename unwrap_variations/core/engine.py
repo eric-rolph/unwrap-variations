@@ -513,10 +513,22 @@ def chart_seams(
         if not broken.any():
             break
 
+        # Group the polygons by chart once, rather than scanning the whole mesh
+        # per broken chart -- on a dense model most charts can be broken in the
+        # first round, and that would be quadratic.
+        rep_index = np.flatnonzero(is_rep)
+        rep_chart = chart[rep_index]
+        by_chart = np.argsort(rep_chart, kind="stable")
+        sorted_chart = rep_chart[by_chart]
+        sorted_rep = rep_index[by_chart]
+        broken_ids = np.flatnonzero(broken)
+        lo = np.searchsorted(sorted_chart, broken_ids, side="left")
+        hi = np.searchsorted(sorted_chart, broken_ids, side="right")
+
         promoted = np.zeros(n_tris, dtype=np.int64)
         changed = False
-        for chart_id in np.flatnonzero(broken).tolist():
-            members = np.flatnonzero((chart == chart_id) & is_rep)
+        for slot in range(int(broken_ids.size)):
+            members = sorted_rep[lo[slot]:hi[slot]]
             if members.size < 2:
                 continue
             points = poly_centre[members]
@@ -590,6 +602,13 @@ def _absorb_slivers(
         host = np.where(small[side_a], side_b, side_a)
         usable = (small[side_a] | small[side_b]) & (side_a != side_b)
         donor, host = donor[usable], host[usable]
+        # Only ever merge *downhill*, into a strictly larger chart (ties broken
+        # by index).  Without this, two equally small neighbours would each pick
+        # the other and the relabel would swap them round for round instead of
+        # ever merging them.
+        d_area, h_area = chart_area[donor], chart_area[host]
+        downhill = (d_area < h_area) | ((d_area == h_area) & (donor > host))
+        donor, host = donor[downhill], host[downhill]
         if donor.size == 0:
             return labels
         order = np.lexsort((chart_area[host], donor))

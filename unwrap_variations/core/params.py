@@ -692,6 +692,65 @@ def mutate(
     return out
 
 
+#: Seam-driven solvers, mirrored from :data:`METHODS`; the chart cut only means
+#: anything for these, since a projection invents its own charts.
+_SOLVER_METHODS = ("ANGLE_BASED", "CONFORMAL", "MINIMUM_STRETCH")
+
+
+def _mutate_chart(
+    extra: dict[str, Any], method: str, rng: random.Random, strength: float
+) -> tuple[dict[str, Any], bool]:
+    """Perturb, introduce or drop the chart-cut request in ``extra``.
+
+    The chart cut is by far the biggest lever on the result -- it decides how
+    many islands there are and where they are cut -- but it lives in ``extra``
+    rather than in :data:`PARAM_SPACE`, so the generic field mutator cannot see
+    it.  Without this, branching from a chart recipe produced ten children that
+    differed only in margin and iteration count and therefore all scored within
+    a fraction of a point of the parent.
+
+    Args:
+        extra: The parent's extras, already copied.
+        method: The child's method.
+        rng: Seeded RNG.
+        strength: Mutation magnitude in ``[0, 1]``.
+
+    Returns:
+        ``(extra, holds_chart)``; ``holds_chart`` is ``True`` when the child
+        should be pinned to ``seam_strategy="EXISTING"`` so the engine's cut is
+        the one that reaches the solver.
+    """
+    if method not in _SOLVER_METHODS:
+        # Carrying a dormant request would make two identical projections hash
+        # differently and waste a slot on a duplicate.
+        extra.pop("chart_cut", None)
+        extra.pop("chart_seed", None)
+        return extra, False
+
+    current = extra.get("chart_cut")
+    if not current:
+        # A branch that can never reach a chart cut cannot escape a bad one.
+        if rng.random() < 0.12 + 0.30 * strength:
+            pool = _CHART_FILL_CLUSTERS
+            extra["chart_cut"] = int(pool[rng.randrange(len(pool))])
+            extra["chart_seed"] = rng.randrange(1 << 16)
+            return extra, True
+        extra.pop("chart_seed", None)
+        return extra, False
+
+    try:
+        clusters = int(current)
+    except (TypeError, ValueError):
+        clusters = 6
+    if rng.random() < 0.45 + 0.45 * strength:
+        span = max(1, int(round(1.0 + strength * 6.0)))
+        clusters += rng.randint(-span, span)
+    extra["chart_cut"] = int(min(48, max(2, clusters)))
+    if rng.random() < 0.35 + 0.45 * strength:
+        extra["chart_seed"] = rng.randrange(1 << 16)
+    return extra, True
+
+
 def _mutate_once(parent: UnwrapParams, rng: random.Random, strength: float) -> UnwrapParams:
     """Apply one round of random perturbation to ``parent``."""
     method = parent.method
@@ -699,9 +758,20 @@ def _mutate_once(parent: UnwrapParams, rng: random.Random, strength: float) -> U
     if rng.random() < 0.10 + 0.25 * strength:
         method = rng.choice([m for m in METHODS if m != method] or list(METHODS))
 
+    extra, holds_chart = _mutate_chart(
+        dict(parent.extra) if isinstance(parent.extra, dict) else {},
+        method,
+        rng,
+        strength,
+    )
+
     names = [n for n in PARAM_SPACE if n != "method" and _applies(n, method)]
+    if holds_chart:
+        # The engine supplies the seams; a strategy that recomputes them would
+        # throw the chart cut away.
+        names = [n for n in names if n != "seam_strategy"]
     if not names:
-        return parent.replace(method=method, seed=rng.randrange(1 << 30))
+        return parent.replace(method=method, seed=rng.randrange(1 << 30), extra=extra)
 
     weights = [PARAM_SPACE[n].weight for n in names]
     # Perturb between one field and (roughly) half of them, scaled by strength.
@@ -718,7 +788,13 @@ def _mutate_once(parent: UnwrapParams, rng: random.Random, strength: float) -> U
         chosen.append(pool.pop(pick))
         pool_w.pop(pick)
 
-    values: dict[str, Any] = {"method": method, "seed": rng.randrange(1 << 30)}
+    values: dict[str, Any] = {
+        "method": method,
+        "seed": rng.randrange(1 << 30),
+        "extra": extra,
+    }
+    if holds_chart:
+        values["seam_strategy"] = "EXISTING"
     for name in chosen:
         spec = PARAM_SPACE[name]
         current = getattr(parent, name)
