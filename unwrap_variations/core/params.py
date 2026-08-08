@@ -685,6 +685,20 @@ def sample_grid(
     # Same median, but the floor rises nearly five points and the spread halves.
     # A user pressing Generate should not get 38 or 48 depending on a seed they
     # never chose, so this trades a lucky maximum for a dependable one.
+    #
+    # It is not free, and the cost is not where it was expected.  The worry was
+    # that pinning a seventh archetype would squeeze out DUAL_GRAPH and hurt the
+    # cube and the cylinder; measured over the same five seeds, both are
+    # **unchanged to 0.00**.  The mesh that pays is the **torus**: median 55.92
+    # to 54.04, minimum 52.77 to 52.27.  The median drop crosses the 1.0-point
+    # floor the benchmark uses, so it is a real cost and not noise, although the
+    # two ranges do overlap and one five-seed sweep is thin evidence.
+    #
+    # Kept anyway, because the trade is heavily in favour: the torus loses 1.88
+    # of median while Suzanne gains 2.83 of median and **7.75 of minimum**, and
+    # organic meshes are the case this entire body of work exists to serve.
+    # Recorded rather than buried so anyone revisiting it starts from the
+    # measurement rather than from the intention.
     core = min(_ARCHETYPE_CORE, max(1, (count * 3) // 4), len(ARCHETYPES))
     order = list(range(core))
     tail = list(range(core, len(ARCHETYPES)))
