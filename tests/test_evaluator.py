@@ -836,3 +836,45 @@ def test_large_mesh_performance(evaluator):
         "500k triangles took %.3f s; the 250 ms budget in "
         "docs/ARCHITECTURE.md section 4 implies a fully vectorised path" % elapsed
     )
+
+
+def test_overlap_saturates_rather_than_reporting_clean_when_the_hash_gives_up(evaluator):
+    """A layout too dense to index must not be reported as overlap-free.
+
+    ``_overlap_area`` builds a uniform spatial hash and doubles the cell size up
+    to eight times to keep the insert count bounded.  It used to ``return 0.0``
+    when that budget was exhausted -- which says "perfectly clean" about the one
+    layout shape most likely to be catastrophically dirty, because exhausting
+    the budget means triangles are stacked on top of each other.
+
+    That was not theoretical.  ``injectivity.certify`` treats
+    ``overlap_area == 0.0`` as proof of injectivity, so a stack of coincident
+    triangles certified as *globally injective* while carrying an enormous real
+    overlap.  Saturating to the used area is the same rule the function already
+    applies once accumulated overlap reaches that area, moved to the case where
+    the measurement cannot start rather than cannot finish.
+    """
+    from unwrap_variations.core import evaluator as ev
+
+    # Every triangle on the same spot: real overlap is maximal.
+    n = 64
+    tri = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
+    uv = np.repeat(tri[None, :, :], n, axis=0)
+    lo = uv.min(axis=1)
+    hi = uv.max(axis=1)
+    total_uv_area = 0.5 * n
+
+    original = ev._OVERLAP_MAX_INSERTS
+    try:
+        # Force the doubling loop to exhaust, which is what a genuinely dense
+        # layout does on the real budget.
+        ev._OVERLAP_MAX_INSERTS = 1
+        saturated = ev._overlap_area(uv, lo, hi, total_uv_area)
+    finally:
+        ev._OVERLAP_MAX_INSERTS = original
+
+    assert saturated == pytest.approx(total_uv_area), (
+        "an unindexable layout reported %r; 0.0 here is a false clean bill of "
+        "health that injectivity.certify believes" % saturated
+    )
+    assert saturated > 0.0
