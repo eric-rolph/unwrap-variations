@@ -10,7 +10,7 @@
 # There is deliberately no `[build-system]` table.
 
 [project]
-name = "unwrap-variations"
+name = "unwrap-variations-blender"
 version = "0.1.0"
 description = "Blender add-on that generates, scores and compares many UV unwraps side by side"
 readme = "README.md"
@@ -36,9 +36,9 @@ dependencies = ["numpy>=1.24"]
 dev = ["pytest>=7.4", "ruff>=0.5"]
 
 [project.urls]
-Homepage = "https://github.com/eric-rolph/unwrap-variations"
-Source = "https://github.com/eric-rolph/unwrap-variations"
-Issues = "https://github.com/eric-rolph/unwrap-variations/issues"
+Homepage = "https://github.com/eric-rolph/unwrap-variations-blender"
+Source = "https://github.com/eric-rolph/unwrap-variations-blender"
+Issues = "https://github.com/eric-rolph/unwrap-variations-blender/issues"
 
 # ---------------------------------------------------------------------------
 # ruff

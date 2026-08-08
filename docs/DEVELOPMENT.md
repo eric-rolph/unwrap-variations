@@ -9,8 +9,8 @@ equivalents are noted where they differ.
 ## 1. Get the source
 
 ```bash
-git clone https://github.com/eric-rolph/unwrap-variations.git
-cd unwrap-variations
+git clone https://github.com/eric-rolph/unwrap-variations-blender.git
+cd unwrap-variations-blender
 ```
 
 The add-on package is the inner `unwrap_variations/` directory -- the one
@@ -50,7 +50,7 @@ Linux: `~/.config/blender/<ver>/extensions/user_default`.)
 ### Windows -- directory junction (no admin rights required)
 
 ```bat
-mklink /J "%APPDATA%\Blender Foundation\Blender\4.5\extensions\user_default\unwrap_variations" "C:\path\to\unwrap-variations\unwrap_variations"
+mklink /J "%APPDATA%\Blender Foundation\Blender\4.5\extensions\user_default\unwrap_variations" "C:\path\to\unwrap-variations-blender\unwrap_variations"
 ```
 
 ### macOS / Linux -- symlink
@@ -135,10 +135,21 @@ Test against both supported versions before opening a pull request:
   `bpy.ops.object.mode_set(mode='EDIT')` plus
   `bpy.ops.mesh.select_all(action='SELECT')`. Missing either silently produces
   an empty or unchanged UV layout rather than an error.
-- **`uv.pack_islands` behaves differently across versions.** Verified: it
-  returns `CANCELLED` in 4.5 headless but `FINISHED` in 5.1. Anything relying on
-  packing must tolerate the cancellation. All such differences belong in
-  `utils/compat.py`, not scattered through the codebase.
+- **`uv.pack_islands` behaves differently across versions, and the cause is
+  UV selection.** It returns `CANCELLED` in 4.5 headless but `FINISHED` in 5.1.
+  The reason is that packing acts on *selected* UVs: 4.5 defaults
+  `tool_settings.use_uv_select_sync = False` and a fresh unwrap leaves every UV
+  deselected, so there is nothing to pack. 5.1 flipped that default. The fix is
+  one line -- `bpy.ops.uv.select_all(action='SELECT')` before packing -- and it
+  works on both. `average_islands_scale` and `minimize_stretch` cancel for
+  exactly the same reason. All such differences belong in `utils/compat.py`.
+- **Packing dominates generation time, and its cost is inverse to island
+  count.** A 6-face cube took 8.46 s to pack; the same cube subdivided to 96
+  faces took 0.15 s. Do not assume a small mesh is a fast one.
+- **`bpy.ops.uv.unwrap` returns `{'FINISHED'}` even when it fails.** On a closed
+  mesh with no seams it prints a console warning, leaves the UVs untouched and
+  still reports success. Never treat the operator's return status as proof it
+  did anything -- check the UV buffer.
 - **A mesh cannot hold more than 8 UV layers.** `uv_layers.new()` returns `None`
   past that -- it does not raise. This is exactly why candidates are stored as
   numpy arrays and blitted into a single scratch layer instead of becoming

@@ -22,7 +22,7 @@ tagline = "Generate, score and compare many UV unwraps side by side"
 maintainer = "Eric Rolph <ericrolph@gmail.com>"
 type = "add-on"
 
-website = "https://github.com/eric-rolph/unwrap-variations"
+website = "https://github.com/eric-rolph/unwrap-variations-blender"
 
 # GPL is required: the add-on links against Blender's Python API.
 license = [

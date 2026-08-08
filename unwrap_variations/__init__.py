@@ -67,8 +67,8 @@ bl_info = {
     "location": "3D Viewport and UV Editor > Sidebar > UV Variations",
     "description": "Generate, score and compare many UV unwraps side by side",
     "warning": "",
-    "doc_url": "https://github.com/eric-rolph/unwrap-variations",
-    "tracker_url": "https://github.com/eric-rolph/unwrap-variations/issues",
+    "doc_url": "https://github.com/eric-rolph/unwrap-variations-blender",
+    "tracker_url": "https://github.com/eric-rolph/unwrap-variations-blender/issues",
     "support": "COMMUNITY",
     "category": "UV",
 }
