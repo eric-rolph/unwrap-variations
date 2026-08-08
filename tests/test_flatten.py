@@ -149,6 +149,106 @@ def notched_chart(flatten, n: int = 8):
     )
 
 
+def rough_disk_chart(flatten, seed: int):
+    """An irregular, rough, extreme-aspect disk -- the shape that breaks cotangent.
+
+    **This family exists because the committed corpus cannot test the design
+    decision this module rests on.**  Cotangent weights go negative on obtuse
+    triangles, which forfeits Tutte's guarantee; mean-value weights are positive
+    for any triangulation, which is why the module uses them.  Measured against
+    ``igl.harmonic`` (cotangent): on all 21 corpus charts the hazard is *present*
+    -- 527 of 3430 edges carry negative assembled cotan weights on one of them --
+    and never *fires*.  A regression suite built on the corpus alone would stay
+    green if someone swapped mean-value for cotangent tomorrow.
+
+    Three ingredients turn out to be jointly necessary; a structured "obtuse fan"
+    does not do it:
+
+    * **irregular grid spacing**, so no two triangles are alike;
+    * **a random diagonal per quad**, which is what actually manufactures the
+      obtuse triangles;
+    * **extreme aspect and z-noise**, which push the cotangents far negative.
+    """
+    rng = np.random.default_rng(seed)
+    n = int(rng.integers(4, 9))
+    aspect = float(np.exp(rng.uniform(math.log(0.06), math.log(16.0))))
+    amplitude = float(np.exp(rng.uniform(math.log(1e-2), math.log(8.0))))
+
+    def axis(count):
+        """Cumulative random spacings, normalised to 0..1."""
+        gaps = rng.uniform(0.15, 1.0, count)
+        edges = np.concatenate([[0.0], np.cumsum(gaps)])
+        return edges / edges[-1]
+
+    xs = axis(n) * aspect
+    ys = axis(n)
+    gx, gy = np.meshgrid(xs, ys, indexing="ij")
+    gz = rng.normal(0.0, amplitude, gx.shape)
+    verts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
+
+    tris = []
+    for i in range(n):
+        for j in range(n):
+            a = i * (n + 1) + j
+            b = (i + 1) * (n + 1) + j
+            c = (i + 1) * (n + 1) + j + 1
+            d = i * (n + 1) + j + 1
+            if rng.random() < 0.5:
+                tris.append((a, b, c))
+                tris.append((a, c, d))
+            else:
+                tris.append((a, b, d))
+                tris.append((b, c, d))
+    tri = np.asarray(tris, dtype=np.int32)
+    return flatten.Chart(
+        verts=verts,
+        tris=tri,
+        loops=np.full(tri.shape, -1, dtype=np.int32),
+        name="rough%d" % seed,
+    )
+
+
+def cotan_tutte(flatten, chart):
+    """Tutte with **cotangent** weights: the variant this module deliberately rejects.
+
+    Lives in the tests, not in the module, and exists for exactly one purpose --
+    to prove the rough-disk family above has the power to catch a regression.  A
+    test that only asserts "mean-value does not flip" could stay green because
+    the charts are easy; this shows they are not.
+    """
+    topo = flatten.chart_topology(chart)
+    if not topo.is_disk:
+        return None
+    n = chart.n_verts
+    uv = np.zeros((n, 2), dtype=np.float64)
+    loop = np.asarray(topo.loops[0], dtype=np.int64)
+    uv[loop] = flatten._circle_boundary(chart, topo.loops[0])
+
+    ei, ej, coeff, inverse = flatten._cotan_pattern(chart)
+    weights = np.bincount(inverse, weights=coeff, minlength=ei.shape[0])[: ei.shape[0]]
+    lap = flatten._edge_laplacian(n, ei, ej, weights)
+
+    on_boundary = np.zeros(n, dtype=bool)
+    on_boundary[loop] = True
+    interior = np.flatnonzero(~on_boundary)
+    if interior.size == 0:
+        return uv, weights
+    padded = np.zeros((n, 2), dtype=np.float64)
+    padded[loop] = uv[loop]
+    rhs = -lap.matvec(padded)[interior]
+    remap = np.full(n, -1, dtype=np.int64)
+    remap[interior] = np.arange(interior.size, dtype=np.int64)
+    keep = (remap[lap.rows] >= 0) & (remap[lap.cols] >= 0)
+    from unwrap_variations.core.linalg import SparseSym, pcg
+
+    reduced = SparseSym.from_coalesced(
+        remap[lap.rows[keep]], remap[lap.cols[keep]], lap.values[keep], interior.size
+    )
+    solved, _, _ = pcg(reduced, rhs, tol=1e-14, maxiter=4000)
+    uv[interior] = np.where(np.isfinite(solved), solved, 0.0)
+    return uv, weights
+
+
 def all_charts(flatten):
     """Every procedural chart, each with a stated reason it is hard."""
     charts = [
@@ -168,7 +268,8 @@ def all_charts(flatten):
     return charts
 
 
-def folded_strip_sample(n: int = 48, turns: float = 1.35):
+def folded_strip_sample(n: int = 48, turns: float = 1.35, r_in: float = 0.18,
+                        r_out: float = 0.30):
     """A flat 3D strip whose UV layout is coiled past a full turn.
 
     **This is the Suzanne defect, made small enough to reason about.**  Every
@@ -179,7 +280,6 @@ def folded_strip_sample(n: int = 48, turns: float = 1.35):
     ``docs/ORGANIC.md`` section 0.3 documents.
     """
     length, width = 2.0, 0.25
-    r_in, r_out = 0.18, 0.30
     verts = []
     for k in range(n + 1):
         verts.append([k / n * length, 0.0, 0.0])
@@ -300,6 +400,80 @@ def test_tutte_produces_zero_flips_on_every_chart(flatten):
             int((areas <= 0.0).sum()),
             areas.size,
         )
+
+
+def test_tutte_zero_flips_on_rough_disks(flatten):
+    """Mean-value Tutte must not flip a single triangle on 200 rough disks.
+
+    This is the test that protects the module's central design decision.  It is
+    paired with the one below, which proves the family is hard enough for the
+    assertion to mean something.
+    """
+    flipped_charts = 0
+    flipped_tris = 0
+    for seed in range(200):
+        chart = rough_disk_chart(flatten, seed)
+        if not flatten.chart_topology(chart).is_disk:
+            continue
+        areas = signed_areas(flatten, flatten.tutte_embed(chart), chart)
+        bad = int((areas <= 0.0).sum())
+        if bad:
+            flipped_charts += 1
+            flipped_tris += bad
+    assert (flipped_charts, flipped_tris) == (0, 0), (
+        "mean-value Tutte flipped %d triangles across %d of 200 rough disks -- "
+        "the guarantee has been lost" % (flipped_tris, flipped_charts)
+    )
+
+
+def test_rough_disks_have_the_power_to_catch_a_cotangent_regression(flatten):
+    """The rough-disk family must actually break cotangent weights.
+
+    Without this, ``test_tutte_zero_flips_on_rough_disks`` could pass because the
+    charts are easy rather than because the weighting is right, and swapping
+    mean-value for cotangent would go unnoticed.  Measured against
+    ``igl.harmonic`` on the same construction: 198 of 400 charts flipped, 2428
+    triangles.  The bar here is deliberately far below that, so the test tracks
+    the *property* rather than a particular solver's arithmetic.
+    """
+    flipped_charts = 0
+    negative_weight_charts = 0
+    checked = 0
+    for seed in range(200):
+        chart = rough_disk_chart(flatten, seed)
+        outcome = cotan_tutte(flatten, chart)
+        if outcome is None:
+            continue
+        checked += 1
+        uv, weights = outcome
+        if (weights < 0.0).any():
+            negative_weight_charts += 1
+        if int((signed_areas(flatten, uv, chart) <= 0.0).sum()):
+            flipped_charts += 1
+    assert checked > 100
+    assert negative_weight_charts > 0.5 * checked, (
+        "only %d of %d rough disks carry a negative cotangent weight; the family "
+        "no longer exercises the hazard" % (negative_weight_charts, checked)
+    )
+    assert flipped_charts > 0.1 * checked, (
+        "cotangent Tutte flipped only %d of %d rough disks -- this family has "
+        "lost its power to catch a regression in the weighting" % (flipped_charts, checked)
+    )
+
+
+def test_mean_value_weights_are_strictly_positive_where_cotangent_is_not(flatten):
+    """The mechanism, asserted directly rather than only through its effect."""
+    worst = 0
+    for seed in range(40):
+        chart = rough_disk_chart(flatten, seed)
+        if not flatten.chart_topology(chart).is_disk:
+            continue
+        _, _, mean_value = flatten._mean_value_weights(chart)
+        assert (mean_value > 0.0).all(), "seed %d: mean-value weight <= 0" % seed
+        _, _, coeff, inverse = flatten._cotan_pattern(chart)
+        cotan = np.bincount(inverse, weights=coeff)
+        worst = max(worst, int((cotan < 0.0).sum()))
+    assert worst > 0, "no chart produced a negative cotangent weight to contrast with"
 
 
 @pytest.mark.parametrize("seed", range(12))
@@ -911,15 +1085,79 @@ def test_repair_folds_rejects_a_mismatched_layout_without_raising(flatten):
 
 
 def test_repair_folds_preserves_repaired_chart_area_when_it_can(flatten):
-    """With no neighbours to collide with, the original UV area is kept exactly."""
+    """Area is preserved exactly when nothing stops it.
+
+    "Nothing stops it" means two things, and the coil radii here are chosen so
+    that both hold: no neighbour to collide with, **and** the unwound strip
+    still fits inside the unit square.  Uncoiling an 8:1 strip turns a compact
+    annulus into a long rectangle, so a larger coil cannot keep its area without
+    running off the edge of the texture -- see the test below.
+    """
     from unwrap_variations.core.evaluator import evaluate
 
-    sample = folded_strip_sample()
+    sample = folded_strip_sample(r_in=0.10, r_out=0.17)
     before = evaluate(sample)
     repaired, report = flatten.repair_folds(sample, sample.uvs)
     after = evaluate(sample.with_uvs(repaired))
     assert report.changed
+    assert after.overlap_area == 0.0
     assert after.uv_coverage == pytest.approx(before.uv_coverage, rel=1e-9)
+
+
+def test_repair_folds_never_pushes_uvs_out_of_bounds(flatten):
+    """A repair may not put triangles outside the unit square.
+
+    ``out_of_bounds_tris`` is **not a term in** :func:`metrics.score`, so the
+    score gate that makes the whole chain safe is structurally blind to this
+    regression: a repair could walk a chart off the edge of the texture and
+    still be accepted.  UVs outside 0..1 wrap, which for a game asset is a
+    defect, so the constraint lives in the placement search instead of being
+    patched into a frozen scorer.
+
+    The large coil is the case that forces the issue: uncoiled at its original
+    area the strip is 1.4 units long and simply cannot fit.
+    """
+    from unwrap_variations.core.evaluator import evaluate
+
+    for radii in ((0.10, 0.17), (0.18, 0.30)):
+        sample = folded_strip_sample(r_in=radii[0], r_out=radii[1])
+        before = evaluate(sample)
+        assert before.out_of_bounds_tris == 0
+        repaired, report = flatten.repair_folds(sample, sample.uvs)
+        after = evaluate(sample.with_uvs(repaired))
+        assert after.out_of_bounds_tris <= before.out_of_bounds_tris, (
+            "radii %s: repair pushed %d triangles out of the unit square"
+            % (radii, after.out_of_bounds_tris)
+        )
+        assert after.overlap_area == 0.0
+
+
+def test_placement_declines_rather_than_leaving_the_allowed_box(flatten):
+    """The bounds test is a real veto, not advisory."""
+    chart = grid_chart(flatten, 4)
+    uv = chart.verts[:, :2] * 0.5 + np.array([0.25, 0.25])
+    empty = np.zeros((0, 3, 2))
+    assert flatten._place_chart(uv, chart, empty, np.array([0.0, 0.0, 1.0, 1.0]))[1] == 1.0
+    # A box the chart cannot fit into at any scale the ladder reaches.
+    assert flatten._place_chart(uv, chart, empty, np.array([0.0, 0.0, 0.01, 0.01])) is None
+
+
+def test_allowed_box_never_tightens_past_where_the_chart_already_was(flatten):
+    """Rule 2 is "never worse", not "always perfect".
+
+    A chart the packer had already pushed outside the unit square must not be
+    forced back inside -- that would be a different change, argued separately --
+    but it must not be pushed further out either.
+    """
+    inside = np.array([[0.2, 0.2], [0.8, 0.2], [0.8, 0.8]])
+    box = flatten._allowed_box(inside)
+    assert box[0] == pytest.approx(0.0, abs=1e-5)
+    assert box[2] == pytest.approx(1.0, abs=1e-5)
+
+    outside = np.array([[-0.3, 0.2], [1.4, 0.2], [0.8, 0.8]])
+    wide = flatten._allowed_box(outside)
+    assert wide[0] <= -0.3
+    assert wide[2] >= 1.4
 
 
 def _combine(first, second, *, offset, uv_offset):
@@ -1021,11 +1259,136 @@ def test_symmetric_dirichlet_energy_of_an_isometric_map_is_four(flatten):
     )
 
 
+def test_scale_normalised_energy_is_blind_to_a_global_uv_scale(flatten):
+    """The whole point of the normalised reading: scaling the layout changes nothing.
+
+    Symmetric Dirichlet is **not** scale invariant -- ``s^2 F + s^-2 G`` has a
+    minimum at unit scale -- so a flattener that happens to pick a better global
+    scale scores better without being any less distorted.  Measured across 21
+    corpus charts, that artefact alone reverses a head-to-head against libigl:
+    16/21 to us at each method's own scale, 18/21 to libigl once scale is
+    minimised out.  Comparing raw energies across methods is therefore a bug in
+    the comparison, and this is the reading that fixes it.
+    """
+    chart = grid_chart(flatten, 6, warp=0.4, jitter=0.2, seed=3)
+    uv = flatten.flatten_chart(chart).uv
+    reference = flatten.symmetric_dirichlet_energy(uv, chart, scale_normalised=True)
+    for factor in (1e-3, 0.25, 4.0, 1e3):
+        assert flatten.symmetric_dirichlet_energy(
+            uv * factor, chart, scale_normalised=True
+        ) == pytest.approx(reference, rel=1e-9)
+
+
+def test_raw_energy_is_not_scale_invariant(flatten):
+    """Assert the hazard exists, so the test above cannot pass vacuously."""
+    chart = grid_chart(flatten, 6, warp=0.4, jitter=0.2, seed=3)
+    uv = flatten.flatten_chart(chart).uv
+    at_own_scale = flatten.symmetric_dirichlet_energy(uv, chart)
+    assert flatten.symmetric_dirichlet_energy(uv * 4.0, chart) > 2.0 * at_own_scale
+
+
+def test_scale_normalised_energy_never_exceeds_the_raw_one(flatten):
+    """It is a minimum over scale, so it is a lower bound by construction."""
+    for chart, why in all_charts(flatten):
+        uv = flatten.tutte_embed(chart)
+        raw = flatten.symmetric_dirichlet_energy(uv, chart)
+        normalised = flatten.symmetric_dirichlet_energy(uv, chart, scale_normalised=True)
+        assert normalised <= raw + 1e-9, "%s (%s)" % (chart.name, why)
+        assert normalised >= 4.0 - 1e-9, "%s (%s): below the isometric floor" % (
+            chart.name,
+            why,
+        )
+
+
+def test_flatten_result_reports_both_energy_conventions(flatten):
+    """Both readings are carried, so a caller cannot quote one by accident."""
+    chart = grid_chart(flatten, 6, warp=0.5)
+    result = flatten.flatten_chart(chart)
+    assert result.energy_normalised <= result.energy + 1e-9
+    assert result.energy_normalised >= 4.0 - 1e-9
+
+
+def test_tutte_never_asks_the_solver_for_an_unbounded_iteration_count(flatten):
+    """``_tutte`` must not opt out of ``pcg``'s own iteration guard.
+
+    It used to pass ``maxiter=max(200, 4*n)`` and then ``max(400, 8*n)``, which
+    on a 99225-unknown chart permits 396,900 iterations -- bypassing the
+    ``min(max(2n, 64), 4000)`` cap that exists precisely so a singular system
+    cannot spin.  Nothing had failed, but the flattener had no bounded worst
+    case, which is a different and worse thing than a slow one.
+    """
+    seen = []
+    real = flatten.pcg
+
+    def spy(matrix, rhs, **kwargs):
+        """Record the iteration budget every Tutte solve asks for."""
+        seen.append(kwargs.get("maxiter"))
+        return real(matrix, rhs, **kwargs)
+
+    chart = grid_chart(flatten, 7, warp=0.4)
+    try:
+        flatten.pcg = spy
+        flatten.tutte_embed(chart)
+    finally:
+        flatten.pcg = real
+
+    assert seen, "the Tutte solve did not run"
+    for budget in seen:
+        assert budget is None or budget <= 4000, (
+            "Tutte asked for %r iterations; the solver's cap is 4000" % (budget,)
+        )
+
+
 def test_symmetric_dirichlet_energy_is_infinite_for_an_inverted_map(flatten):
     """The barrier: a collapsed or inverted triangle costs infinity, not a number."""
     chart = grid_chart(flatten, 4)
     mirrored = chart.verts[:, :2] * np.array([-1.0, 1.0])
     assert flatten.symmetric_dirichlet_energy(mirrored, chart) == math.inf
+
+
+def test_max_feasible_step_ignores_a_numerically_dead_triangle(flatten):
+    """A degenerate triangle may not clamp the whole chart's step.
+
+    Measured before the fix: a signed area of ``1e-300`` -- numerically dead,
+    contributing nothing to the energy and nothing an artist could see --
+    produced a step cap of ``1e-300`` and froze the descent for every other
+    triangle in the chart.  The relative floor excludes it, so the cap is set by
+    the triangles that are actually resolvable.
+    """
+    tris = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+    uv = np.array(
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [5.0, 0.0], [6.0, 0.0], [5.0, 2e-300]]
+    )
+    direction = np.zeros((6, 2))
+    direction[2] = (0.0, -1.0)
+    direction[5] = (0.0, -1.0)
+    assert flatten._max_feasible_step(uv, direction, tris) == pytest.approx(1.0)
+
+
+def test_max_feasible_step_does_not_treat_zero_area_as_unconstrained(flatten):
+    """An exactly-collapsed triangle is "already lost", not "free to move".
+
+    ``A0 > 0`` read ``0.0`` as unconstrained and returned ``inf``, so a full step
+    could carry a collapsed triangle to a *negative* area -- a hole in the
+    no-flip invariant at exactly the measure-zero set the energy barrier also
+    ignores.  It is now classified as degenerate, which both excludes it from
+    the cap and makes :func:`_certify_layout` report it, so ``flatten_chart``
+    refuses to certify rather than silently shipping it.
+    """
+    tris = np.array([[0, 1, 2]], dtype=np.int64)
+    uv = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, 0.0]])
+    direction = np.array([[0.0, 0.0], [0.0, 0.0], [0.0, -1.0]])
+    assert flatten._max_feasible_step(uv, direction, tris) == math.inf
+
+    chart = flatten.Chart(
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1.0, 0.0]]),
+        tris.astype(np.int32),
+        np.full((1, 3), -1, np.int32),
+        "collapsed_uv",
+    )
+    topo = flatten.chart_topology(chart)
+    flipped, degenerate, _ = flatten._certify_layout(uv, chart, topo)
+    assert degenerate == 1 and flipped == 0
 
 
 def test_max_feasible_step_stops_short_of_the_first_inversion(flatten):

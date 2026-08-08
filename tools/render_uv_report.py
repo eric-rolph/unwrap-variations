@@ -76,14 +76,58 @@ SMART_ANGLE_LIMIT_RAD = 1.15192
 #: surface at once, and a top-down that catches limbs a front view hides.
 VIEWS = (("front", 0.0, 8.0), ("three_quarter", 52.0, 26.0), ("top", 15.0, 74.0))
 
-#: Island fill colours.  A fixed cycle, not a hash of the island id: a stable
-#: palette makes two renders of the same mesh comparable at a glance, and the
-#: order islands come out in is itself deterministic.
+#: The first twelve island fill colours.  A fixed cycle, not a hash of the
+#: island id: a stable palette makes two renders of the same mesh comparable at
+#: a glance, and the order islands come out in is itself deterministic.
+#: Islands past the twelfth get generated colours -- see :func:`island_colour`.
 PALETTE = (
     (0.31, 0.55, 0.83), (0.94, 0.64, 0.27), (0.42, 0.72, 0.44), (0.78, 0.45, 0.72),
     (0.36, 0.74, 0.76), (0.87, 0.51, 0.44), (0.62, 0.60, 0.30), (0.55, 0.49, 0.80),
     (0.30, 0.66, 0.61), (0.85, 0.38, 0.53), (0.48, 0.58, 0.28), (0.70, 0.70, 0.42),
 )
+
+#: Relative tolerance for welding two UVs into one island node.  It is the same
+#: rule -- and the same constant -- ``core/evaluator.py`` uses to count islands,
+#: expressed as a fraction of the layout's own span.  Measured: with a plain
+#: ``round(uv, 7)`` absolute lattice instead, this file reported **329** islands
+#: on a ``smart_project`` layout of ``blob_limbs`` whose published
+#: ``island_count`` is **328**, so the caption under a picture contradicted the
+#: table above it.  A visual regression tool that disagrees with the number it
+#: illustrates is worse than none.
+ISLAND_WELD_EPS = 1e-6
+
+
+def island_colour(label: int) -> tuple[float, float, float]:
+    """Return a stable fill colour for island ``label``, distinct for any count.
+
+    The first twelve come from :data:`PALETTE` so small layouts keep the colours
+    every earlier render used.  Beyond that the hue advances by the golden
+    ratio, which spreads any prefix of the sequence evenly round the wheel, and
+    the value alternates over three tiers so that two islands whose hues happen
+    to land close together still differ in brightness.
+
+    A plain ``PALETTE[label % 12]`` was the previous behaviour and it is not
+    good enough here: the corpus routinely produces layouts of 90 to 330
+    islands (measured: ``blob_limbs`` 328, ``hand`` 97 after merging), so nine
+    islands in ten shared a fill with another one and two adjacent charts
+    painted the same colour read as a single chart.  Being able to count the
+    confetti is the entire reason ``docs/BENCHMARKS.md`` section 4.1 gives for
+    this tool existing.
+    """
+    idx = int(label)
+    if idx < len(PALETTE):
+        return PALETTE[idx]
+    k = idx - len(PALETTE)
+    hue = (k * 0.6180339887498949) % 1.0
+    value = (0.86, 0.66, 0.97)[k % 3]
+    sat = (0.62, 0.78, 0.45)[k % 3]
+    i = int(hue * 6.0) % 6
+    f = hue * 6.0 - int(hue * 6.0)
+    p = value * (1.0 - sat)
+    q = value * (1.0 - sat * f)
+    t = value * (1.0 - sat * (1.0 - f))
+    return ((value, t, p), (q, value, p), (p, value, t),
+            (p, q, value), (t, p, value), (value, p, q))[i]
 
 
 def _load(module_name: str, filename: str):
@@ -247,8 +291,30 @@ def overlapping_triangles(tri_uv: np.ndarray, *, cells: int = 128) -> np.ndarray
 
 
 def island_labels(sample) -> np.ndarray:
-    """Return one island label per triangle, welded on ``(vertex, uv)``."""
+    """Return one island label per triangle, welded on ``(vertex, uv)``.
+
+    Two corners join when they share a mesh vertex *and* land on the same UV
+    within :data:`ISLAND_WELD_EPS` of the layout's span, or when they belong to
+    the same triangle.  Both halves are needed: welding on the vertex alone
+    fuses deliberately split islands, welding on the UV alone fuses islands that
+    merely touch.  That is ``core/evaluator.py``'s rule, restated, because the
+    count this produces is printed under a picture whose table cell comes from
+    the evaluator and the two must not disagree.
+    """
     n_loops = sample.uvs.shape[0]
+    uv = np.asarray(sample.uvs, dtype=np.float64)
+    if uv.size:
+        finite = uv[np.isfinite(uv).all(axis=1)]
+        span = float(
+            max(
+                (finite[:, 0].max() - finite[:, 0].min()) if finite.size else 0.0,
+                (finite[:, 1].max() - finite[:, 1].min()) if finite.size else 0.0,
+                0.0,
+            )
+        )
+    else:
+        span = 0.0
+    step = ISLAND_WELD_EPS * max(span, 1.0)
     parent = list(range(n_loops))
 
     def find(x: int) -> int:
@@ -267,7 +333,8 @@ def island_labels(sample) -> np.ndarray:
         for k in range(3):
             loop = int(sample.tri_loops[t, k])
             vert = int(sample.tri_verts[t, k])
-            key = (vert, round(float(sample.uvs[loop, 0]), 7), round(float(sample.uvs[loop, 1]), 7))
+            key = (vert, _quantise(float(uv[loop, 0]), step),
+                   _quantise(float(uv[loop, 1]), step))
             if key in seen:
                 union(loop, seen[key])
             else:

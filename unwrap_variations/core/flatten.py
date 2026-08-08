@@ -26,7 +26,16 @@ So the guarantee is built as a chain, and every link is load-bearing:
    triangle along ``uv + t*d`` is a quadratic in ``t``, so the largest ``t``
    that keeps every currently-positive triangle positive is available in closed
    form.  Capping at 80% of it means no step can ever flip a triangle, so local
-   injectivity holds by construction from the Tutte start onward.  This is the
+   injectivity holds by construction from the Tutte start onward.
+
+   The invariant is stated over the triangles float64 can resolve: a triangle
+   whose signed UV area is **measurably** positive stays positive, where
+   "measurably" is the same scale-relative floor the evaluator and
+   :func:`_certify_layout` use.  That is not a weasel: a triangle of area
+   ``1e-300`` has no orientation to preserve, and constraining it would set the
+   whole chart's step cap to ``1e-300`` and freeze the descent.  Anything below
+   the floor is reported as degenerate instead, and a chart carrying one is
+   never certified.  This is the
    entire reason for starting at Tutte rather than at the backend's layout --
    the backend's layout is not a feasible point and there is nothing to
    preserve.
@@ -42,6 +51,18 @@ Symmetric Dirichlet ``sum A_t (||J_t||_F^2 + ||J_t^-1||_F^2)`` is the energy
 because it is infinite at ``det J = 0``: the barrier and the step cap push in
 the same direction, so a triangle that is nearly collapsed is repelled rather
 than merely constrained.
+
+**It is not scale invariant, and any comparison that forgets that is wrong.**
+``s^2 ||J||^2 + s^-2 ||J^-1||^2`` has a minimum at unit scale, so a method that
+happens to choose a better global scale scores better without being any less
+distorted.  :func:`tutte_embed` sizes its circle to match the chart's surface
+area; libigl's ``map_vertices_to_circle`` uses the unit circle.  Measured
+across 21 corpus charts that difference alone reverses the verdict -- 16/21 to
+us at each method's own scale, 18/21 to libigl once the scale is minimised
+out.  So every energy this module reports carries its convention explicitly:
+:func:`symmetric_dirichlet_energy` takes ``scale_normalised`` and
+:class:`FlattenResult` carries both readings.  Quote the normalised one when
+comparing methods, the raw one when watching a descent converge.
 
 Nothing here imports :mod:`bpy`, and nothing imports ``scipy`` -- Blender ships
 numpy and nothing else (``docs/ORGANIC.md`` section 0.5).  The linear algebra
@@ -134,7 +155,15 @@ _SOLVE_MAXITER_CAP = 64
 _WELD_EPS = 1e-6
 
 #: Below this fraction of the mean triangle area a chart triangle is treated as
-#: degenerate: excluded from the energy, and not allowed to veto a step.
+#: degenerate.  Applied **separately per domain**, exactly as
+#: :func:`unwrap_variations.core.evaluator._relative_floor` does: against the
+#: mean 3D rest area when deciding what contributes to the energy, and against
+#: the mean absolute UV area when deciding what constrains the step and what
+#: :func:`_certify_layout` counts.  The two live in unrelated units and a
+#: triangle can be degenerate in one and perfectly measurable in the other.
+#: Relative rather than absolute for the reason ``meshdata.degenerate_mask``
+#: gives: an absolute 1e-12 calls every triangle of a sub-millimetre model
+#: degenerate.
 _DEGENERATE_EPS = 1e-12
 
 #: Hard cap on candidate segment pairs in the fallback boundary-crossing test.
@@ -159,6 +188,11 @@ _TOUCH_EPS = 1e-12
 
 #: Candidate triangle pairs tested per broadcast block during placement.
 _PAIR_BLOCK = 1_000_000
+
+#: Slack on the unit-square placement constraint.  Deliberately the same value
+#: as ``evaluator._OOB_TOL`` so "in bounds" here and ``out_of_bounds_tris``
+#: there mean the same thing.
+_OOB_TOL = 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -299,8 +333,14 @@ class FlattenResult:
         flipped: Triangles whose signed area opposes the chart majority.
         degenerate: Triangles with no usable area.
         boundary_crossings: Self-intersections of the chart boundary.
-        energy: Final symmetric-Dirichlet energy, normalised by surface area so
-            a perfectly isometric map reads 4.0.
+        energy: Final symmetric-Dirichlet energy **at the layout's own
+            scale**, divided by surface area so a perfectly isometric map reads
+            4.0.  This is what the descent minimises, so it is the reading to
+            watch converge -- but it is *not* comparable across methods that
+            choose different global UV scales.
+        energy_normalised: The same energy minimised over global scale in closed
+            form.  Scale free, so this is the reading to compare against another
+            flattener.
         iterations: Descent iterations actually run.
         seconds: Wall time.
         message: Short explanation, empty when nothing went wrong.
@@ -315,6 +355,7 @@ class FlattenResult:
     energy: float
     iterations: int
     seconds: float
+    energy_normalised: float = 0.0
     message: str = ""
 
 
@@ -946,21 +987,50 @@ def _jacobians(uv: np.ndarray, rest: _Rest) -> tuple[np.ndarray, ...]:
     return j00, j01, j10, j11, det, frob
 
 
+def _energy_terms(uv: np.ndarray, rest: _Rest) -> tuple[float, float]:
+    """Return ``(F, G)``, the two halves of the symmetric Dirichlet energy.
+
+    ``F = sum A ||J||^2`` and ``G = sum A ||J^-1||^2``.  Splitting them is what
+    turns the scale-normalised reading into a closed form rather than a
+    search: scaling the layout by ``s`` gives ``E(s) = s^2 F + s^-2 G``, whose
+    minimum over ``s`` is ``2*sqrt(F*G)``.
+    """
+    if rest.n_good == 0:
+        return 0.0, 0.0
+    _, _, _, _, det, frob = _jacobians(uv, rest)
+    if (rest.good & ~(det > 0.0)).any():
+        return math.inf, math.inf
+    safe = np.where(det != 0.0, det, 1.0)
+    forward = np.where(rest.good, frob, 0.0)
+    inverse = np.where(rest.good, frob / (safe * safe), 0.0)
+    f_term = float(np.dot(np.where(np.isfinite(forward), forward, np.inf), rest.area))
+    g_term = float(np.dot(np.where(np.isfinite(inverse), inverse, np.inf), rest.area))
+    return f_term, g_term
+
+
 def _energy(uv: np.ndarray, rest: _Rest) -> float:
-    """Return the area-weighted symmetric Dirichlet energy of ``uv``.
+    """Return the symmetric Dirichlet energy of ``uv`` at its own UV scale.
 
     Infinite when any measurable triangle has collapsed or inverted, which is
     the property that makes the energy a barrier rather than merely a cost.
     """
-    if rest.n_good == 0:
-        return 0.0
-    _, _, _, _, det, frob = _jacobians(uv, rest)
-    inverted = rest.good & ~(det > 0.0)
-    if inverted.any():
-        return math.inf
-    density = np.where(rest.good, frob * (1.0 + 1.0 / np.where(det != 0.0, det, 1.0) ** 2), 0.0)
-    total = float(np.dot(np.where(np.isfinite(density), density, np.inf), rest.area))
+    f_term, g_term = _energy_terms(uv, rest)
+    total = f_term + g_term
     return total if math.isfinite(total) else math.inf
+
+
+def _energy_scale_min(uv: np.ndarray, rest: _Rest) -> float:
+    """Return the energy minimised over a global uniform UV scale.
+
+    ``min_s (s^2 F + s^-2 G) = 2*sqrt(F G)``.  This is the reading that can be
+    compared across flatteners; the raw one cannot, because symmetric
+    Dirichlet has a preferred scale and different methods pick different ones.
+    """
+    f_term, g_term = _energy_terms(uv, rest)
+    if not (math.isfinite(f_term) and math.isfinite(g_term)):
+        return math.inf
+    product = f_term * g_term
+    return 2.0 * math.sqrt(product) if product > 0.0 else 0.0
 
 
 def _energy_and_gradient(uv: np.ndarray, rest: _Rest) -> tuple[float, np.ndarray]:
@@ -1008,24 +1078,34 @@ def _energy_and_gradient(uv: np.ndarray, rest: _Rest) -> tuple[float, np.ndarray
     return (total if math.isfinite(total) else math.inf), grad
 
 
-def symmetric_dirichlet_energy(uv: np.ndarray, chart: Chart) -> float:
+def symmetric_dirichlet_energy(
+    uv: np.ndarray, chart: Chart, *, scale_normalised: bool = False
+) -> float:
     """Return the chart's symmetric Dirichlet energy, normalised by surface area.
 
-    A perfectly isometric map reads exactly ``4.0`` (both singular values 1), so
-    the number is comparable across charts of different size.  Returns ``inf``
-    when any measurable triangle is collapsed or inverted.
+    A perfectly isometric map reads exactly ``4.0`` under either convention, so
+    the number is comparable across charts of different size.
 
     Args:
         uv: ``(V, 2)`` chart-local layout.
         chart: The chart the layout belongs to.
+        scale_normalised: When False (the default) the energy is measured **at
+            the layout's own scale**, which is what the descent minimises.  When
+            True it is minimised over a global uniform scale in closed form,
+            removing the one degree of freedom that makes a cross-method
+            comparison meaningless -- see the module docstring.  **Always say
+            which one you are quoting.**
 
     Returns:
-        The normalised energy, or ``inf``.
+        The energy, or ``inf`` when a measurable triangle is collapsed or
+        inverted.
     """
     rest = _Rest(_as_chart(chart))
     if rest.total_area <= 0.0:
         return 0.0
-    return _energy(np.asarray(uv, dtype=np.float64).reshape(-1, 2), rest) / rest.total_area
+    layout = np.asarray(uv, dtype=np.float64).reshape(-1, 2)
+    measure = _energy_scale_min if scale_normalised else _energy
+    return measure(layout, rest) / rest.total_area
 
 
 # ---------------------------------------------------------------------------
@@ -1255,13 +1335,19 @@ def _tutte(chart: Chart, topo: ChartTopology) -> np.ndarray:
         remap[lap.rows[keep]], remap[lap.cols[keep]], lap.values[keep], interior.size
     )
 
-    solution, _, residual = pcg(reduced, rhs, tol=1e-12, maxiter=max(200, 4 * interior.size))
+    # No explicit ``maxiter``: use the solver's own documented cap,
+    # ``min(max(2n, 64), 4000)``.  This used to pass ``max(200, 4*n)`` and then
+    # ``max(400, 8*n)``, which on a 99225-unknown chart permits 396,900
+    # iterations -- it opted out of the very guard that exists to stop a
+    # singular system spinning, leaving the flattener with no bounded worst
+    # case.  A Tutte system that has not converged inside the cap is reported
+    # rather than chased: a loose solve shows up as flipped triangles, which
+    # ``_certify_layout`` sees and ``flatten_chart`` refuses to certify.
+    solution, _, residual = pcg(reduced, rhs, tol=1e-12)
     if residual > 1e-8:
-        # A loose solve is the one thing that can cost the guarantee, so buy a
-        # second pass before accepting it.  Warm-started, so it is cheap.
-        solution, _, _ = pcg(
-            reduced, rhs, x0=solution, tol=1e-14, maxiter=max(400, 8 * interior.size)
-        )
+        # One warm-started refinement, also inside the cap.  The worst case is
+        # therefore two capped solves, never an unbounded one.
+        solution, _, _ = pcg(reduced, rhs, x0=solution, tol=1e-14)
     uv[interior] = np.where(np.isfinite(solution), solution, 0.0)
     return uv
 
@@ -1295,17 +1381,37 @@ def _signed_areas(uv: np.ndarray, tris: np.ndarray) -> np.ndarray:
 
 
 def _max_feasible_step(uv: np.ndarray, direction: np.ndarray, tris: np.ndarray) -> float:
-    """Return the largest ``t`` for which no positive triangle inverts.
+    """Return the largest ``t`` for which no *measurably* positive triangle inverts.
 
     Along ``uv + t*d`` a triangle's signed area is the quadratic
-    ``Q t^2 + L t + A0``.  Only triangles that are currently positive are
-    constrained: one that is already inverted cannot be made "more" inverted in
-    a way that matters, and letting it veto the step would freeze the whole
-    descent over a triangle the caller already knows about.
+    ``Q t^2 + L t + A0``, so the largest safe step is available in closed form.
+    Which triangles get a say is decided by a **scale-relative floor**, the same
+    ``_DEGENERATE_EPS * mean(|signed area|)`` rule
+    :func:`_certify_layout`, :func:`unwrap_variations.core.meshdata.degenerate_mask`
+    and the evaluator all use, and the three-way split matters at both ends:
+
+    * ``A0 > floor`` -- measurably positive, and therefore **constrained**.  This
+      is the set the no-flip invariant is stated over.
+    * ``|A0| <= floor`` -- numerically degenerate, and **excluded on both
+      counts**: it cannot veto a step, and no promise is made about its
+      orientation.
+    * ``A0 < -floor`` -- already inverted, so **excluded**; letting it veto the
+      step would freeze the descent over a triangle the caller already knows
+      about.
+
+    A bare ``A0 > 0`` test, which is what this used to do, fails on both sides
+    of zero.  An area of exactly ``0.0`` read as "not constrained" rather than
+    "already lost", so a step of 1.0 could carry it to -0.5 -- a hole in the
+    invariant at exactly the measure-zero set the energy barrier also ignores.
+    And an area of ``1e-300`` -- numerically dead, contributing nothing to
+    anything -- produced a cap of ``1e-300`` and froze the entire chart's
+    descent.  The relative floor closes both: the invariant is now stated over
+    the triangles float64 can actually resolve, which is the strongest promise
+    that is true.
 
     Returns:
         The smallest positive root over the constrained triangles, or ``inf``
-        when no triangle can invert along ``d``.
+        when no such triangle can invert along ``d``.
     """
     if tris.shape[0] == 0:
         return math.inf
@@ -1324,7 +1430,10 @@ def _max_feasible_step(uv: np.ndarray, direction: np.ndarray, tris: np.ndarray) 
     linear = 0.5 * (cross(b0, dc) + cross(db, c0))
     quad = 0.5 * cross(db, dc)
 
-    live = const > 0.0
+    magnitude = np.abs(np.where(np.isfinite(const), const, 0.0))
+    mean = float(magnitude.mean()) if magnitude.size else 0.0
+    floor = _DEGENERATE_EPS * mean if mean > 0.0 else 0.0
+    live = np.isfinite(const) & (const > floor)
     if not live.any():
         return math.inf
     const = const[live]
@@ -1654,6 +1763,7 @@ def flatten_chart(
             degenerate=degenerate,
             boundary_crossings=crossings,
             energy=float("inf"),
+            energy_normalised=float("inf"),
             iterations=0,
             seconds=time.perf_counter() - started,
             message="chart is not a disk: %s" % "; ".join(topo.problems),
@@ -1690,6 +1800,7 @@ def flatten_chart(
         degenerate=best.verdict[1],
         boundary_crossings=best.verdict[2],
         energy=best.energy / normal,
+        energy_normalised=_energy_scale_min(best.uv, rest) / normal,
         iterations=best.iterations,
         seconds=time.perf_counter() - started,
         message="" if ok else "certification failed after every fallback",
@@ -2001,8 +2112,43 @@ _SCALE_LADDER = (
 )
 
 
+def _allowed_box(target: np.ndarray) -> np.ndarray:
+    """Return the ``(u0, v0, u1, v1)`` box a repaired chart may not leave.
+
+    The unit square, widened to include wherever the **original** chart already
+    sat.  UVs outside 0..1 wrap the texture, which for a game asset is a defect
+    rather than a preference -- but Rule 2 says "never worse", not "always
+    perfect", so a chart the packer had already pushed over the edge is only
+    held to where it already was.  When the original was inside the unit square,
+    this is exactly the unit square.
+
+    The ``_OOB_TOL`` slack is the evaluator's own out-of-bounds tolerance, so
+    "in bounds" here means precisely what ``out_of_bounds_tris`` means there;
+    a stricter test would reject placements the metric considers clean.
+    """
+    lo = target.min(axis=0)
+    hi = target.max(axis=0)
+    return np.array(
+        [
+            min(0.0, float(lo[0])) - _OOB_TOL,
+            min(0.0, float(lo[1])) - _OOB_TOL,
+            max(1.0, float(hi[0])) + _OOB_TOL,
+            max(1.0, float(hi[1])) + _OOB_TOL,
+        ]
+    )
+
+
+def _within(uv: np.ndarray, box: np.ndarray | None) -> bool:
+    """Return True when every vertex of a placement lies inside ``box``."""
+    if box is None or uv.size == 0:
+        return True
+    lo = uv.min(axis=0)
+    hi = uv.max(axis=0)
+    return bool(lo[0] >= box[0] and lo[1] >= box[1] and hi[0] <= box[2] and hi[1] <= box[3])
+
+
 def _place_chart(
-    uv: np.ndarray, chart: Chart, others: np.ndarray
+    uv: np.ndarray, chart: Chart, others: np.ndarray, bounds: np.ndarray | None = None
 ) -> tuple[np.ndarray, float] | None:
     """Fit a repaired chart back into the atlas, keeping as much area as it can.
 
@@ -2032,11 +2178,15 @@ def _place_chart(
         uv: ``(V, 2)`` repaired layout, already aligned onto the original.
         chart: The chart being placed.
         others: ``(B, 3, 2)`` triangles of the rest of the atlas near it.
+        bounds: Optional ``(u0, v0, u1, v1)`` box the placement may not leave;
+            see :func:`_allowed_box`.  Without it the translation trials will
+            happily push a chart off the edge of the texture, which the score
+            cannot see because ``out_of_bounds_tris`` is not one of its terms.
 
     Returns:
         ``(uv, scale)`` for the best placement found, or None if every trial at
-        every scale still collides -- in which case the caller keeps the
-        original chart untouched.
+        every scale still collides or leaves ``bounds`` -- in which case the
+        caller keeps the original chart untouched.
     """
     tris = np.asarray(chart.tris, dtype=np.int64).reshape(-1, 3)
     if tris.shape[0] == 0:
@@ -2067,11 +2217,23 @@ def _place_chart(
         shift = np.array([off_u * extent, off_v * extent])
         return rotate(angle) * scale + centre + shift
 
+    def feasible(scale: float, trial: tuple[float, float, float]) -> bool:
+        """A placement is feasible when it stays in bounds and hits nothing.
+
+        The bounds test runs first: it is a reduction over ``(V, 2)`` against a
+        four-element box, where the collision test is a broadcast against the
+        whole neighbourhood.
+        """
+        placed = build(scale, trial)
+        if not _within(placed, bounds):
+            return False
+        return not _collides(placed[tris], others, lo_b, hi_b)
+
     found: tuple[float, tuple[float, float, float]] | None = None
     previous = 1.0
     for scale in _SCALE_LADDER:
         for trial in _PLACEMENTS:
-            if not _collides(build(scale, trial)[tris], others, lo_b, hi_b):
+            if feasible(scale, trial):
                 found = (scale, trial)
                 break
         if found is not None:
@@ -2088,10 +2250,10 @@ def _place_chart(
         clean = scale
         for _ in range(_SHRINK_REFINE):
             mid = 0.5 * (failing + clean)
-            if _collides(build(mid, trial)[tris], others, lo_b, hi_b):
-                failing = mid
-            else:
+            if feasible(mid, trial):
                 clean = mid
+            else:
+                failing = mid
         scale = clean
     return build(scale, trial), float(scale)
 
@@ -2268,7 +2430,7 @@ def _repair_impl(
             continue
 
         others = _neighbour_triangles(sample, out, group, _placement_box(result.uv))
-        placed = _place_chart(result.uv, chart, others)
+        placed = _place_chart(result.uv, chart, others, _allowed_box(target))
         if placed is None:
             reverted += 1
             messages.append("%s: kept original (no collision-free placement)" % chart.name)

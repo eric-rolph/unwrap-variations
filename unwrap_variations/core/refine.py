@@ -423,10 +423,17 @@ def _stage_merge(sample, uvs, *, params, topo, resolve=None):
     # WHERE to cut; ABF flattens the result better than the fallback descent
     # does, and on Suzanne that difference is worth more than the merge itself.
     # If it declines, the merge's own rebuilt layout still stands.
-    note = "%d -> %d charts at max_stretch=%.2f, seam %.3f -> %.3f" % (
-        n_before, n_after, max_stretch,
-        float(getattr(report, "seam_length_before", float("nan"))),
-        float(getattr(report, "seam_length_after", float("nan"))),
+    # Report only the chart count and the *inter-chart* length actually removed.
+    # `seam_length_before/after` is inter-chart boundary, not the layout's seam
+    # length, and printing it as "seam X -> Y" overstated the gain: on
+    # suzanne_sub2 the layout's seam reads 10.016 while the report says 2.761,
+    # because 72.4% of that layout's cuts are intra-island slits merging cannot
+    # reach. The honest figure is how much inter-chart boundary went away.
+    removed = float(getattr(report, "seam_length_before", float("nan"))) - float(
+        getattr(report, "seam_length_after", float("nan"))
+    )
+    note = "%d -> %d charts at max_stretch=%.2f, %.3f of inter-chart cut removed" % (
+        n_before, n_after, max_stretch, removed,
     )
     variants = [] if layout is None else [layout]
     if resolve is not None:

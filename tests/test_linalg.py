@@ -443,24 +443,55 @@ def test_matvec_budget_at_100k_vertices(linalg):
 
 @pytest.mark.perf
 @pytest.mark.slow
-def test_pcg_solves_200k_unknowns(linalg):
-    """A 200k-unknown, two-right-hand-side solve completes and is accurate.
+def test_pcg_cost_per_iteration_at_200k_unknowns(linalg):
+    """Measure the 200k-unknown cost the honest way: per iteration, on a Laplacian.
 
-    Shifted to be well conditioned on purpose: this measures that the solver
-    scales, not how many iterations an unpreconditioned Poisson problem needs.
-    The residual assertion is what makes the timing meaningful -- a fast solve
-    that did not converge measures nothing (``docs/ARCHITECTURE.md`` section 0,
-    "do not trust a CANCELLED operator's timing").
+    **This test replaces a misleading one, and the story is worth keeping.**  It
+    used to solve a Laplacian *shifted by* ``1.0 * I`` to convergence and report
+    the total -- 35 iterations, 0.91 s.  That number is real but it is not a
+    Laplacian: the shift makes the system strongly diagonally dominant, and it
+    flatters the solver by roughly 70-100x.  The same grid without the shift,
+    which is what ``docs/ORGANIC.md`` section 3 actually specifies, needs about
+    2900 iterations and a minute or more.
+
+    Total time to convergence on an unpreconditioned Poisson problem is a
+    property of the *problem's* conditioning, not of this module, and asserting
+    it would either be vacuous or flaky.  Cost per iteration is the figure that
+    belongs to the implementation, so that is what is measured and bounded.
     """
-    op = grid_laplacian(linalg, 448, shift=1.0)
+    op = grid_laplacian(linalg, 448)
     assert op.n >= 200_000
     b = np.random.default_rng(2).normal(size=(op.n, 2))
+    b -= b.mean(axis=0)
+    budget = 100
     started = time.perf_counter()
-    got, iters, residual = linalg.pcg(op, b, tol=1e-10, maxiter=4000)
+    got, iters, residual = linalg.pcg(op, b, tol=0.0, maxiter=budget)
     elapsed = time.perf_counter() - started
+    assert iters == budget
+    assert np.isfinite(got).all()
+    assert np.isfinite(residual)
+    per_iteration = elapsed / budget
+    assert per_iteration < 0.060, "%.1f ms per CG iteration at n=%d" % (
+        per_iteration * 1000.0,
+        op.n,
+    )
+
+
+@pytest.mark.perf
+@pytest.mark.slow
+def test_pcg_converges_on_a_well_conditioned_200k_system(linalg):
+    """A diagonally dominant 200k system converges quickly -- and is labelled as such.
+
+    Kept separate from the Laplacian budget above precisely so the two numbers
+    cannot be confused.  The ``+1.0 I`` shift is the whole reason this converges
+    in tens of iterations rather than thousands; quoting it as "a 200k Laplacian
+    solve" would be wrong by two orders of magnitude.
+    """
+    op = grid_laplacian(linalg, 448, shift=1.0)
+    b = np.random.default_rng(2).normal(size=(op.n, 2))
+    got, iters, residual = linalg.pcg(op, b, tol=1e-10, maxiter=4000)
     assert residual < 1e-9, "did not converge: residual %.3g after %d iters" % (
         residual,
         iters,
     )
     assert np.isfinite(got).all()
-    assert elapsed < 20.0, "200k solve took %.1f s" % elapsed

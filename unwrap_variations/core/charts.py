@@ -1493,25 +1493,61 @@ def _fallback_certify(chart: Chart, uv: np.ndarray) -> tuple[bool, str]:
         return False, "boundary test exceeded its budget"
     if crossings:
         return False, "boundary self-intersects (%d crossings)" % crossings
+
+    # Zero *transversal* crossings is not simplicity, and the gap is not
+    # academic.  A degree-2 branched cover -- a fan whose rim traces the same
+    # convex polygon twice, the second wrap reusing the first's coordinates
+    # bit-for-bit -- has every triangle positively oriented, ``chi == 1``, one
+    # boundary cycle, no non-manifold edge and no repeated *welded* vertex, so
+    # every test above passes.  The two wraps are exactly collinear rather than
+    # crossing, so the count is 0, and they enclose no extra area either, so
+    # ``overlap_area`` cannot object.  Measured on the 12-triangle case: the map
+    # is exactly two-to-one, 15100 of 15100 sampled interior points covered
+    # twice, and this function returned ``True``.
+    #
+    # A simple closed curve cannot pass through a plane point twice.  Same rule
+    # and same exact-equality convention as
+    # :func:`unwrap_variations.core.injectivity._loops_revisit_a_point`, so the
+    # fallback and the strict path agree by construction rather than by luck.
+    for loop in loops:
+        idx = np.asarray(loop, dtype=np.int64).reshape(-1)
+        if idx.shape[0] < 2 or idx.min() < 0 or idx.max() >= uv.shape[0]:
+            continue
+        points = np.ascontiguousarray(uv[idx]).view(np.complex128).reshape(-1)
+        if np.unique(points).shape[0] != idx.shape[0]:
+            return False, "boundary revisits a UV point, so it is not simple"
     return True, ""
 
 
 def _certify_chart(
     chart: Chart, uv: np.ndarray, certify: Callable[..., Any] | None
 ) -> tuple[bool, str]:
-    """Certify a flattened chart, preferring ``core.injectivity`` when present."""
+    """Certify a flattened chart, preferring ``core.injectivity`` when present.
+
+    A certifier that **raises** has not certified anything, so its exception is a
+    refusal rather than an invitation to try a weaker test.  Downgrading on an
+    exception meant any crash in the strict path silently re-opened every hole
+    the strict path exists to close -- and the local fallback is a genuinely
+    different implementation, not a subset.  Measured over 279 certify calls on
+    the whole corpus at seven ``max_stretch`` values: **zero raised and zero
+    returned no verdict**, so refusing costs nothing observable and buys the
+    guarantee that no merge is ever accepted on a certificate nobody produced.
+
+    A stub with no ``globally_injective`` attribute is a different case -- it is
+    an injected test double, not a failure -- and still gets the local test.
+    """
     if certify is None:
         return _fallback_certify(chart, uv)
     try:
         report = certify(_mini_sample(chart, uv, name=chart.name))
-        verdict = getattr(report, "globally_injective", None)
-        if verdict is None:
-            return _fallback_certify(chart, uv)
-        if bool(verdict):
-            return True, ""
-        return False, "core.injectivity rejected the flattening"
-    except BaseException:  # noqa: BLE001 - fall back rather than fail the run
+    except BaseException as exc:  # noqa: BLE001 - a crash is a refusal
+        return False, "certifier raised %s: %s" % (type(exc).__name__, exc)
+    verdict = getattr(report, "globally_injective", None)
+    if verdict is None:
         return _fallback_certify(chart, uv)
+    if bool(verdict):
+        return True, ""
+    return False, "core.injectivity rejected the flattening"
 
 
 # ---------------------------------------------------------------------------
@@ -1571,6 +1607,15 @@ class MergeReport:
         flatten_calls: Number of flattener invocations.
         seconds: Wall-clock time.
         changed: Whether anything was merged at all.
+        failed: Whether the zero merges are a *crash* rather than a decision.
+            Merging never raises, so without this the two are indistinguishable
+            downstream: both arrive as ``changed=False`` and get reported as
+            "nothing was worth merging".  Observed live -- one Blender 4.5.4 run
+            in five came back with ``chart_count_before=0`` and all-zero labels
+            from the :func:`chart_graph` exception path, and the only trace was
+            a note claiming no merge was admissible.  ORGANIC.md 0.7 names the
+            same failure mode in another guise: ``bpy.ops.uv.unwrap`` returns
+            ``{'FINISHED'}`` when it fails.
         message: Human-readable summary, ASCII only.
     """
 
@@ -1590,11 +1635,16 @@ class MergeReport:
     flatten_calls: int = 0
     seconds: float = 0.0
     changed: bool = False
+    failed: bool = False
     message: str = ""
 
     def summary(self) -> str:
-        """Return a compact one-line description, for logs and reports."""
-        return (
+        """Return a compact one-line description, for logs and reports.
+
+        A crashed run appends its ``message``, because a summary that cannot
+        say "I broke" is the status flag ORGANIC.md 0.7 warns about.
+        """
+        head = (
             "merges=%d charts %d->%d seam %.3f->%.3f stretch<=%.4f "
             "rejected(disk=%d stretch=%d inj=%d flat=%d) unscreened=%d "
             "flattens=%d %.2fs"
@@ -1614,6 +1664,7 @@ class MergeReport:
                 self.seconds,
             )
         )
+        return head + (" FAILED: %s" % self.message if self.failed else "")
 
 
 class _Candidate:
@@ -1633,6 +1684,40 @@ class _Candidate:
         self.stretch = stretch
         self.uv = uv
         self.chart = chart
+
+
+def _clamped_iters(iters: int | None, chart: "Chart") -> int | None:
+    """Return a screening budget that can never exceed the full-quality one.
+
+    The gate's whole safety argument is that screening cheaply can only ever
+    *reject* more than screening at full quality would, so a cheap gate cannot
+    admit a merge the expensive one would refuse.  That argument silently
+    inverts above about a thousand triangles.
+
+    ``flatten_chart``'s own budget is per-chart -- ``min(max(32000 // tris, 16),
+    256)`` -- so it *falls* as the chart grows, while the screening budget is a
+    flat constant.  Past the crossover the screen is the **finer** flatten,
+    reports the **lower** stretch, and admits merges full quality refuses.
+    Measured on the corpus sphere at ``max_stretch=1.060497``: screening at 32
+    measured 1.0515 and admitted the merge, full-quality screening measured
+    1.0695 and refused it.
+
+    The descent also minimises symmetric Dirichlet while the gate reads Sander
+    L2, and stretch is *not* monotone in the iteration budget even though energy
+    is -- 18 of 35 corpus pair-unions have a budget at which stretch rises.  So
+    "more iterations is always a tighter gate" was never true either; clamping
+    is what restores the one-sided guarantee the docstring claims.
+    """
+    if iters is None:
+        return None
+    try:
+        from .flatten import _iteration_budget  # noqa: PLC0415 - optional sibling
+    except BaseException:  # noqa: BLE001 - flatten may be absent or renamed
+        return iters
+    try:
+        return int(min(int(iters), int(_iteration_budget(chart))))
+    except (TypeError, ValueError, AttributeError):
+        return iters
 
 
 def _measure_union(
@@ -1672,7 +1757,7 @@ def _measure_union(
         return _Candidate(False, "disk", "not a disk", math.inf, None, None)
 
     chart = _build_chart(sample, tri_mask, name)
-    uv, verdict = _flatten_uv(flatten, chart, iters)
+    uv, verdict = _flatten_uv(flatten, chart, _clamped_iters(iters, chart))
     if uv is None:
         return _Candidate(False, "flatten", "flatten failed", math.inf, None, chart)
     if require_injective and verdict is False:
@@ -1825,6 +1910,7 @@ def merge_charts(
     try:
         graph = chart_graph(sample, tri_chart, topo=topo)
     except Exception as exc:  # noqa: BLE001 - containment, per the contract
+        report.failed = True
         report.message = "chart graph failed: %s: %s" % (type(exc).__name__, exc)
         report.seconds = time.perf_counter() - started
         n_tris = int(sample.n_tris)
@@ -1881,6 +1967,7 @@ def merge_charts(
             deadline=(started + time_budget) if time_budget > 0.0 else None,
         )
     except Exception as exc:  # noqa: BLE001 - containment, per the contract
+        report.failed = True
         report.message = "merge aborted: %s: %s" % (type(exc).__name__, exc)
         report.seconds = time.perf_counter() - started
         return labels, report

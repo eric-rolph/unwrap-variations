@@ -254,6 +254,31 @@ def projective_plane():
     return make_sample(rng.random((6, 3)), RP2_TRIS, name="rp2")
 
 
+def branched_cover(rim: int = 12, wrap: int = 6):
+    """Return ``(sample, uv)`` for a degree-2 branched cover of a hexagon.
+
+    A ``rim``-triangle fan whose boundary polyline traces a ``wrap``-gon twice,
+    the second wrap reusing the first's coordinates bit-for-bit.  It is a
+    genuine disk (``chi == 1``, one boundary loop, manifold), every triangle
+    keeps its orientation, no *welded vertex* repeats -- the second wrap is a
+    different set of mesh vertices, so the bowtie test is blind to it -- and the
+    two wraps are exactly collinear rather than crossing, so the transversal
+    crossing count is zero.  The map is nonetheless exactly two-to-one over the
+    whole polygon: measured by brute force, 15100 of 15100 sampled interior
+    points are covered by exactly 2 triangles.
+    """
+    tris = [[0, j, j + 1] for j in range(1, rim)] + [[0, rim, 1]]
+    verts = [[0.0, 0.0, 1.0]]
+    uv = [[0.0, 0.0]]
+    for j in range(rim):
+        a3 = 2.0 * math.pi * j / rim
+        verts.append([math.cos(a3), math.sin(a3), 0.0])
+        a2 = 2.0 * math.pi * (j % wrap) / wrap
+        uv.append([math.cos(a2), math.sin(a2)])
+    return (make_sample(verts, tris, name="branched_cover"),
+            np.asarray(uv, dtype=np.float64))
+
+
 # ---------------------------------------------------------------------------
 # is_disk
 # ---------------------------------------------------------------------------
@@ -613,6 +638,80 @@ class TestMergeRejection:
         assert not report.changed
 
 
+class TestFallbackCertifier:
+    """The local certifier must not be weaker than the one it stands in for.
+
+    ``_certify_chart`` reaches ``_fallback_certify`` whenever ``core.injectivity``
+    is unavailable, offers no verdict, or **raises**, so a fallback that accepts
+    more than the strict path is not a safety net -- it is a bypass around it.
+    """
+
+    def test_fallback_refuses_a_degree_two_branched_cover(self):
+        """Zero crossings is not simplicity, and the difference is two-to-one.
+
+        The old test accepted on ``crossings == 0``.  A curve that retraces
+        itself exactly has no *transversal* crossing anywhere, so the count is
+        0, and it also encloses no extra area, so ``overlap_area`` cannot object
+        either.  The rule that catches it is the one
+        ``injectivity._loops_revisit_a_point`` uses: a simple closed curve
+        cannot pass through the same plane point twice.
+        """
+        sample, uv = branched_cover()
+        chart = charts.chart_from_mask(
+            sample, np.ones(sample.n_tris, dtype=bool), name="bc"
+        )
+        loops = charts._boundary_loops(
+            np.asarray(chart.tris, dtype=np.int64), chart.n_verts
+        )
+        assert len(loops) == 1, "one boundary cycle, so the obvious disk test passes"
+        assert len(set(loops[0].tolist())) == len(loops[0]), "no welded vertex repeats"
+        assert charts._boundary_crossings(uv, loops) == 0, "nothing crosses"
+        assert is_disk(sample, np.ones(sample.n_tris, dtype=bool)), "a fan is a disk"
+
+        ok, why = charts._fallback_certify(chart, uv)
+        assert not ok
+        assert "point" in why or "simple" in why
+
+    def test_fallback_still_accepts_an_honest_fan(self):
+        """The new condition must not cost a legitimate single-wrap fan."""
+        sample, _ = branched_cover(rim=12, wrap=12)
+        _, uv = branched_cover(rim=12, wrap=12)
+        chart = charts.chart_from_mask(
+            sample, np.ones(sample.n_tris, dtype=bool), name="fan"
+        )
+        ok, why = charts._fallback_certify(chart, uv)
+        assert ok, why
+
+    def test_a_certifier_that_raises_refuses_rather_than_downgrades(self):
+        """A certifier that threw has not certified anything.
+
+        Falling back to the weaker local test on an exception means any crash in
+        the strict path silently re-opens every hole the strict path exists to
+        close.  ``_measure_union``'s own docstring already says an uncertified
+        merge must be refused rather than waved through.
+        """
+        sample, uv = branched_cover()
+
+        def explodes(_mini):
+            raise RuntimeError("certifier blew up")
+
+        chart = charts.chart_from_mask(
+            sample, np.ones(sample.n_tris, dtype=bool), name="bc"
+        )
+        ok, why = charts._certify_chart(chart, uv, explodes)
+        assert not ok
+        assert "certifier blew up" in why or "raised" in why
+
+    def test_a_certifier_with_no_verdict_still_uses_the_local_test(self):
+        """An injected stub that offers no ``globally_injective`` is not a crash."""
+        sample, uv = branched_cover(rim=12, wrap=12)
+        chart = charts.chart_from_mask(
+            sample, np.ones(sample.n_tris, dtype=bool), name="fan"
+        )
+        ok, _ = charts._certify_chart(chart, uv, lambda _mini: object())
+        assert ok
+
+
 class TestMergeDisabled:
     """The escape hatches: no flattener, and merging switched off."""
 
@@ -673,6 +772,44 @@ class TestMergeDisabled:
         _, default = merge_charts(sample, labels, max_stretch=1.25, flatten=plane_flatten)
         assert nan.changed == default.changed
         assert len(nan.steps) == len(default.steps)
+
+    def test_an_internal_failure_is_distinguishable_from_a_policy_refusal(
+        self, monkeypatch
+    ):
+        """A crash inside the merge must not read as "nothing was worth merging".
+
+        Both come back as a report with zero merges and, before this, both were
+        invisible in ``summary()`` -- which omits ``message`` -- so a hard
+        failure surfaced to the user as an ordinary refusal.  Observed live: one
+        Blender 4.5.4 run in five returned ``chart_count_before=0`` with all-zero
+        labels from the ``chart_graph`` exception path, and the only trace was a
+        note saying no merge was admissible.
+
+        ORGANIC.md 0.7 already names this failure mode in another guise:
+        ``bpy.ops.uv.unwrap`` returns ``{'FINISHED'}`` when it fails, so never
+        trust a status that cannot say "I broke".
+        """
+        sample = quad_grid(2, 1)
+        labels = quad_grid_charts(2, 1, 1)
+
+        def explode(*_args, **_kwargs):
+            raise ValueError("synthetic topology failure")
+
+        monkeypatch.setattr(charts, "chart_graph", explode)
+        _, crashed = merge_charts(sample, labels, flatten=plane_flatten)
+        assert not crashed.changed
+        assert crashed.failed
+        assert "synthetic topology failure" in crashed.summary()
+        assert crashed.summary().isascii()
+
+        # A policy refusal is not marked failed and does not carry a traceback.
+        monkeypatch.undo()
+        _, refused = merge_charts(
+            sample, labels, max_stretch=0.5, flatten=plane_flatten
+        )
+        assert not refused.changed
+        assert not refused.failed
+        assert "FAILED" not in refused.summary()
 
     def test_no_flattener_returns_the_input_untouched(self, monkeypatch):
         monkeypatch.setattr(charts, "_resolve_flatten", lambda _: None)
