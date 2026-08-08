@@ -9,8 +9,8 @@ equivalents are noted where they differ.
 ## 1. Get the source
 
 ```bash
-git clone https://github.com/eric-rolph/unwrap-variations-blender.git
-cd unwrap-variations-blender
+git clone https://github.com/eric-rolph/unwrap-variations.git
+cd unwrap-variations
 ```
 
 The add-on package is the inner `unwrap_variations/` directory -- the one
@@ -50,7 +50,7 @@ Linux: `~/.config/blender/<ver>/extensions/user_default`.)
 ### Windows -- directory junction (no admin rights required)
 
 ```bat
-mklink /J "%APPDATA%\Blender Foundation\Blender\4.5\extensions\user_default\unwrap_variations" "C:\path\to\unwrap-variations-blender\unwrap_variations"
+mklink /J "%APPDATA%\Blender Foundation\Blender\4.5\extensions\user_default\unwrap_variations" "C:\path\to\unwrap-variations\unwrap_variations"
 ```
 
 ### macOS / Linux -- symlink

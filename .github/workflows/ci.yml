@@ -195,6 +195,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: unwrap-variations-blender-extension
+          name: unwrap-variations-extension
           path: dist/*.zip
           if-no-files-found: warn
