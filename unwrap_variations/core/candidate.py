@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import struct
 import time
 import zlib
@@ -200,17 +201,48 @@ class Candidate:
             except Exception:  # noqa: BLE001
                 _LOG.debug("could not rebuild metrics from stored dict", exc_info=True)
         return cls(
-            index=int(data.get("index", 0)),
+            index=_as_int(data.get("index"), 0),
             params=UnwrapParams.from_dict(data.get("params") or {}),
             uvs=uvs,
             metrics=metrics,
-            score=float(data.get("score", 0.0) or 0.0),
+            score=_as_float(data.get("score"), 0.0),
             ok=bool(data.get("ok", True)),
             message=str(data.get("message", "") or ""),
             parent=data.get("parent") or None,
-            generation=int(data.get("generation", 0) or 0),
-            seconds=float(data.get("seconds", 0.0) or 0.0),
+            generation=_as_int(data.get("generation"), 0),
+            seconds=_as_float(data.get("seconds"), 0.0),
         )
+
+
+def _as_int(value: Any, fallback: int) -> int:
+    """Coerce a stored value to ``int``, never raising.
+
+    ``OverflowError`` has to be caught alongside the obvious two, and it is not
+    hypothetical: :mod:`json` emits and accepts bare ``Infinity``, and a JSON
+    integer literal with more digits than a double can hold parses to a valid
+    Python int that ``float()`` then refuses.  ``int(float("inf"))`` and
+    ``float(10**400)`` both raise ``OverflowError``, which is neither a
+    ``TypeError`` nor a ``ValueError``.  Without this,
+    :meth:`CandidateStore.load_from_id` -- documented as returning ``False`` on
+    unreadable data and never raising -- would propagate straight out of the
+    ``.blend`` load path and break opening the file.
+    """
+    try:
+        number = float(value)
+        if not math.isfinite(number):
+            return fallback
+        return int(number)
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+
+
+def _as_float(value: Any, fallback: float) -> float:
+    """Coerce a stored value to a finite ``float``, never raising."""
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else fallback
+    except (TypeError, ValueError, OverflowError):
+        return fallback
 
 
 def _coerce_uvs(uvs: Any) -> np.ndarray | None:

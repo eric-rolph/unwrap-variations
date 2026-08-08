@@ -556,6 +556,16 @@ class UVVAR_SceneProps(PropertyGroup):
 
     candidates: CollectionProperty(type=UVVAR_CandidateItem, name="Candidates")
 
+    mirror_object: StringProperty(
+        name="Mirrored Object",
+        description=(
+            "Name of the object the candidate list currently mirrors. The list "
+            "lives on the scene while candidates belong to an object, so this "
+            "is what keeps the two from drifting apart"
+        ),
+        default="",
+    )
+
     def active(self) -> UVVAR_CandidateItem | None:
         """Return the currently selected mirror row, or ``None``."""
         idx = int(self.active_index)
@@ -611,6 +621,10 @@ def sync_ui_list(scene: Scene | None, obj: Any, *, store: Any = None) -> int:
         active_signature = current.signature
 
     props.candidates.clear()
+    try:
+        props.mirror_object = str(getattr(obj, "name", "") or "")
+    except Exception:  # noqa: BLE001 - the stamp is bookkeeping, not the data.
+        _LOG.debug("could not stamp mirror_object", exc_info=True)
     if store is None:
         store = get_store(obj)
     if store is None:
@@ -713,6 +727,67 @@ def candidate_rows(props: UVVAR_SceneProps | None) -> Iterable[UVVAR_CandidateIt
 # ---------------------------------------------------------------------------
 
 
+#: Owner token for the message-bus subscription.  Any hashable object works;
+#: it exists so ``clear_by_owner`` can remove exactly our subscription.
+_MSGBUS_OWNER = object()
+
+
+def on_active_object_changed() -> None:
+    """Re-point the mirror list at whatever object is now active.
+
+    Candidates belong to an *object*; the mirror list lives on the *scene*.
+    Without this the panel keeps showing the previous object's grid after the
+    user clicks something else -- rows that look live, are ranked, and whose
+    buttons the operators then quite correctly refuse to act on.  Resyncing on
+    the change is the only way the two views can agree.
+
+    Registered through ``bpy.msgbus`` rather than a depsgraph handler on
+    purpose: the message bus fires on the specific RNA change (the view layer's
+    active object) and is allowed to write, whereas resyncing from
+    ``depsgraph_update_post`` writes scene data from inside a depsgraph
+    evaluation and can re-trigger itself.
+
+    Never raises: a message-bus callback that throws is reported on every
+    selection click for the rest of the session.
+    """
+    try:
+        context = bpy.context
+        props = get_props(context)
+        if props is None:
+            return
+        obj = getattr(context, "object", None) or getattr(context, "active_object", None)
+        name = str(getattr(obj, "name", "") or "")
+        if name == str(props.mirror_object):
+            return
+        store = store_for(obj, create=False) if obj is not None else None
+        sync_ui_list(getattr(context, "scene", None), obj, store=store)
+        _LOG.debug("mirror list re-pointed at %r", name or "<nothing>")
+    except Exception:  # noqa: BLE001 - a notify callback must never raise.
+        _LOG.debug("active-object resync failed", exc_info=True)
+
+
+def _subscribe_active_object() -> None:
+    """Subscribe to active-object changes, replacing any earlier subscription."""
+    try:
+        bpy.msgbus.clear_by_owner(_MSGBUS_OWNER)
+        bpy.msgbus.subscribe_rna(
+            key=(bpy.types.LayerObjects, "active"),
+            owner=_MSGBUS_OWNER,
+            args=(),
+            notify=on_active_object_changed,
+        )
+    except Exception:  # noqa: BLE001 - no message bus (headless) is not an error.
+        _LOG.debug("could not subscribe to active-object changes", exc_info=True)
+
+
+def _unsubscribe_active_object() -> None:
+    """Drop the active-object subscription."""
+    try:
+        bpy.msgbus.clear_by_owner(_MSGBUS_OWNER)
+    except Exception:  # noqa: BLE001
+        _LOG.debug("could not clear the message-bus owner", exc_info=True)
+
+
 @persistent
 def _on_load_post(_dummy: Any) -> None:
     """Reset per-file runtime state after a new file is opened.
@@ -721,7 +796,9 @@ def _on_load_post(_dummy: Any) -> None:
     files; without this, opening a second file could hand a stale UV array --
     sized for a different mesh -- to the preview blit.  The overlay is
     resynchronised at the same time because ``overlay_mode`` is saved in the
-    ``.blend`` while the GPU draw handler that implements it is not.
+    ``.blend`` while the GPU draw handler that implements it is not, and the
+    message-bus subscription is remade because Blender drops every subscription
+    when it loads a file.
     """
     drop_all_stores()
     try:
@@ -730,23 +807,26 @@ def _on_load_post(_dummy: Any) -> None:
         sync_overlay_state(bpy.context)
     except Exception:  # noqa: BLE001 - a handler must never raise into Blender.
         _LOG.debug("overlay resync after file load failed", exc_info=True)
+    _subscribe_active_object()
     _LOG.debug("cleared candidate caches on file load")
 
 
 def _install_handlers() -> None:
-    """Add the file-load handler exactly once."""
+    """Add the file-load handler exactly once and open the message-bus subscription."""
     handlers = bpy.app.handlers.load_post
     if _on_load_post not in handlers:
         handlers.append(_on_load_post)
+    _subscribe_active_object()
 
 
 def _remove_handlers() -> None:
-    """Remove the file-load handler if it is installed.
+    """Remove the file-load handler and the message-bus subscription.
 
     Compares by name as well as by identity because a module reload creates a
     *new* function object while the old one is still in the handler list, which
     is the classic way an add-on leaks a handler across F8.
     """
+    _unsubscribe_active_object()
     handlers = bpy.app.handlers.load_post
     for handler in list(handlers):
         if handler is _on_load_post or getattr(handler, "__name__", "") == "_on_load_post":

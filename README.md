@@ -335,8 +335,8 @@ evaluator, each measured five times and reported as a median.
 
 The scores matched between Blender 4.5.4 and 5.1.2, so the ranking you see does
 not appear to depend on which supported version you run. No timing figures are
-published yet -- a performance bug is being fixed that would make anything
-measured today unrepresentative.
+published yet: the engine is still under active change, so any number measured
+today would be obsolete by the next build.
 
 Full table, methodology, the competitive context against xatlas, and
 regeneration instructions: **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
@@ -437,9 +437,10 @@ Listed because you will hit them, not because they are theoretical.
   `FINISHED` and leaves the previous UVs in place when it cannot solve an
   island. The add-on detects unchanged and degenerate results and marks the
   candidate failed, but this is inference, not a reliable signal from Blender.
-- **Overlap detection is the expensive metric.** It is on by default and it
-  dominates generation time on dense meshes. **Advanced > Detect Overlaps**
-  turns it off; the overlap warnings go with it.
+- **Overlap detection is the most expensive metric.** It is a spatial-hash pass
+  over every triangle and it is on by default. On dense meshes,
+  **Advanced > Detect Overlaps** turns it off for a noticeably faster generate;
+  the overlap warnings go with it.
 - **Packing behaves differently across Blender versions.** `uv.pack_islands`
   returns `CANCELLED` in 4.5 when running headless but `FINISHED` in 5.1. This
   affects scripted and CI runs rather than interactive use, and everything that

@@ -56,10 +56,13 @@ supported Blender they run. It is subject to the same sampling caveat as
 everything else here, and the cross-version comparison has not yet been re-run
 under the repeated methodology.
 
-No timing figures are published yet. A backend performance bug is being fixed
-that adds roughly a second of pure overhead per candidate, so any wall-clock
-number measured today would be unrepresentative of the next build. The raw
-`bpy.ops.uv.*` calls themselves are sub-millisecond on these meshes.
+**No timing figures are published yet**, and the reason is not that generation
+is slow. Two performance bugs that dominated wall-clock time -- roughly a
+second of pure overhead per candidate, and a refill loop that repeated its
+setup on every round -- have since been fixed, and cost is once again monotonic
+in candidate count. But the engine is still under active change, so any number
+measured today would be obsolete by the next build. Timings will be published
+alongside the final table rather than guessed at now.
 
 The three columns are:
 
@@ -122,8 +125,14 @@ Two consequences:
 
 Score is 0-100, higher is better. Each cell is the **median of 5 runs**, with
 the observed `[min-max]` range. A verdict is awarded only when the median
-margin exceeds **both** half the combined spread of the two series **and** an
+margin exceeds **both** the full combined spread of the two series **and** an
 absolute floor of 1.0 point. Everything else is a tie.
+
+That is a deliberately conservative rule for a benchmark whose whole purpose is
+to be believed: if our best-of-N result and the baseline could have swapped
+places on a different roll of Blender's non-deterministic packer, it is a tie.
+The record below is 3 wins, 3 ties, 1 loss under either this rule or the
+looser half-spread variant, so nothing here depends on the choice.
 
 <!-- BEGIN BENCHMARK TABLE - regenerate wholesale, never hand-edit a cell -->
 
