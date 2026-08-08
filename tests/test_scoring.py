@@ -432,21 +432,6 @@ def test_metrics_summary_is_ascii():
     make_metrics().summary().encode("ascii")
 
 
-@pytest.mark.xfail(
-    reason=(
-        "BUG in core/metrics.py UVMetrics.from_dict: the int/float conversions "
-        "sit inside a `try` that catches only (TypeError, ValueError). "
-        "int(float('inf')) and float(<huge python int>) both raise "
-        "OverflowError, which escapes. Same class as the ParamSpec.clamp bug. "
-        "Reachable from disk: json emits and accepts `Infinity`, and a JSON "
-        "integer literal of 400 digits parses to a Python int that float() "
-        "cannot take. Fix: add OverflowError to the except clause (and "
-        "saturate non-finite values toward the matching bound, as "
-        "ParamSpec.clamp now does)."
-    ),
-    raises=OverflowError,
-    strict=False,
-)
 @pytest.mark.parametrize(
     "payload",
     [
@@ -465,27 +450,33 @@ def test_metrics_from_dict_contains_non_finite_values(payload):
     ``from_dict`` promises that "a ``.blend`` written by a newer add-on version
     must still open in an older one".  An exception here does not degrade a
     candidate, it propagates out of the file-load path.
+
+    Regression test.  The int/float conversions used to sit in a ``try`` that
+    caught only ``(TypeError, ValueError)``; ``int(float('inf'))`` and
+    ``float(<400-digit int>)`` both raise ``OverflowError``, which escaped.
+    An unreadable *measurement* falls back to the field default rather than
+    saturating -- unlike a parameter, a metric has no meaningful bound to
+    saturate toward, and "unknown" is the honest reading.
     """
     m = UVMetrics.from_dict(json.loads(payload))
     assert isinstance(m, UVMetrics)
-    assert math.isfinite(float(m.stretch_l2))
-    assert int(m.n_tris) >= 0
+    defaults = UVMetrics()
+    for spec in dataclasses.fields(UVMetrics):
+        value = getattr(m, spec.name)
+        if isinstance(value, float):
+            assert math.isfinite(value), "%s came back as %r" % (spec.name, value)
+        elif isinstance(value, int):
+            assert value == getattr(defaults, spec.name) or value >= 0
     # And whatever came back must still be scoreable.
     assert 0.0 <= score(m, ScoreWeights()) <= 100.0
 
 
-@pytest.mark.xfail(
-    reason=(
-        "BUG in core/metrics.py ScoreWeights.from_dict: float(value) inside a "
-        "`try` catching only (TypeError, ValueError); a JSON integer literal "
-        "too large for a float raises OverflowError and escapes. Fix: add "
-        "OverflowError to the except clause."
-    ),
-    raises=OverflowError,
-    strict=False,
-)
 def test_weights_from_dict_contains_an_oversized_integer():
-    """A stored weight too large to be a float falls back, it does not raise."""
+    """A stored weight too large to be a float falls back, it does not raise.
+
+    Regression test for the same narrow-``except`` class as the metrics and
+    ``ParamSpec.clamp`` bugs: ``float(<400-digit int>)`` raises ``OverflowError``.
+    """
     w = ScoreWeights.from_dict(json.loads('{"angle": %s}' % ("9" * 400)))
     assert math.isfinite(w.angle)
 

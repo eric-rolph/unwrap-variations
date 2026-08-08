@@ -295,7 +295,7 @@ cylinder, selecting sharp edges at 30 degrees marks 64 seams -- all 64 of them
 horizontal rim circles, none lengthwise. The caps come off and the side is left
 as a closed tube, which cannot be flattened. Blender's unwrap reports success
 and returns a layout with a stretch of 30.6 and 12 flipped triangles. See
-[the full write-up](docs/BENCHMARKS.md#32-the-most-instructive-row-the-cylinder-that-cannot-be-unwrapped);
+[the full write-up](docs/BENCHMARKS.md#43-the-most-instructive-row-the-cylinder-that-cannot-be-unwrapped);
 it is the single clearest argument for measuring your unwraps.
 
 The strategy also uses the **Seed** to break ties between equally flat joins,
@@ -307,27 +307,31 @@ the classic cube unfoldings.
 
 > **These figures are provisional (measured 2026-08-07).** The scoring weights
 > are being retuned, and because all three columns share one scorer, a weight
-> change moves every number in the table. Two runs a few hours apart already
-> disagreed on three rows. Do not quote them as settled; both readings are
-> recorded in [docs/BENCHMARKS.md](docs/BENCHMARKS.md), which is the one place
-> any benchmark number lives.
+> change moves every number. Do not quote them as settled.
+> [docs/BENCHMARKS.md](docs/BENCHMARKS.md) is the one place any benchmark
+> number lives.
 
 Measured, not asserted. Best-of-10 against Blender's own single-pass
 unwrappers, across seven primitives, with all three columns scored by the same
-evaluator:
+evaluator, each measured five times and reported as a median.
 
-- **Best case:** cylinder, roughly **+59** points over the best baseline -- the
+**Record: 3 wins, 3 ties, 1 loss.**
+
+- **Best case:** cylinder, **+59.2** points over the best baseline -- the
   topology case described above.
-- **Worst case:** icosphere, where best-of-10 **loses by about 6.5 points** to
-  a plain sharp-edge unwrap. A smooth closed mesh has no creases for the seam
+- **Worst case:** icosphere, where best-of-10 **loses by 6.7 points** to a
+  plain sharp-edge unwrap. A smooth closed mesh has no creases for the seam
   heuristics to grip, and the sharp-edge baseline degenerates into "cut almost
   nothing and let the solver relax", which happens to be a good answer there.
-- **Overall:** five or six wins out of seven, one tie or two, and that one
-  loss, depending on the run.
+- **Two former wins are now ties.** An earlier single-run version of this
+  benchmark claimed 5 wins. The sphere's +0.6 margin turned out to be smaller
+  than that mesh's own run-to-run variation, and the cone's +0.8 is too small
+  to see on a model. Both were demoted. 3/3/1 is the honest record.
 
-Scores were **identical on Blender 4.5.4 and 5.1.2**; only wall-clock time
-differed, with 5.1 running about 1.7x faster. The ranking you see does not
-depend on which supported Blender you run.
+The scores matched between Blender 4.5.4 and 5.1.2, so the ranking you see does
+not appear to depend on which supported version you run. No timing figures are
+published yet -- a performance bug is being fixed that would make anything
+measured today unrepresentative.
 
 Full table, methodology, the competitive context against xatlas, and
 regeneration instructions: **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
@@ -338,6 +342,44 @@ xatlas 0.0.11 is genuinely better than Blender native on distortion (Suzanne L2
 1.0077 against 1.0298). This add-on wraps Blender's solvers -- it cannot beat a
 better solver by wrapping a different one. What it does is search, measure and
 rank, which no single-pass unwrapper does at all.
+
+## Blender does not unwrap the same way twice
+
+This surprised us, it is measurable, and it is worth knowing whether or not you
+use this add-on.
+
+**Running the same Blender UV operator twice on the same mesh does not produce
+the same UVs.** Measured on 4.5.4, five runs each against a freshly rebuilt,
+identical 48x24 UV sphere:
+
+| Operator | Distinct results in 5 runs | Magnitude |
+| --- | --- | --- |
+| `smart_project` | 5 of 5 | about **3%** -- a genuinely different chart packing each time |
+| `unwrap` (angle-based) | 5 of 5 | 1e-6 level |
+| `cube_project` | 5 of 5 | 1e-6 level |
+
+`cube_project` is the telling one. It is a pure analytical projection with no
+solver in it at all, and it still differs between runs -- which identifies the
+small variation as float and threading noise rather than solver behaviour.
+`smart_project`'s 3% is a different order of thing: threaded chart packing that
+lands somewhere slightly different each time.
+
+This is not a Blender defect and it is not something this add-on can fix. But
+it does have two consequences.
+
+**For you, using this add-on:** pressing **Generate Grid** twice with the same
+seed gives you slightly different candidates and slightly different scores. The
+seed is not broken. It reproduces the same *recipes* faithfully; what it cannot
+do is make Blender's solvers return the same *result* from a recipe.
+
+**For the argument this add-on makes:** if pressing Unwrap twice can hand you
+two different layouts, then you do not actually know what you got until you
+measure it. "Generate several and rank them" stops being a convenience and
+starts being the only way to know which layout is on your mesh.
+
+It also sets the standard for the benchmark: a single run is a sample, not a
+measurement, so every published figure is a median of five with its spread
+reported. Two results previously claimed as wins did not survive that.
 
 ## Requirements and compatibility
 
@@ -365,14 +407,22 @@ it found, or exactly what to set if it found neither.
 
 Listed because you will hit them, not because they are theoretical.
 
-- **The icosphere case loses.** Best-of-10 is beaten by a single sharp-edge
-  unwrap on smooth closed meshes with no creases. There is no seam strategy
-  aimed at that case yet. Raising the candidate count is a mitigation, not a
-  fix.
-- **Not every slot fills.** On closed meshes (sphere, torus, icosphere) a
-  10-candidate grid currently comes back with around 8 usable candidates; the
-  rest are recipes the solver could not complete. They are shown as failed
-  slots with a reason rather than being hidden.
+- **The icosphere case loses.** Best-of-10 is beaten by 6.7 points by a single
+  sharp-edge unwrap on smooth closed meshes with no creases. There is no seam
+  strategy aimed at that case yet. Raising the candidate count is a mitigation,
+  not a fix.
+- **Not every slot fills, and it correlates with the losses.** On closed meshes
+  -- sphere, torus, icosphere -- a 10-candidate grid currently comes back with
+  8 usable candidates; the rest are recipes the solver could not complete.
+  Those are exactly the three meshes that tie or lose in the benchmark, which
+  points at one root cause rather than two problems: not enough viable
+  diversity on closed surfaces. Failed slots are shown with a reason rather
+  than hidden.
+- **The same seed does not give byte-identical results.** Blender's own UV
+  operators are non-deterministic, so re-running Generate reshuffles the
+  candidates slightly. See
+  [above](#blender-does-not-unwrap-the-same-way-twice). The recipes are
+  reproducible; the layouts they produce are not.
 - **A mesh can hold at most 8 UV maps.** This is a Blender limit, not ours --
   `uv_layers.new()` returns nothing past eight and does not raise. It is why
   candidates are stored as raw arrays and shown through a single scratch layer.

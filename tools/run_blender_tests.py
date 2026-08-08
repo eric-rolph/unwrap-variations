@@ -1072,7 +1072,16 @@ def test_generate_preview_branch_apply():
 
 @HARNESS.add("workflow")
 def test_generate_is_reproducible():
-    """The same seed produces the same recipes, run after run."""
+    """The same seed explores the same recipes, run after run.
+
+    Deliberately a **set** comparison, not a list one.  Blender's UV operators
+    are verified non-deterministic on 4.5.4 -- five runs of ``smart_project`` on
+    an identical sphere give five distinct UV buffers -- so the *scores* differ
+    slightly between runs and the ranked order can legitimately swap two
+    near-tied candidates.  What the seed does guarantee is which recipes get
+    tried, and that is what is asserted here.  Asserting on order would be
+    asserting on solver noise.
+    """
     engine = require_attr("unwrap_variations.core.engine", "generate")
     metrics = require("unwrap_variations.core.metrics")
     obj = get("UVVarCube")
@@ -1081,9 +1090,16 @@ def test_generate_is_reproducible():
 
     first = engine.generate(obj, count=4, seed=99, weights=weights, compute_overlap=False)
     second = engine.generate(obj, count=4, seed=99, weights=weights, compute_overlap=False)
-    a = [c.signature for c in first.candidates]
-    b = [c.signature for c in second.candidates]
-    assert a == b, "the same seed produced different recipes:\n  %r\n  %r" % (a, b)
+    a = sorted(c.signature for c in first.candidates)
+    b = sorted(c.signature for c in second.candidates)
+    assert a == b, "the same seed explored different recipes:\n  %r\n  %r" % (a, b)
+    ordered_a = [c.signature for c in first.candidates]
+    ordered_b = [c.signature for c in second.candidates]
+    if ordered_a != ordered_b:
+        HARNESS.note(
+            "same recipes, different ranking between runs -- expected, the "
+            "solvers are non-deterministic"
+        )
 
 
 @HARNESS.add("workflow")

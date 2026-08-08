@@ -1,14 +1,43 @@
 #!/usr/bin/env python3
-"""The decisive experiment: does best-of-N actually beat a single-pass unwrap?
+"""Best-of-N against single-pass, repeated -- because Blender's UV ops are not deterministic.
 
-The product premise is that generating N candidates and ranking them
-automatically produces a better UV layout than Blender's one-shot default. If
-that is not true and measurable, the add-on has no reason to exist. This script
-is the measurement, and it is the *only* thing that may produce the numbers in
-``docs/BENCHMARKS.md``.
+The product premise is that generating N candidate unwraps and ranking them
+automatically produces a better UV layout than running one unwrapper once. This
+script is the measurement, and it is the *only* thing that may produce the
+numbers in ``docs/BENCHMARKS.md``.
 
-Three columns, all scored by the same evaluator so the comparison is
-apples-to-apples:
+Why this repeats every measurement
+----------------------------------
+
+Blender's UV operators do not return the same result twice. Verified on 4.5.4,
+five runs each against a freshly rebuilt, identical 48x24 UV sphere, comparing
+a hash of the resulting UV buffer:
+
+* ``smart_project`` -- 5 runs, 5 distinct results, varying by roughly **3%**.
+  That is a genuinely different chart packing each time.
+* ``unwrap(ANGLE_BASED)`` -- 5 runs, 5 distinct results, at the 1e-6 level.
+* ``cube_project`` -- 5 runs, 5 distinct results, at the 1e-6 level. This one
+  is a pure analytical projection with no solver in it at all, which is what
+  identifies the small variation as float/threading noise rather than solver
+  behaviour.
+
+This is Blender's behaviour, not a defect in this add-on, and it is not
+something the add-on can fix: the engine reproduces the same *recipes* from a
+seed faithfully, but it cannot make Blender's solvers reproduce the same
+*results* from a recipe.
+
+The consequence is methodological. **A single run is a sample, not a
+measurement.** A margin smaller than the run-to-run spread is not a win, and an
+earlier single-run version of this script reported two such non-wins as wins.
+So every column is measured ``--repeats`` times, reported as median with the
+observed range, and a verdict is only awarded when the median margin clears
+both half the combined spread and an absolute floor of 1.0 point.
+
+Columns
+-------
+
+All three are scored by the same evaluator on the same mesh, so the comparison
+is apples-to-apples:
 
 * ``smart_project`` -- ``bpy.ops.uv.smart_project`` at Blender's own defaults.
 * ``unwrap+sharp``  -- sharp edges marked as seams at 30 degrees, then
@@ -16,10 +45,10 @@ apples-to-apples:
 * ``best-of-N``     -- ``engine.generate(count=N)``, top-ranked candidate.
 
 Because every column runs through ``core.metrics.score`` with the same
-``ScoreWeights`` preset, changing that preset changes **all three** columns.
-Never hand-edit a single cell of the published table: regenerate the whole
-thing, or you will end up comparing baselines from one weighting against our
-results from another.
+``ScoreWeights`` preset, changing that preset changes **all three**. Never
+hand-edit a single cell of the published table: regenerate the whole thing, or
+you will end up comparing baselines from one weighting against our results from
+another.
 
 Run::
 
@@ -28,7 +57,7 @@ Run::
 Options go after a bare ``--`` so that Blender does not try to parse them::
 
     blender.exe -b --factory-startup --python tools/benchmark_bestofn.py -- \
-        --count 10 --seed 1 --preset balanced
+        --count 10 --repeats 5 --seed 1 --preset balanced
 
 Exit code is 0 when every mesh produced at least one candidate, 1 otherwise.
 """
@@ -37,8 +66,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import statistics
 import sys
-import time
 
 # The add-on package lives one directory up from tools/. Resolving it from
 # __file__ (rather than hard-coding a path) is what lets anyone else run this.
@@ -58,10 +87,11 @@ from unwrap_variations.core import bridge, engine  # noqa: E402
 from unwrap_variations.core.evaluator import evaluate  # noqa: E402
 from unwrap_variations.core.metrics import ScoreWeights, score  # noqa: E402
 
-#: Score difference below which two layouts are called a tie rather than a win.
-#: The scorer is a continuous function, so without a dead band a 0.05-point
-#: difference would be reported as a victory.
-TIE_BAND = 0.5
+#: Absolute floor a median margin must clear to be called a win or a loss, in
+#: score points. Without it, a mesh whose runs happen to be perfectly stable
+#: (spread 0.0) would have any margin at all declared a victory -- including
+#: 0.05, which is noise in the scorer rather than a difference anyone can see.
+MIN_MARGIN = 1.0
 
 #: Blender's own default Smart UV Project angle limit, in radians (66 degrees).
 SMART_ANGLE_LIMIT_RAD = 1.15192
@@ -97,7 +127,8 @@ def fresh(build):
     Every measurement starts from ``read_factory_settings`` so that no seam,
     UV map or selection left behind by the previous run can leak into the next
     one. That leakage is not hypothetical: seams in particular survive an
-    object rebuild if the scene is reused.
+    object rebuild if the scene is reused, and a repeated benchmark rebuilds
+    the same object dozens of times.
     """
     bpy.ops.wm.read_factory_settings(use_empty=True)
     build()
@@ -107,37 +138,33 @@ def fresh(build):
     return obj
 
 
-def measure_current(obj):
-    """Evaluate whatever UV layout ``obj`` currently carries.
+def measure_current(obj, weights):
+    """Return the score of whatever UV layout ``obj`` currently carries.
 
-    Returns:
-        ``(metrics, score)``. Seams are *read back from the layout* rather than
-        taken from the mesh's seam flags -- ``smart_project`` invents its own
-        charts without marking anything, so asking the mesh would report zero
-        seam length for a heavily cut result.
+    Seams are *read back from the layout* rather than taken from the mesh's
+    seam flags, because ``smart_project`` invents its own charts without
+    marking anything -- asking the mesh would report zero seam length for a
+    heavily cut result and flatter it badly.
     """
     sample = bridge.extract_sample(obj)
     topo = seam_mod.build_edge_topology(sample)
     seams = engine.derive_uv_seams(sample, topo, sample.uvs)
     metrics = evaluate(sample.with_uvs(sample.uvs).with_seams(seams), compute_overlap=True)
-    return metrics, score(metrics, WEIGHTS)
+    return score(metrics, weights)
 
 
-def baseline_smart(obj):
-    """Blender's own Smart UV Project at its stock defaults."""
+def baseline_smart(obj, weights):
+    """Score Blender's own Smart UV Project at its stock defaults."""
     bpy.context.view_layer.objects.active = obj
     bpy.ops.object.mode_set(mode="EDIT")
     bpy.ops.mesh.select_all(action="SELECT")
-    start = time.perf_counter()
     bpy.ops.uv.smart_project(angle_limit=SMART_ANGLE_LIMIT_RAD, island_margin=0.0)
-    seconds = time.perf_counter() - start
     bpy.ops.object.mode_set(mode="OBJECT")
-    metrics, value = measure_current(obj)
-    return metrics, value, seconds
+    return measure_current(obj, weights)
 
 
-def baseline_unwrap(obj):
-    """Blender's stock angle-based Unwrap over sharp-edge seams.
+def baseline_unwrap(obj, weights):
+    """Score Blender's stock angle-based Unwrap over sharp-edge seams.
 
     The deselect in the middle is load-bearing. ``mesh.edges_select_sharp``
     *extends* the current selection rather than replacing it, so without it
@@ -155,17 +182,42 @@ def baseline_unwrap(obj):
     bpy.ops.mesh.mark_seam(clear=False)
     bpy.ops.mesh.select_mode(type="VERT")
     bpy.ops.mesh.select_all(action="SELECT")
-    start = time.perf_counter()
     bpy.ops.uv.unwrap(method="ANGLE_BASED", margin=0.001)
-    seconds = time.perf_counter() - start
     bpy.ops.object.mode_set(mode="OBJECT")
-    metrics, value = measure_current(obj)
-    return metrics, value, seconds
+    return measure_current(obj, weights)
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Reporting
 # ---------------------------------------------------------------------------
+
+
+def band(values):
+    """Format a run of samples as ``median [min-max]``."""
+    return "%5.1f [%5.1f-%5.1f]" % (statistics.median(values), min(values), max(values))
+
+
+def verdict(ours, baseline):
+    """Decide win / tie / loss for one mesh from repeated samples.
+
+    Args:
+        ours: Best-of-N scores, one per repeat.
+        baseline: The better of the two baselines, one per repeat.
+
+    Returns:
+        ``(label, margin, noise)``. ``noise`` is the combined observed spread of
+        both series. A verdict is awarded only when the median margin clears
+        **both** half that spread and :data:`MIN_MARGIN`, so a difference that
+        could plausibly be a different roll of Blender's non-deterministic
+        packer is reported as a tie.
+    """
+    margin = statistics.median(ours) - statistics.median(baseline)
+    noise = (max(ours) - min(ours)) + (max(baseline) - min(baseline))
+    if margin > noise / 2.0 and margin > MIN_MARGIN:
+        return "WIN", margin, noise
+    if margin < -noise / 2.0 and margin < -MIN_MARGIN:
+        return "LOSS", margin, noise
+    return "tie", margin, noise
 
 
 def parse_args(argv):
@@ -175,16 +227,18 @@ def parse_args(argv):
         description="Measure best-of-N against Blender's single-pass unwrappers.",
     )
     parser.add_argument("--count", type=int, default=10, help="Candidates per mesh (default 10).")
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=5,
+        help="Samples per column (default 5). Blender's UV ops are non-deterministic; "
+             "1 disables the statistics and is not suitable for publication.",
+    )
     parser.add_argument("--seed", type=int, default=1, help="Determinism seed (default 1).")
     parser.add_argument(
         "--preset",
         default="balanced",
         help="ScoreWeights preset used for ALL THREE columns (default balanced).",
-    )
-    parser.add_argument(
-        "--no-recipes",
-        action="store_true",
-        help="Skip the per-mesh winning-recipe report at the end.",
     )
     return parser.parse_args(argv)
 
@@ -193,112 +247,65 @@ def main():
     """Run the benchmark and print the table. Returns a process exit code."""
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
     args = parse_args(argv)
+    repeats = max(1, args.repeats)
+    weights = ScoreWeights.preset(args.preset)
 
-    global WEIGHTS
-    WEIGHTS = ScoreWeights.preset(args.preset)
-
-    print("=" * 108)
-    print("BEST-OF-%d vs SINGLE-PASS  (score 0-100 higher better; L2 stretch >= 1.0, lower better)"
-          % args.count)
-    print("Blender %s | preset %r | seed %d" % (bpy.app.version_string, args.preset, args.seed))
-    print("=" * 108)
-    print("%-11s | %-22s | %-22s | %-24s | %s"
+    print("BEST-OF-%d vs SINGLE-PASS, median of %d runs [min-max], Blender %s"
+          % (args.count, repeats, bpy.app.version_string))
+    print("preset %r | seed %d" % (args.preset, args.seed))
+    print("A verdict requires the median margin to exceed HALF the combined spread")
+    print("and to exceed %.1f point; anything else is reported as a tie." % MIN_MARGIN)
+    if repeats < 2:
+        print("WARNING: --repeats 1 produces a sample, not a measurement. Do not publish it.")
+    print("-" * 104)
+    print("%-10s | %-20s | %-20s | %-20s | %s"
           % ("mesh", "smart_project", "unwrap+sharp", "best-of-%d (ours)" % args.count, "verdict"))
-    print("%-11s | %-22s | %-22s | %-24s |"
-          % ("", "score / L2 / isl", "score / L2 / isl", "score / L2 / isl"))
-    print("-" * 108)
+    print("-" * 104)
 
-    wins = losses = ties = 0
-    rows = []
-    recipes = []
+    record = {"WIN": 0, "tie": 0, "LOSS": 0}
     empty = []
 
     for name, build in MESHES:
-        obj = fresh(build)
-        m_smart, sc_smart, t_smart = baseline_smart(obj)
+        smart_runs, unwrap_runs, our_runs, counts = [], [], [], []
+        for _ in range(repeats):
+            smart_runs.append(baseline_smart(fresh(build), weights))
+            unwrap_runs.append(baseline_unwrap(fresh(build), weights))
+            report = engine.generate(
+                fresh(build),
+                count=args.count,
+                seed=args.seed,
+                weights=weights,
+                store=False,
+                compute_overlap=True,
+            )
+            our_runs.append(report.candidates[0].score if report.candidates else 0.0)
+            counts.append(len(report.candidates))
 
-        obj = fresh(build)
-        m_unwrap, sc_unwrap, t_unwrap = baseline_unwrap(obj)
-
-        obj = fresh(build)
-        start = time.perf_counter()
-        report = engine.generate(
-            obj,
-            count=args.count,
-            seed=args.seed,
-            weights=WEIGHTS,
-            compute_overlap=True,
-            store=False,
-        )
-        t_gen = time.perf_counter() - start
-
-        if not report.candidates:
-            print("%-11s | GENERATION PRODUCED NOTHING: %s" % (name, report.warnings[:2]))
+        if not max(counts):
+            print("%-10s | GENERATION PRODUCED NOTHING" % name)
             empty.append(name)
-            losses += 1
+            record["LOSS"] += 1
             continue
 
-        best = report.candidates[0]
-        best_baseline = max(sc_smart, sc_unwrap)
-        delta = best.score - best_baseline
-        if delta > TIE_BAND:
-            verdict = "WIN  +%.1f" % delta
-            wins += 1
-        elif delta < -TIE_BAND:
-            verdict = "LOSE %.1f" % delta
-            losses += 1
-        else:
-            verdict = "tie"
-            ties += 1
+        # The per-repeat maximum, not the maximum of the medians: on any given
+        # run the user would have taken whichever baseline happened to be better.
+        baseline = [max(a, b) for a, b in zip(smart_runs, unwrap_runs)]
+        label, margin, noise = verdict(our_runs, baseline)
+        record[label] += 1
 
-        print("%-11s | %5.1f / %6.4f / %3d | %5.1f / %6.4f / %3d | %5.1f / %6.4f / %3d | %s"
-              % (name,
-                 sc_smart, m_smart.stretch_l2, m_smart.island_count,
-                 sc_unwrap, m_unwrap.stretch_l2, m_unwrap.island_count,
-                 best.score, best.metrics.stretch_l2, best.metrics.island_count,
-                 verdict))
-        rows.append((name, t_gen, t_smart, t_unwrap,
-                     len(report.candidates), len(report.failures)))
-        # Kept from this same run rather than regenerated: a second generate()
-        # would double the runtime and, worse, could disagree with the table
-        # above if anything in the engine were ever non-deterministic.
-        recipes.append((name, best, [round(c.score, 1) for c in report.candidates]))
+        print("%-10s | %s | %s | %s | %-4s %+6.1f (noise %.1f) %d/%d"
+              % (name, band(smart_runs), band(unwrap_runs), band(our_runs),
+                 label, margin, noise, min(counts), args.count))
 
-    print("-" * 108)
-    print("RECORD: %d wins, %d ties, %d losses" % (wins, ties, losses))
-    print()
-
-    print("%-11s | %8s | %8s | %8s | %6s | %s"
-          % ("mesh", "gen NxN", "smart", "unwrap", "cands", "failures"))
-    for name, t_gen, t_smart, t_unwrap, n_cands, n_fail in rows:
-        print("%-11s | %7.2fs | %7.3fs | %7.3fs | %4d/%-2d | %d"
-              % (name, t_gen, t_smart, t_unwrap, n_cands, args.count, n_fail))
-
-    if not args.no_recipes:
-        # Which recipe won tells you whether the parameter space is doing real
-        # work or whether one archetype always wins. If it is always the same
-        # one, the search is theatre.
-        print()
-        print("Winning recipe per mesh:")
-        for name, best, spread in recipes:
-            print("  %-11s -> %-28s score=%5.1f L2=%.4f isl=%3d flip=%d ovl=%.2e"
-                  % (name, best.params.describe(), best.score, best.metrics.stretch_l2,
-                     best.metrics.island_count, best.metrics.flipped_tris,
-                     best.metrics.overlap_area))
-            print("               score spread across %d: %s" % (len(spread), spread))
-
+    print("-" * 104)
+    print("RECORD: %d wins, %d ties, %d losses"
+          % (record["WIN"], record["tie"], record["LOSS"]))
     print()
     if empty:
         print("FAILED: no candidates at all for: %s" % ", ".join(empty))
         return 1
     print("DONE")
     return 0
-
-
-#: Scoring weights, set from ``--preset`` in :func:`main`. Module level because
-#: :func:`measure_current` is called from the baseline helpers too, and every
-#: column must be scored with exactly the same weights.
-WEIGHTS = ScoreWeights.preset("balanced")
 
 
 if __name__ == "__main__":

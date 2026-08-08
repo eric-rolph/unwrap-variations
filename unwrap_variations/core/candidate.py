@@ -493,6 +493,18 @@ class CandidateStore:
             return False, self.last_message
 
         try:
+            # DELETE BEFORE WRITING. Re-assigning an existing bytes ID property
+            # silently TRUNCATES the new value at its first NUL byte -- verified
+            # identically on Blender 4.5.4 and 5.1.2 (a 314-byte zlib blob came
+            # back as 309). Our payload is compressed, so it is full of NULs.
+            # Without this, the FIRST Generate on an object persists correctly
+            # and every subsequent one quietly shreds the store, which is the
+            # worst possible shape for a bug: it passes every single-run test.
+            # Deleting the key first round-trips exactly.
+            if hasattr(mesh, "pop"):
+                mesh.pop(self.ID_KEY, None)
+            elif self.ID_KEY in mesh.keys():
+                del mesh[self.ID_KEY]
             mesh[self.ID_KEY] = blob
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("could not write ID property", exc_info=True)

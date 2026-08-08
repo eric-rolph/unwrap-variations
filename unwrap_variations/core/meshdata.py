@@ -275,15 +275,42 @@ def degenerate_mask(sample: UVMeshSample, eps: float = 1e-12) -> np.ndarray:
     """Return ``(T,)`` bool marking triangles unusable for distortion metrics.
 
     A triangle is degenerate when its 3D area or its absolute UV area falls
-    below ``eps``, or when either carries a non-finite coordinate.  These are
-    excluded from every mean so that a single pinched face cannot poison the
-    score of an otherwise good unwrap.
+    below a threshold, or when either carries a non-finite coordinate.  These
+    are excluded from every mean so that a single pinched face cannot poison
+    the score of an otherwise good unwrap.
+
+    The threshold is **relative to the mesh's own scale**, not the bare ``eps``.
+    An absolute epsilon silently misclassifies small models: a 0.1 mm part --
+    entirely ordinary for a CAD or photogrammetry import -- has per-triangle
+    areas around 5e-15, so a perfectly good unwrap of it would be reported as
+    100% degenerate and scored near zero.  Scaling by the mean triangle area
+    makes the test scale-invariant, which is the only defensible behaviour for
+    a metric that is otherwise scale-free.  ``eps`` remains the relative floor.
+
+    Args:
+        sample: The mesh to inspect.
+        eps: Relative area floor, as a fraction of the mean triangle area.
+            Also used as an absolute floor so an all-zero mesh still resolves.
     """
     if sample.n_tris == 0:
         return np.zeros(0, dtype=bool)
     a3 = tri_areas_3d(sample)
     auv = np.abs(tri_areas_uv(sample))
-    bad = (a3 <= eps) | (auv <= eps)
+
+    def _floor(areas: np.ndarray) -> float:
+        """Scale ``eps`` by the mesh's own mean area, never above it."""
+        finite = areas[np.isfinite(areas)]
+        if finite.size == 0:
+            return float(eps)
+        scale = float(finite.mean())
+        if not (scale > 0.0):
+            return float(eps)
+        # Multiply, do NOT take a max against the absolute eps: clamping the
+        # floor up to 1e-12 is exactly what breaks sub-millimetre models, whose
+        # every triangle is legitimately smaller than that.
+        return float(eps) * scale
+
+    bad = (a3 <= _floor(a3)) | (auv <= _floor(auv))
     p = sample.tri_positions()
     q = sample.tri_uvs()
     bad |= ~np.isfinite(p).all(axis=(1, 2))

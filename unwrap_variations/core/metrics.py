@@ -143,6 +143,14 @@ class UVMetrics:
         A ``.blend`` written by a newer add-on version must still open in an
         older one, so unrecognised keys are dropped rather than raising, and
         anything unparseable falls back to the field default.
+
+        ``OverflowError`` has to be caught alongside the obvious two.  It is not
+        a hypothetical: :mod:`json` both emits and accepts bare ``Infinity``, and
+        a JSON integer literal with more digits than a double can hold parses to
+        a perfectly valid Python int.  ``int(float("inf"))`` and
+        ``float(10**400)`` each raise ``OverflowError``, which -- being neither
+        ``TypeError`` nor ``ValueError`` -- would escape this trust boundary and
+        propagate out of the ``.blend`` load path.
         """
         if not data:
             return cls()
@@ -161,7 +169,7 @@ class UVMetrics:
                     clean[spec.name] = int(raw)
                 else:
                     clean[spec.name] = float(raw)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 clean[spec.name] = fallback
         return cls(**clean)
 
@@ -257,7 +265,15 @@ class ScoreWeights:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any] | None) -> "ScoreWeights":
-        """Rebuild weights from a dict, ignoring unknown keys."""
+        """Rebuild weights from a dict, ignoring unknown and unparseable keys.
+
+        ``OverflowError`` is caught for the same reason as in
+        :meth:`UVMetrics.from_dict`: a stored JSON integer too large to become a
+        float raises it, and this runs on the ``.blend`` load path where nothing
+        may raise.  A non-finite weight is *not* rejected here -- :func:`score`
+        neutralises it -- but one that cannot be converted at all is dropped so
+        the field keeps its default.
+        """
         if not data:
             return cls()
         known = {f.name for f in fields(cls)}
@@ -266,7 +282,7 @@ class ScoreWeights:
             if key in known:
                 try:
                     clean[key] = float(value)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     pass
         return cls(**clean)
 
@@ -347,6 +363,24 @@ def _unit(value: Any, fallback: float) -> float:
     return min(1.0, max(0.0, number))
 
 
+def _count(value: Any) -> int:
+    """Return ``value`` as a non-negative int, or ``0`` if it is not countable.
+
+    Deliberately duck-typed rather than ``isinstance``-checked.  ``numpy``
+    integers are *not* instances of :class:`int` -- ``np.int64`` derives from
+    ``np.signedinteger``, not from ``int`` -- so an ``isinstance`` guard rejects
+    the perfectly ordinary result of ``mask.sum()`` or ``np.count_nonzero(...)``
+    and silently reports a triangle count of zero, which drops the candidate's
+    score to 0.0 and ranks a flawless layout last.  Converting and catching is
+    both broader and safer.
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        return 0
+    return number if number > 0 else 0
+
+
 def score(m: UVMetrics, w: ScoreWeights | None = None) -> float:
     """Collapse metrics into a single ``0..100`` quality number, higher better.
 
@@ -368,7 +402,7 @@ def score(m: UVMetrics, w: ScoreWeights | None = None) -> float:
         is nothing to be good at.
     """
     weights = w if w is not None else ScoreWeights()
-    n_tris = int(m.n_tris) if isinstance(m.n_tris, (int, float)) else 0
+    n_tris = _count(m.n_tris)
     if n_tris <= 0:
         return 0.0
 
@@ -432,20 +466,33 @@ _PARETO_CHUNK = 512
 
 
 def _objectives(ms: Sequence[UVMetrics]) -> np.ndarray:
-    """Return the ``(n, 3)`` minimisation objectives for the Pareto test.
+    """Return the ``(n, 5)`` minimisation objectives for the Pareto test.
 
-    The three axes are the ones an artist actually trades off against each
-    other: distortion, cut count and texture-space efficiency.  Packing is
-    negated so that all three are "smaller is better".  Unmeasurable values
+    The first three axes are the ones an artist actually trades off against
+    each other: distortion, cut count and texture-space efficiency.  Packing is
+    negated so that every axis is "smaller is better".  Unmeasurable values
     become ``+inf``, which makes them dominated by anything measurable.
+
+    Overlap and mirrored triangles are the fourth and fifth axes, and they are
+    not tradeoffs -- they are defects.  They have to be here because otherwise a
+    catastrophically broken layout wins the front outright: a cube projection
+    stacks all six faces onto the same unit square, which gives it a perfect
+    1.0 stretch, zero seams and 1.0 packing efficiency, so on the first three
+    axes alone it dominates every genuinely good candidate.  Measured on real
+    Blender output, it was the *only* point on the front while scoring 0.00.
+    Since the UI badges front members as optimal, that is a lie told in the
+    most prominent place in the product.
     """
     n = len(ms)
-    obj = np.empty((n, 3), dtype=np.float64)
+    obj = np.empty((n, 5), dtype=np.float64)
     for i, m in enumerate(ms):
         obj[i, 0] = _badness(m.stretch_l2, math.inf)
         obj[i, 1] = _badness(m.seam_ratio, math.inf)
         eff = float(m.packing_efficiency) if _is_finite(m.packing_efficiency) else -math.inf
         obj[i, 2] = -eff
+        obj[i, 3] = _badness(m.overlap_area, math.inf)
+        n_tris = max(int(getattr(m, "n_tris", 0) or 0), 1)
+        obj[i, 4] = _badness(m.flipped_tris, math.inf) / n_tris
     return obj
 
 

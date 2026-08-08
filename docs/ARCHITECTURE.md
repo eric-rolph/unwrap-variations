@@ -21,7 +21,7 @@ These facts were probed empirically against **Blender 4.5.4 LTS** and
 | **`pack_islands` headless** | Returns `CANCELLED` on **4.5** but `FINISHED` on **5.1**. Must be wrapped and failure-tolerant. |
 | `numpy` inside Blender | present (1.26.4 on 4.5) |
 | `xatlas` inside Blender | **absent** — must be optional/subprocess |
-| ID-property blobs | `mesh["key"] = bytes(...)` round-trips as `bytes` |
+| ID-property blobs | `mesh["key"] = bytes(...)` round-trips as `bytes` **on the first write only** -- see the truncation row below. |
 | `gpu.shader.from_builtin` | available (overlay is feasible) |
 
 ### Further probed facts (added as workers verified them)
@@ -31,6 +31,9 @@ These facts were probed empirically against **Blender 4.5.4 LTS** and
 | **`uv.unwrap` lies about success** | Returns `{'FINISHED'}` even when it fails. On a closed mesh with no seams it prints `Unwrap failed to solve 1 of 1 island(s)` and **leaves the previous UVs untouched**. Never treat the operator return value as success -- detect a degenerate or unchanged UV buffer instead (`engine.dead_layout_reason`). A dead slot silently inherits its predecessor's layout. |
 | **4.5 cancels more than packing** | Headless on 4.5, `pack_islands`, `average_islands_scale` **and** `minimize_stretch` all return `CANCELLED`; all three return `FINISHED` on 5.1. |
 | **UV operators are NON-DETERMINISTIC** | Verified on 4.5.4: 5 runs of `smart_project` on an identical fresh sphere gave **5 distinct UV buffers**. `smart_project` varies by ~3% (genuinely different chart packing, threaded); `unwrap` and even `cube_project` -- a pure analytical projection with no solver -- vary at the 1e-6 level. Consequences: (a) a seed reproduces the same *recipes*, never bit-identical *results*; (b) any benchmark must repeat and report medians with a noise band, because a single run is a sample not a measurement; (c) a margin smaller than the run-to-run spread is not a win. |
+| **Re-assigning a bytes ID property TRUNCATES it** | Writing over an existing `bytes` ID property silently truncates the new value at its **first NUL byte**. Verified identically on 4.5.4 and 5.1.2: a 314-byte zlib blob came back as 309. A compressed payload is full of NULs, so the *first* Generate persists correctly and every subsequent one shreds the store -- a bug shaped to pass every single-run test. **Always `del`/`pop` the key before writing it.** |
+| **`bl_info` is deleted before `register()`** | For extensions, `addon_utils` runs `del mod.bl_info` before calling `register()`, so reading `bl_info` inside `register()` raises `NameError` for every installed user while a source checkout works fine. Also, `bl_info` must contain **only literals** -- it is parsed from source text with `ast.literal_eval` and never imported, so referencing a constant yields `ValueError: malformed node`. |
+| **Registered subclasses are not on `bpy.types`** | On 4.5.4, registered `PropertyGroup`/`AddonPreferences` subclasses are not reachable via `bpy.types.<Name>` or `dir(bpy.types)` (they are on 5.1.2). Use `Base.bl_rna_get_subclass_py(name)`, or a leak assertion silently passes. |
 | **Raw operator cost is negligible** | Every `bpy.ops.uv.*` call is sub-millisecond on a small mesh, both versions. Any per-candidate cost above that is our own overhead. |
 | **`gpu.shader.from_builtin` names** | The `3D_`/`2D_` prefixed names (`'3D_SMOOTH_COLOR'`, `'2D_IMAGE'`) **do not exist** on 4.5 or 5.1 and raise `ValueError`. Valid on both: `FLAT_COLOR`, `IMAGE`, `IMAGE_COLOR`, `SMOOTH_COLOR`, `UNIFORM_COLOR`, `POLYLINE_*`, `POINT_*`. Resolve through a preference list, not a version branch. |
 | **`layout.progress()` exists on both** | But `hasattr(bpy.types.UILayout, "progress")` returns **False** -- `dir()` does not list RNA functions. Probe with `"progress" in bpy.types.UILayout.bl_rna.functions`. |
@@ -102,6 +105,9 @@ Helper (bpy-free, used by evaluator and tests):
 def tri_areas_3d(s: UVMeshSample) -> np.ndarray      # (T,)
 def tri_areas_uv(s: UVMeshSample) -> np.ndarray      # (T,) SIGNED
 def degenerate_mask(s: UVMeshSample, eps=1e-12) -> np.ndarray  # (T,) bool
+#   eps is RELATIVE: the floor is eps * mean(triangle area), never an absolute
+#   value. An absolute 1e-12 flags every triangle of a 0.1 mm CAD import as
+#   degenerate. evaluate() must use the same relative rule.
 ```
 
 ---

@@ -154,7 +154,11 @@ def evaluate(sample: UVMeshSample, *, compute_overlap: bool = True) -> UVMetrics
     """
     started = time.perf_counter()
     try:
-        metrics = _evaluate_impl(sample, bool(compute_overlap))
+        # Non-finite input is expected and handled explicitly by the masks
+        # below, so numpy's warnings about it are noise -- and in Blender they
+        # would land in the user's system console once per candidate.
+        with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+            metrics = _evaluate_impl(sample, bool(compute_overlap))
     except Exception:  # noqa: BLE001 - containment is the whole point
         metrics = _fallback_metrics(sample)
     return replace(metrics, eval_seconds=time.perf_counter() - started)
@@ -438,11 +442,27 @@ def _stretch_metrics(
     for the area normalisation.  ``conformal_error`` -- the area-weighted mean
     of ``sigma_max/sigma_min - 1`` -- falls out of the same singular values for
     free and is already scale invariant, so it is deliberately *not* normalised.
+
+    The ``1/D`` factor is folded into the UV edge components *before* they are
+    squared rather than applied as a ``1/D^2`` factor afterwards.  The two forms
+    are algebraically identical, but ``D^2`` overflows to infinity once the UV
+    coordinates pass roughly ``1e77`` -- well inside the range where ``e2d`` and
+    ``g2d`` are still finite, so the triangle is not rejected as degenerate.
+    That drove ``a``, ``b`` and ``c`` to zero and reported a *zero* stretch for
+    a layout that was merely scaled up, which is below the provable floor of
+    1.0.  Dividing first keeps every intermediate on the order of the stretch
+    itself and costs one array pass less than the old form; ``D`` is safe to
+    divide by because the caller only passes triangles whose absolute UV area
+    clears ``_DEGENERATE_EPS``.
     """
-    inv_dsq = 1.0 / (4.0 * signed_uv * signed_uv)  # 1 / D^2, D = 2 * signed area
-    a = (dt2 * dt2 * e3 - 2.0 * dt1 * dt2 * f3 + dt1 * dt1 * g3) * inv_dsq
-    c = (ds2 * ds2 * e3 - 2.0 * ds1 * ds2 * f3 + ds1 * ds1 * g3) * inv_dsq
-    b = ((ds1 * dt2 + ds2 * dt1) * f3 - ds2 * dt2 * e3 - ds1 * dt1 * g3) * inv_dsq
+    inv_d = 0.5 / signed_uv  # 1 / D, with D = 2 * signed UV area
+    x1 = ds1 * inv_d
+    y1 = dt1 * inv_d
+    x2 = ds2 * inv_d
+    y2 = dt2 * inv_d
+    a = y2 * y2 * e3 - 2.0 * y1 * y2 * f3 + y1 * y1 * g3
+    c = x2 * x2 * e3 - 2.0 * x1 * x2 * f3 + x1 * x1 * g3
+    b = (x1 * y2 + x2 * y1) * f3 - x2 * y2 * e3 - x1 * y1 * g3
 
     half_sum = 0.5 * (a + c)
     half_diff = 0.5 * (a - c)
@@ -468,9 +488,20 @@ def _stretch_metrics(
     else:
         conformal = 0.0
 
+    # Both bounds below are theorems about the quantity being measured, not
+    # taste, so enforcing them can only ever remove floating-point noise.
+    # Per triangle AM-GM gives L2(T)^2 = (Gamma^2 + gamma^2)/2 >= Gamma*gamma =
+    # A3d/Auv; summing area-weighted and applying Cauchy-Schwarz gives
+    # sum(A3d^2/Auv) >= (sum A3d)^2 / sum Auv = sum A3d, hence L2 >= 1 -- which
+    # holds precisely because ``total_uv`` and ``total_3d`` here are summed over
+    # exactly the triangles that feed ``l2_sq``.  Computing the normalisation
+    # over a wider set than the accumulation is the classic way to break this.
+    # Linf is a maximum over the same per-triangle values whose area-weighted
+    # RMS is L2, so Linf >= L2 likewise.
+    l2_out = max(_finite(stretch_l2, 1.0), 1.0)
     return (
-        _finite(stretch_l2, 1.0),
-        _finite(stretch_linf, 1.0),
+        l2_out,
+        max(_finite(stretch_linf, 1.0), l2_out),
         max(0.0, _finite(conformal, 0.0)),
     )
 
