@@ -337,14 +337,41 @@ def _run_stage(stage, sample, uvs, *, params, topo, resolve=None):
     return None, "unknown stage %r" % (stage,)
 
 
-#: Seconds `merge_charts` may spend screening new candidate pairs on one
-#: candidate.  Merging is the expensive stage by a wide margin and its result
-#: is always a prefix of the same greedy sequence, so a budget costs quality
-#: gracefully rather than producing a different kind of answer.  Measured on
-#: Suzanne over ten candidates: unbudgeted merging took 45.6 s of a 65.2 s
-#: generate for a best of 48.46; at 2.0 s it takes 16.0 s of 51.6 s for 47.33.
-#: Roughly a point of score for a third of the wall-clock.
-_MERGE_TIME_BUDGET = 2.0
+#: Seconds `merge_charts` may spend screening new candidate pairs, per
+#: candidate, per 1000 triangles.  Merging is the expensive stage by a wide
+#: margin and its result is always a prefix of the same greedy sequence, so a
+#: budget costs quality gracefully rather than producing a different kind of
+#: answer.  Measured on Suzanne over ten candidates: unbudgeted merging took
+#: 45.6 s of a 65.2 s generate for a best of 48.46; at 2.0 s it takes 16.0 s of
+#: 51.6 s for 47.33.  Roughly a point of score for a third of the wall-clock.
+#:
+#: It is a *rate* and not a constant because a constant tuned on Suzanne
+#: silently starves anything larger.  Measured with a flat 2.0 s:
+#:
+#: ============ ===== ===== =====
+#: mesh (tris)  2.0 s 8.0 s 30 s
+#: ============ ===== ===== =====
+#: hand (9280)  17.99 25.06 30.19
+#: blob (7608)  45.93 45.95 45.95
+#: knot (5808)  43.59 43.59 43.59
+#: ============ ===== ===== =====
+#:
+#: `hand` lost **12.2 points** to the flat budget, finishing as one giant palm
+#: chart plus 167 sliver ribbons -- a failure the score alone reported as
+#: merely "bad" and which only the rendered UV layout showed for what it was.
+#: The other two plateau early, so the rate costs them nothing.
+_MERGE_SECONDS_PER_KTRI = 2.0
+#: Floor and ceiling on the derived budget.  The floor keeps small meshes from
+#: getting a budget so short that merging cannot finish a single screen; the
+#: ceiling keeps a dense mesh from spending unbounded time in one stage.
+_MERGE_TIME_MIN = 2.0
+_MERGE_TIME_MAX = 15.0
+
+
+def _merge_time_budget(sample) -> float:
+    """Return the merge screening budget for this mesh, in seconds."""
+    ktri = max(float(getattr(sample, "n_tris", 0)), 0.0) / 1000.0
+    return float(min(_MERGE_TIME_MAX, max(_MERGE_TIME_MIN, _MERGE_SECONDS_PER_KTRI * ktri)))
 
 
 def _stage_merge(sample, uvs, *, params, topo, resolve=None):
@@ -380,7 +407,7 @@ def _stage_merge(sample, uvs, *, params, topo, resolve=None):
         certify=injectivity.certify,
         uvs=uvs,
         topo=topo,
-        time_budget=_MERGE_TIME_BUDGET,
+        time_budget=_merge_time_budget(sample),
     )
     n_after = int(np.unique(merged).size)
     if n_after >= n_before:
