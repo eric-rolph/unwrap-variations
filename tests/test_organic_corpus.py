@@ -24,6 +24,7 @@ from __future__ import annotations
 import importlib.util
 import math
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -37,7 +38,12 @@ from tests.reference import (
     reference_union_rect_area,
 )
 from unwrap_variations.core.evaluator import evaluate
-from unwrap_variations.core.meshdata import degenerate_mask, tri_areas_3d, tri_areas_uv
+from unwrap_variations.core.meshdata import (
+    degenerate_mask,
+    make_sample,
+    tri_areas_3d,
+    tri_areas_uv,
+)
 
 _TOOLS = Path(__file__).resolve().parents[1] / "tools"
 
@@ -60,6 +66,29 @@ def _load_corpus():
 
 
 corpus = _load_corpus()
+
+
+def _load_render():
+    """Import ``tools/render_uv_report.py`` behind a bare ``bpy`` stub.
+
+    The report needs Blender to *render*, but the parts that decide what the
+    picture means -- island labelling, the fill palette, the caption -- are
+    plain numpy and are exactly the parts that can silently lie.  A stub module
+    is enough to import them, and testing them here rather than only inside
+    Blender is what makes a regression on them cheap to catch.
+    """
+    name = "unwrap_variations_render_uv_report"
+    if name in sys.modules:
+        return sys.modules[name]
+    sys.modules.setdefault("bpy", types.ModuleType("bpy"))
+    spec = importlib.util.spec_from_file_location(name, _TOOLS / "render_uv_report.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+render = _load_render()
 
 
 @pytest.fixture(scope="module")
@@ -400,6 +429,103 @@ def test_union_rect_area_on_known_cases():
     assert nested == pytest.approx(16.0)
     # Degenerate rectangles contribute nothing.
     assert reference_union_rect_area([(0.0, 0.0, 0.0, 5.0)]) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# The visual report has to tell the truth
+# ---------------------------------------------------------------------------
+
+
+def _laid_out(mesh):
+    """Return a sample carrying a layout: the mesh's own, or a flat projection."""
+    sample = corpus.to_sample(mesh)
+    if mesh.uvs is not None:
+        return sample
+    flat = sample.verts[sample.tri_verts][:, :, :2].reshape(-1, 2)
+    lo, hi = flat.min(axis=0), flat.max(axis=0)
+    return sample.with_uvs(0.02 + 0.96 * (flat - lo) / np.maximum(hi - lo, 1e-12))
+
+
+def _scattered_islands(count):
+    """Return a sample of ``count`` triangles laid out with no two touching."""
+    tri = np.array([[0.0, 0.0], [0.16, 0.0], [0.0, 0.16]])
+    tri_uv = np.asarray(
+        [tri + np.array([0.02 + 0.2 * (i % 5), 0.02 + 0.2 * (i // 5)]) for i in range(count)]
+    )
+    verts = np.zeros((count * 3, 3))
+    verts[:, :2] = tri_uv.reshape(-1, 2)
+    return make_sample(
+        verts, np.arange(count * 3).reshape(count, 3), uvs=tri_uv.reshape(-1, 2), name="grid"
+    )
+
+
+def test_every_island_gets_its_own_colour():
+    """Distinct islands get distinct fills, however many there are.
+
+    Regression.  The palette was a 12-entry cycle indexed by ``label % 12``,
+    while the corpus routinely produces layouts of 90 to 330 islands
+    (``blob_limbs`` measures 328 under ``smart_project``, ``hand`` 97 after
+    merging).  At 30 islands, 18 of them shared a fill with another one, so two
+    adjacent charts painted the same colour read as a single chart -- in the one
+    picture whose entire purpose, per ``docs/BENCHMARKS.md`` section 4.1, is to
+    show that a good-scoring layout is really confetti.
+    """
+    for count in (12, 30, 400):
+        colours = [render.island_colour(i) for i in range(count)]
+        assert len(set(colours)) == count, "%d islands share a colour at n=%d" % (
+            count - len(set(colours)), count
+        )
+    # The first twelve are unchanged, so older renders stay comparable.
+    assert [render.island_colour(i) for i in range(12)] == list(render.PALETTE)
+    # Deterministic, and independent of how many are asked for.
+    assert render.island_colour(97) == render.island_colour(97)
+    for r, g, b in (render.island_colour(i) for i in range(200)):
+        assert 0.0 <= r <= 1.0 and 0.0 <= g <= 1.0 and 0.0 <= b <= 1.0
+
+
+def test_island_labels_weld_on_the_evaluators_tolerance(meshes):
+    """The picture's island count matches the number printed beside it.
+
+    Regression.  ``island_labels`` welded on ``round(uv, 7)``, an *absolute*
+    lattice, while ``core/evaluator.py`` welds on ``1e-6`` of the layout's own
+    span.  Measured inside Blender on a ``smart_project`` layout of
+    ``blob_limbs``: the evaluator reported **328** islands and the picture's
+    caption said **329**, on the same page, for the same layout.
+    """
+    for name in ("folded_ribbon", "pinched", "displaced_sphere"):
+        sample = _laid_out(meshes[name])
+        drawn = int(render.island_labels(sample).max()) + 1
+        assert drawn == evaluate(sample, compute_overlap=False).island_count, name
+
+    # The tolerance is relative, so a layout and the same layout at a millionth
+    # of the size have the same islands.  An absolute round-to-7 lattice fuses
+    # the small one into a handful of cells and reports far fewer.
+    scattered = _scattered_islands(24)
+    full = int(render.island_labels(scattered).max()) + 1
+    tiny = scattered.with_uvs(scattered.uvs * 1e-6)
+    assert full == 24
+    assert int(render.island_labels(tiny).max()) + 1 == full
+    assert evaluate(tiny, compute_overlap=False).island_count == full
+
+
+def test_island_labels_survive_a_broken_layout(meshes):
+    """A NaN UV must not crash the report that exists to show broken layouts."""
+    sample = corpus.to_sample(meshes["folded_ribbon"])
+    uvs = sample.uvs.copy()
+    uvs[0] = np.nan
+    uvs[1] = np.inf
+    labels = render.island_labels(sample.with_uvs(uvs))
+    assert labels.shape[0] == sample.n_tris
+    assert int(labels.min()) >= 0
+
+
+def test_the_caption_names_a_disagreement_instead_of_hiding_it():
+    """When the two island counts differ the caption says so."""
+    agree = render.uv_caption({"islands": 14, "flipped": 0, "overlapping": 3}, 14)
+    assert agree == "UV layout -- 14 islands, 3 red"
+    differ = render.uv_caption({"islands": 329, "flipped": 0, "overlapping": 0}, 328)
+    assert "MISMATCH" in differ
+    assert "328" in differ and "329" in differ
 
 
 @pytest.mark.parametrize("name", ["folded_ribbon", "displaced_sphere", "pinched"])

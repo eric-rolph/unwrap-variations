@@ -290,6 +290,19 @@ def overlapping_triangles(tri_uv: np.ndarray, *, cells: int = 128) -> np.ndarray
     return corpus.overlapping_triangle_mask(tri_uv, cells=cells)
 
 
+def _quantise(value: float, step: float) -> float:
+    """Return ``value`` snapped to a ``step`` lattice, passing NaN/inf through.
+
+    A backend that returns a broken layout returns NaN, and a report whose job
+    is to show broken layouts must not be the thing that crashes on one.  A
+    non-finite coordinate is kept as itself, which groups all the NaNs of one
+    vertex together and never claims two different infinities are the same UV.
+    """
+    if not math.isfinite(value):
+        return value
+    return float(round(value / step))
+
+
 def island_labels(sample) -> np.ndarray:
     """Return one island label per triangle, welded on ``(vertex, uv)``.
 
@@ -408,7 +421,7 @@ def render_uv_layout(sample, path: str, *, size: int) -> dict:
     tri_uv = sample.tri_uvs()
     canvas = Canvas(size)
 
-    colours = np.asarray([PALETTE[int(lab) % len(PALETTE)] for lab in labels], dtype=np.float64)
+    colours = np.asarray([island_colour(int(lab)) for lab in labels], dtype=np.float64)
     signed = tri_areas_uv(sample)
     flipped = signed < 0.0
     overlapping = overlapping_triangles(tri_uv)
@@ -434,6 +447,25 @@ def render_uv_layout(sample, path: str, *, size: int) -> dict:
         "flipped": int(flipped.sum()),
         "overlapping": int(overlapping.sum()),
     }
+
+
+def uv_caption(drawn: dict, published: int) -> str:
+    """Return the caption under a UV panel, naming any disagreement out loud.
+
+    The table above the picture prints ``UVMetrics.island_count``; the picture
+    is coloured by :func:`island_labels`.  They are the same rule and normally
+    the same number, but they are two implementations, and a report that
+    silently shows 329 under a row that says 328 is teaching its reader to
+    distrust it.  When they differ the caption says so rather than picking a
+    winner.
+    """
+    red = int(drawn["flipped"]) + int(drawn["overlapping"])
+    drew = int(drawn["islands"])
+    if drew == int(published):
+        return "UV layout -- %d islands, %d red" % (drew, red)
+    return ("UV layout -- %d islands, %d red (MISMATCH: the evaluator counts %d; "
+            "the picture is coloured by the %d it found)"
+            % (drew, red, int(published), drew))
 
 
 # ---------------------------------------------------------------------------
@@ -797,8 +829,8 @@ def main() -> int:
             prefix = os.path.join(out_dir, "%s_%s" % (name, variant_id))
             sample = bridge.extract_sample(obj)
             drawn = render_uv_layout(sample, prefix + "_uv.png", size=args.uv_size)
-            images = [(prefix + "_uv.png", "UV layout -- %d islands, %d red"
-                       % (drawn["islands"], drawn["flipped"] + drawn["overlapping"]))]
+            images = [(prefix + "_uv.png",
+                       uv_caption(drawn, int(metrics.island_count)))]
             if not args.no_views:
                 for path in render_views(
                     obj, prefix, size=args.view_size, samples=args.samples

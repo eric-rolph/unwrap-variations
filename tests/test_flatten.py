@@ -1325,7 +1325,12 @@ def test_tutte_never_asks_the_solver_for_an_unbounded_iteration_count(flatten):
         seen.append(kwargs.get("maxiter"))
         return real(matrix, rhs, **kwargs)
 
-    chart = grid_chart(flatten, 7, warp=0.4)
+    # The chart has to be big enough that the old formula would breach the cap:
+    # a 34x34 grid has 1089 interior vertices, so ``max(200, 4*n)`` is 4356.
+    # On a smaller chart the bug is invisible, which is exactly why it survived.
+    chart = grid_chart(flatten, 34, warp=0.3)
+    interior = chart.n_verts - len(flatten.chart_topology(chart).loops[0])
+    assert 4 * interior > 4000, "chart too small to exercise the guard"
     try:
         flatten.pcg = spy
         flatten.tutte_embed(chart)
@@ -1335,7 +1340,9 @@ def test_tutte_never_asks_the_solver_for_an_unbounded_iteration_count(flatten):
     assert seen, "the Tutte solve did not run"
     for budget in seen:
         assert budget is None or budget <= 4000, (
-            "Tutte asked for %r iterations; the solver's cap is 4000" % (budget,)
+            "Tutte asked for %r iterations on a %d-unknown system; the solver's "
+            "own cap is 4000 and exists so a singular system cannot spin"
+            % (budget, interior)
         )
 
 
