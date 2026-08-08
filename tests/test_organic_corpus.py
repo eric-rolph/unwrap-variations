@@ -173,6 +173,38 @@ def test_the_builders_are_deterministic(meshes):
         assert again.digest() == meshes[name].digest(), name
 
 
+def test_no_builder_routes_a_corpus_mesh_through_blas():
+    """No corpus geometry may be computed by a matmul.
+
+    Regression, and the mechanism is measured.  ``_band_limited_bumps`` used to
+    project with ``normals @ directions.T``, which is a BLAS ``dgemm``; two numpy
+    builds with different BLAS vendors sum in a different order and the answer
+    moves by an ULP.  That was the whole reason ``displaced_sphere`` and
+    ``pinched`` were not bit-identical between Blender's numpy and a pip wheel:
+    isolated step by step, ``np.linalg.norm`` over an axis and ``np.cos`` hash
+    identically on both, and only the matmul's output diverged.
+
+    The written-out form is checked against the matmul here so the substitution
+    stays honest -- it must be the same arithmetic, just in a pinned order.
+    """
+    directions = corpus._fibonacci_directions(7)
+    normals, _ = corpus._icosphere(2)
+    written = corpus._band_limited_bumps(directions, 7)(normals)
+    proj = normals @ directions.T
+    freqs = np.asarray([3.0 + 1.7 * k for k in range(7)])
+    weights = np.asarray([1.0 / (1.0 + 0.85 * k) for k in range(7)])
+    weights = weights / float(np.abs(weights).sum())
+    matmul = (np.cos(proj * freqs[None, :]) * weights[None, :]).sum(axis=1)
+    assert written == pytest.approx(matmul, abs=1e-14)
+
+    source = (_TOOLS / "organic_corpus.py").read_text(encoding="utf-8")
+    body = "\n".join(
+        line for line in source.splitlines()
+        if not line.lstrip().startswith("#") and "``" not in line
+    )
+    assert " @ " not in body, "a matmul crept back into a corpus builder"
+
+
 def test_an_altered_mesh_is_rejected():
     """A corpus regression raises at build time rather than propagating."""
     saved = corpus.EXPECTED["pinched"]

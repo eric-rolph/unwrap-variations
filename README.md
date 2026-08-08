@@ -368,12 +368,19 @@ Three things that record does **not** mean:
 Full table, methodology, the competitive context against xatlas, timing notes
 and regeneration instructions: **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
 
-**What is not claimed.** This does not beat xatlas or RizomUV on raw
-distortion, and it is not trying to. On the same corpus with the same scorer,
-xatlas 0.0.11 is genuinely better than Blender native on distortion (Suzanne L2
-1.0077 against 1.0298). This add-on wraps Blender's solvers -- it cannot beat a
+**What is not claimed.** This is not a better *solver* than xatlas or RizomUV,
+and it is not trying to be -- it wraps Blender's solvers, so it cannot beat a
 better solver by wrapping a different one. What it does is search, measure and
 rank, which no single-pass unwrapper does at all.
+
+Measured on the same corpus with the same scorer, we do beat xatlas 0.0.11 on
+every mesh, including on raw distortion (Suzanne L2 1.0164 against 1.5190). But
+read [section 5.3](docs/BENCHMARKS.md) before quoting that: xatlas builds
+lightmap atlases, where many small charts are the right answer, and scoring it
+with weights that charge for artist-visible seams penalises it for doing its
+job. An earlier version of this README claimed the opposite result from a
+figure that turned out not to be reproducible; the correction and the evidence
+are in that section.
 
 ## Blender does not unwrap the same way twice
 

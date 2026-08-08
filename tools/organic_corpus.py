@@ -52,11 +52,19 @@ BLAS and sums in a vendor-dependent order.  Measured, not assumed:
 * Blender 4.5.4 (numpy 1.26.4, Python 3.11) and Blender 5.1.2 (numpy 2.3.4,
   Python 3.13) produce **bit-identical** vertex and triangle arrays for all
   eight meshes -- Suzanne and her subdivided form included.
-* Against an unrelated numpy build (2.2.6 on scipy-openblas), connectivity is
-  still bit-identical everywhere and the implicit meshes are bit-identical too;
-  the three analytic meshes differ by **1 to 3 ULP** (max 6.7e-16) because
-  ``np.linalg.norm`` and libm's ``cos`` are not bit-portable.  That is far too
-  small to move any invariant, and the invariant check proves it did not.
+* Against unrelated numpy builds (2.2.6 and 2.5.1 on pip's scipy-openblas),
+  connectivity is bit-identical everywhere and five of the six numpy meshes are
+  bit-identical outright.  Only ``torus_knot`` still drifts, by **1 ULP**
+  (2.2e-16), and the reason is measured rather than guessed: isolating the
+  pipeline step by step, ``np.linalg.norm`` over an axis, ``np.cos``, ``np.sin``
+  and ``np.einsum`` all hash identically on both builds, and every divergence
+  traces to a **BLAS call** -- ``np.dot`` on the 3-vectors inside
+  :func:`_rotation_minimising_frame`, and ``np.linalg.norm`` on a single vector,
+  which goes to ``dnrm2``.  ``displaced_sphere`` and ``pinched`` used to drift
+  for the same reason and no longer do; see :func:`_band_limited_bumps`.  An
+  earlier version of this note blamed ``np.linalg.norm`` and libm's ``cos``.
+  That was wrong, and it was wrong in the direction that would have stopped
+  anybody fixing it.
 
 Each entry carries its **expected invariants** -- vertex and triangle count,
 shell count, Euler characteristic and boundary-edge count per shell -- plus a
@@ -684,14 +692,30 @@ def _band_limited_bumps(directions: np.ndarray, n_terms: int) -> "callable":
     differentiable, so the displaced sphere has **no sharp edge anywhere** --
     which is the whole point of that corpus entry.  The directions come from a
     golden-angle spiral and the frequencies from a fixed arithmetic sequence, so
-    there is no RNG to seed and nothing that can drift between numpy versions.
+    there is no RNG to seed.
+
+    The projection is written out as three multiplies and two adds for the same
+    reason :func:`_segment_distance_sq` is, and it was found the same way.  It
+    used to read ``normals @ directions.T``, which is a BLAS ``dgemm``: measured,
+    that single expression is the **entire** reason ``displaced_sphere`` and
+    ``pinched`` were not bit-identical between Blender's numpy and a pip wheel.
+    Isolated step by step, the icosphere vertices (``np.linalg.norm``), the
+    golden-angle directions (``np.cos``) and the knot's curve (``np.cos``,
+    ``np.sin``) all hash identically across both builds; only the matmul's
+    output diverges, by 1 ULP (2.2e-16).  Written out, the projection is
+    bit-identical on both -- and identical to what the matmul produced under
+    Blender, so no corpus digest moves on a supported build.
     """
     freqs = np.asarray([3.0 + 1.7 * k for k in range(n_terms)], dtype=np.float64)
     weights = np.asarray([1.0 / (1.0 + 0.85 * k) for k in range(n_terms)], dtype=np.float64)
     weights = weights / float(np.abs(weights).sum())
 
     def displace(normals: np.ndarray) -> np.ndarray:
-        proj = normals @ directions.T  # (V, K)
+        proj = (
+            normals[:, 0:1] * directions[None, :, 0]
+            + normals[:, 1:2] * directions[None, :, 1]
+            + normals[:, 2:3] * directions[None, :, 2]
+        )  # (V, K)
         return (np.cos(proj * freqs[None, :]) * weights[None, :]).sum(axis=1)
 
     return displace

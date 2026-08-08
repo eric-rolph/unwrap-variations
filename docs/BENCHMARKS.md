@@ -20,14 +20,17 @@ The claim is narrow on purpose:
 
 That is it. Specifically **not** claimed:
 
-- Not that this beats [xatlas](https://github.com/jpcy/xatlas) or RizomUV on
-  raw distortion. It does not, and it could not: the solvers doing the work
-  here are Blender's own. Measured on the same corpus with the same scorer,
-  xatlas 0.0.11 is genuinely better than Blender native on distortion --
-  Suzanne L2 **1.0077** against Blender's **1.0298**, torus **1.0037** against
-  **1.0296**, hard-surface test mesh **1.0006** against **1.0119**. Where this
-  add-on differs is that it searches, measures and ranks; a single unwrapper,
-  however good, does not.
+- Not that this is a better *solver* than [xatlas](https://github.com/jpcy/xatlas)
+  or RizomUV. It could not be: the solvers doing the work here are Blender's
+  own. What this add-on adds is search, measurement and ranking, which a single
+  unwrapper does not do at all.
+
+  An earlier version of this file claimed xatlas beats Blender native on raw
+  distortion, with Suzanne L2 1.0077. **That number was wrong and is corrected
+  in [section 5](#5-competitive-context-measured-not-quoted)** -- re-measured,
+  xatlas gets 1.5190 on Suzanne. The narrower point survives: xatlas is an
+  excellent library built for a different job, and on a lightmap workload the
+  comparison would look different from the one in section 5.
 - Not that it is fast in absolute terms. Ten candidates cost roughly ten
   unwraps plus ten evaluations. The claim is that the *iteration loop* is
   faster than doing the same exploration by hand, not that the arithmetic is
@@ -328,23 +331,96 @@ For contrast, xatlas produced **zero** overlaps everywhere on the same corpus.
 
 ## 5. Competitive context (measured, not quoted)
 
-From the same corpus, scored by the same reference implementation. This is
-context for where the add-on sits, not a claim about it.
+> **This section was wrong and has been re-measured.** The previous version
+> reported xatlas beating Blender native on distortion with **Suzanne L2
+> 1.0077 against 1.0298**. That figure is not reproducible against this
+> Suzanne by either of our two independent implementations. It is corrected
+> below rather than quietly deleted, because it was a competitive claim in a
+> public repository and someone may have relied on it.
 
-| engine | Suzanne L2 | torus L2 | hard-surface L2 | overlaps |
-| --- | ---: | ---: | ---: | --- |
-| Blender `smart_project` | 1.0298 | 1.0296 | 1.0119 | 42 pairs on Suzanne |
-| xatlas 0.0.11 | **1.0077** | **1.0037** | **1.0006** | 0 everywhere |
+Everything here is scored by `unwrap_variations.core.evaluator` with the
+shipped `balanced` weights -- the same code that judges our own candidates, so
+the comparison is apples-to-apples by construction. Meshes are exported from
+Blender 5.1.2; `core/` is `bpy`-free, so xatlas output is measured with no
+translation layer and no special pleading.
 
-Blender native does win on the sphere (1.0237 against xatlas's 1.0346), and it
-is far better integrated.
+| mesh | ours | xatlas 0.0.11 | ours L2 | xatlas L2 | ours seam ratio | xatlas seam ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| suzanne | **23.19** | 1.29 | **1.0164** | 1.5190 | **8.956** | 14.171 |
+| sphere | **66.43** | 55.72 | **1.0071** | 1.0346 | **3.508** | 4.630 |
+| torus | **52.30** | 34.96 | **1.0035** | 1.0323 | **6.383** | 9.650 |
+| icosphere | **66.04** | 28.25 | **1.0042** | 1.0288 | **3.777** | 4.869 |
+
+The "ours" column is the pre-organic-work baseline (commit `e0360e5`), which
+is the fairest thing to compare a single-pass tool against; the current
+engine scores considerably higher (see section 4).
+
+### 5.1 Why the old number was wrong, and why the evaluator is not
+
+The obvious suspicion is that our two implementations disagree. They do not.
+Computing Sander L2 from the naive `tests/reference.py` singular values, the
+slow obvious way, against `core/evaluator.py` on identical UV buffers:
+
+| layout | `core/evaluator.py` | naive `tests/reference.py` | delta |
+| --- | ---: | ---: | ---: |
+| xatlas | 1.5190 | 1.5190 | 2.2e-16 |
+| ours | 1.0164 | 1.0164 | 2.2e-16 |
+| Suzanne stock UVs | 1.4124 | 1.4124 | 8.9e-16 |
+
+Machine precision on all three, so **the evaluator is sound and every other
+number in this file stands**. What does not stand is the old xatlas row.
+
+Two further checks, because a surprising competitive result deserves them:
+
+- **Per-chart scale is not the explanation.** A global stretch metric can
+  conflate per-chart distortion with inter-chart scale variation, and xatlas's
+  texel density is far less uniform than ours (`texel_density_cv` 0.428 against
+  0.055). Rescaling every xatlas chart to the global mean texel density before
+  measuring makes Suzanne **worse**, 1.5190 to 1.9904. The distortion is real
+  and per-chart.
+- **Tuning does not rescue it.** `padding=4 resolution=2048` gives L2 1.804;
+  `padding=8 resolution=4096 brute_force=True` likewise. xatlas simply shatters
+  Suzanne into 42+ islands.
+
+### 5.2 Scoring xatlas fairly requires unmirroring its charts first
+
+Measured naively, xatlas scores **0.02** on Suzanne with **521 of 968 triangles
+flagged flipped**. That is our harness, not xatlas.
+
+xatlas orients each chart to its own surface normal, so roughly half its charts
+come out mirrored relative to the source winding. Measured on Suzanne: 66
+charts, **zero with mixed winding** -- every chart is internally consistent, so
+this is a convention difference and not a defect. `UVMetrics.flipped_tris`
+counts any negative signed UV area, which scores a mirrored-but-perfect chart
+as 100% broken. The numbers above reflect each such chart being reflected about
+its own bounding-box centre first, which fixes winding without moving it.
+
+**This is a latent issue in our own evaluator, not only in the comparison
+harness.** Mirrored UVs are a standard production technique for saving texture
+space, and we would currently report an artist's mirrored asset as
+catastrophically broken. It is a no-op on every layout we ourselves produce
+(all report `flipped_tris` 0), so it changes no number in this file, and it is
+tracked as a separate change rather than folded in here.
+
+### 5.3 This is not a fair fight on xatlas's home ground
+
+Worth stating plainly. xatlas exists to build lightmap and texture atlases,
+where many small charts are exactly the right answer. Our `balanced` weights
+charge 1.8 per unit of `seam_ratio` because an artist pays for every cut by
+hand. Scoring an atlas generator with an artist's weights penalises it for
+doing its job well.
+
+The honest claim is narrow: **under the weights this add-on ships, on this
+corpus, we win every mesh.** On Suzanne xatlas's raw distortion is genuinely
+worse too, which is not a weighting artefact -- but on a lightmap workload the
+comparison would look different, and nobody should read this table as "xatlas
+is bad".
 
 **xatlas 0.0.11 segfaulted** on a 130k-triangle sphere on Windows / CPython
 3.13, with valid in-range indices -- a hard crash, not a Python exception. This
-is stated as a factual observation about why this add-on isolates its backends
-and treats a backend failure as a skipped candidate: a backend that dies must
-take the candidate down, never Blender. It is not a criticism of xatlas, which
-is an excellent library and beats Blender's own solver on distortion above.
+is recorded as the reason this add-on isolates its backends and treats a
+backend failure as a skipped candidate: a backend that dies must never take
+Blender with it. It is not a criticism of xatlas.
 
 ## 6. Regenerating this table
 
@@ -431,11 +507,22 @@ a mysteriously moved benchmark cell.
 **Determinism was measured, not assumed.** All eight meshes come out
 bit-identical on Blender 4.5.4 (numpy 1.26.4, Python 3.11) and Blender 5.1.2
 (numpy 2.3.4, Python 3.13) -- vertex arrays, triangle arrays and content
-digests. Against an unrelated numpy build (2.2.6 on scipy-openblas)
-connectivity is still bit-identical everywhere and the two implicit meshes are
-bit-identical too; only the three meshes that call `np.linalg.norm` or libm's
-`cos` differ, by 1 to 3 ULP (max 6.7e-16), which is far too small to move an
-invariant.
+digests. Against unrelated numpy builds (2.2.6 and 2.5.1 on pip's
+scipy-openblas), connectivity is bit-identical everywhere and five of the six
+numpy meshes are bit-identical outright. Only `torus_knot` still drifts, by
+1 ULP (2.2e-16), far too small to move an invariant.
+
+The cause was isolated rather than guessed, and an earlier version of this
+paragraph got it wrong. It is not `np.linalg.norm` and it is not libm's `cos`:
+stepping through the builders and hashing each intermediate, `np.linalg.norm`
+over an axis, `np.cos`, `np.sin` and `np.einsum` all agree bit for bit on every
+build tested. **Every divergence traces to a BLAS call.** `displaced_sphere`
+and `pinched` drifted solely because `_band_limited_bumps` projected with
+`normals @ directions.T`, a `dgemm`; written out as three multiplies it is
+bit-identical everywhere and identical to what the matmul produced under
+Blender, so no digest moved. What is left in `torus_knot` is `np.dot` on
+3-vectors and `np.linalg.norm` on a single vector -- `ddot` and `dnrm2` -- inside
+the rotation-minimising frame.
 
 `folded_ribbon` deserves its own note, because it is the entry that makes the
 injectivity work testable at all. `docs/ORGANIC.md` section 0.3 established
