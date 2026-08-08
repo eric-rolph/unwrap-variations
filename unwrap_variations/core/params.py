@@ -241,19 +241,32 @@ class ParamSpec:
     applies_to: tuple[str, ...] | None = None
 
     def clamp(self, value: Any) -> Any:
-        """Coerce ``value`` into this spec's legal range or choice set."""
+        """Coerce ``value`` into this spec's legal range or choice set.
+
+        Deliberately total: every input, however malformed, yields a legal
+        value.  Non-finite numbers are saturated towards the matching bound
+        rather than discarded, because ``+inf`` plainly means "as large as
+        allowed".  This matters on the load path -- ``json`` happily writes and
+        reads back ``Infinity``, so a hand-edited or corrupted ``.blend`` can
+        deliver one, and ``int(float("inf"))`` raises ``OverflowError``, which
+        is neither a ``TypeError`` nor a ``ValueError``.
+        """
         try:
             if self.kind == "bool":
                 return bool(value)
             if self.kind == "enum":
                 return value if value in self.choices else self.choices[0]
-            if self.kind == "int":
-                return int(min(max(int(value), self.low), self.high))
+
             number = float(value)
-            if not math.isfinite(number):
-                return float(self.low)
+            if math.isnan(number):
+                number = float(self.low)
+            elif math.isinf(number):
+                number = float(self.high) if number > 0 else float(self.low)
+
+            if self.kind == "int":
+                return int(min(max(int(number), self.low), self.high))
             return float(min(max(number, self.low), self.high))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             if self.kind == "enum":
                 return self.choices[0]
             if self.kind == "bool":
