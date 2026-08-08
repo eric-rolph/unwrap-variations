@@ -49,6 +49,7 @@ SEAM_STRATEGIES = (
     "ANGLE",
     "CURVATURE",
     "DUAL_GRAPH",
+    "CONCAVE",
     "SMART",
 )
 
@@ -86,6 +87,7 @@ class UnwrapParams:
     curvature_threshold: float = 0.35
     minimize_stretch_iters: int = 0
     average_islands_scale: bool = False
+    max_stretch: float = 1.25
     seed: int = 0
     extra: Mapping[str, Any] = field(default_factory=dict)
 
@@ -116,6 +118,13 @@ class UnwrapParams:
             "pack_rotate": bool(self.pack_rotate),
             "pack_shape_method": self.pack_shape_method,
             "average_islands_scale": bool(self.average_islands_scale),
+            # Chart merging runs after every method, projections included, so
+            # this belongs in the identity of every recipe.  Two candidates that
+            # differ only in whether their islands are merged are genuinely
+            # different layouts, and collapsing them here would mean the grid
+            # could never hold both -- which
+            # ``docs/ORGANIC.md`` section 5 requires it to.
+            "max_stretch": round(float(self.max_stretch), 4),
             "extra": dict(self.extra),
         }
         if self.method == "SMART_PROJECT":
@@ -137,7 +146,7 @@ class UnwrapParams:
             elif self.seam_strategy == "CURVATURE":
                 d["seam_angle_deg"] = round(float(self.seam_angle_deg), 2)
                 d["curvature_threshold"] = round(float(self.curvature_threshold), 4)
-            elif self.seam_strategy == "DUAL_GRAPH":
+            elif self.seam_strategy in ("DUAL_GRAPH", "CONCAVE"):
                 d["curvature_threshold"] = round(float(self.curvature_threshold), 4)
                 d["seed"] = int(self.seed)
         return d
@@ -163,6 +172,7 @@ class UnwrapParams:
                 "ANGLE": "ang%.0f" % self.seam_angle_deg,
                 "CURVATURE": "curv%.2f" % self.curvature_threshold,
                 "DUAL_GRAPH": "dual",
+                "CONCAVE": "conc%.2f" % self.curvature_threshold,
                 "SMART": "smart",
             }.get(self.seam_strategy, self.seam_strategy[:6])
             charts = self.chart_clusters()
@@ -342,6 +352,16 @@ PARAM_SPACE: dict[str, ParamSpec] = {
     ),
     "minimize_stretch_iters": ParamSpec("int", 0, 60, weight=0.8),
     "average_islands_scale": ParamSpec("bool", weight=0.5),
+    # Distortion ceiling for chart merging
+    # (:func:`unwrap_variations.core.charts.merge_charts`).  The range starts
+    # *below* 1.0 on purpose: ``stretch_l2 >= 1.0`` is a theorem, so any value
+    # under it makes every merge unsatisfiable and reproduces the unmerged
+    # layout exactly.  ORGANIC.md section 5 requires that layout to stay
+    # reachable from the grid so a benchmark can attribute the gain to merging
+    # rather than to the whole pipeline at once, and a bound that merely
+    # *discourages* merging would not prove anything.  The Halton fill therefore
+    # spends 62% of its samples with merging off and 38% with it on.
+    "max_stretch": ParamSpec("float", 0.0, 1.6, weight=1.5),
 }
 
 
@@ -391,8 +411,23 @@ def chart_recipe(
 #: 4.5.4 it is what wins on all three (icosphere 80.4 against 66.8 for the best
 #: recipe available before, torus 75.3 against 53.8, sphere 81.7 against 72.7).
 ARCHETYPES: tuple[dict[str, Any], ...] = (
-    # Balanced conformal unwrap along sharp edges - the everyday default.
-    {"method": "ANGLE_BASED", "seam_strategy": "SHARP", "island_margin": 0.01},
+    # Balanced conformal unwrap along sharp edges - the everyday default, and
+    # the grid's pinned **unmerged control**.  ``max_stretch`` below 1.0 makes
+    # chart merging unsatisfiable (``stretch_l2 >= 1.0`` is a theorem), so this
+    # slot reproduces the pre-merge pipeline exactly.  ORGANIC.md section 5
+    # requires the unmerged layout to stay reachable so a benchmark can
+    # attribute the gain to merging; it has to be *here*, in the pinned leading
+    # archetypes, because a ten-slot grid is filled entirely from this list and
+    # never reaches the quasi-random fill that samples ``PARAM_SPACE``.
+    # ``1.0`` would *not* do: an exactly isometric merge -- two coplanar islands
+    # on a hard-surface model -- measures exactly 1.0 and is a free win worth
+    # keeping, so only a bound strictly below it means "off".
+    {
+        "method": "ANGLE_BASED",
+        "seam_strategy": "SHARP",
+        "island_margin": 0.01,
+        "max_stretch": 0.0,
+    },
     # Classic Smart UV Project at Blender's own default angle.
     {
         "method": "SMART_PROJECT",
@@ -419,6 +454,18 @@ ARCHETYPES: tuple[dict[str, Any], ...] = (
         "island_margin": 0.005,
     },
     # ---- end of the always-tried core (see _ARCHETYPE_CORE) ----------------
+    # Concavity-weighted minimum cut: the organic-mesh answer, and the first
+    # entry of the shuffled tail.  It is the only strategy here that both
+    # *always* opens a closed surface and places its cuts where an artist
+    # would, so it is the natural counterpart to the chart cuts above -- those
+    # open a closed mesh too, but land their seams on cube-map boundaries in
+    # the middle of a face (BENCHMARKS.md section 4.4).
+    {
+        "method": "ANGLE_BASED",
+        "seam_strategy": "CONCAVE",
+        "curvature_threshold": 0.35,
+        "island_margin": 0.01,
+    },
     # The cube-map charts relaxed for stretch: best texel-density uniformity.
     chart_recipe(6, method="MINIMUM_STRETCH", chart_seed=7, iterations=30),
     # Aggressive Smart Project: many small, low-distortion islands.

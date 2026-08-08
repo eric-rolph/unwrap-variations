@@ -21,6 +21,8 @@ Strategy summary
 ``CURVATURE``    Scale-invariant discrete mean curvature over a threshold.
 ``DUAL_GRAPH``   Maximum spanning forest of the face dual graph, cut on the
                  complement, then pruned.  Few, well-placed cuts.
+``CONCAVE``      Concavity-weighted shortest paths: the topological minimum
+                 cut, routed down the valleys an artist would hide a seam in.
 ``SMART``        Empty -- ``uv.smart_project`` finds its own charts.
 ===============  ============================================================
 
@@ -56,6 +58,7 @@ middle of a quad.
 
 from __future__ import annotations
 
+import heapq
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -71,7 +74,13 @@ __all__ = [
     "EdgeTopology",
     "build_edge_topology",
     "edge_dihedral_deg",
+    "edge_signed_dihedral_deg",
     "edge_curvature",
+    "concavity_weights",
+    "cut_topology",
+    "CutTopology",
+    "ConcaveReport",
+    "concave_seams",
 ]
 
 #: Strategy identifiers, mirrored in :mod:`unwrap_variations.core.params`.
@@ -82,12 +91,41 @@ SEAM_STRATEGIES = (
     "ANGLE",
     "CURVATURE",
     "DUAL_GRAPH",
+    "CONCAVE",
     "SMART",
 )
 
 #: Relative cut-off for calling a triangle normal degenerate.  Relative -- not
 #: absolute -- so that scaling a mesh cannot change which triangles are ignored.
 _NORMAL_REL_EPS = 1e-12
+
+#: How hard ``CONCAVE`` discounts a valley.  An edge at the mesh's own 90th
+#: percentile of concavity costs ``1 - bias`` times its length; a ridge at the
+#: same percentile costs ``1 + bias``.  At 0.8 that is a 9:1 preference, which
+#: is enough to bend a path a long way round a ridge but not so much that a
+#: pathologically long detour through a shallow crease ever wins.
+_CONCAVE_BIAS = 0.8
+
+#: Percentile of ``|signed dihedral|`` used as the per-mesh angular reference.
+#: Relative, not absolute, so a smooth organic model and a faceted one both get
+#: a meaningful spread instead of one of them reading as uniformly flat.
+_CONCAVE_REF_PERCENTILE = 90.0
+
+#: Numerical floor, as a fraction of ``area ** 1.5``, below which a closed
+#: shell's signed volume is treated as meaningless rather than as evidence that
+#: the mesh is inside out.  A sphere measures 0.094 and a cube 0.41; only a
+#: degenerate or doubled shell lands near zero.
+_CLOSED_VOLUME_RATIO = 1e-6
+
+#: Hard ceiling on the extra cuts the distortion escalation may add, so that a
+#: hostile threshold cannot turn a mesh into confetti.
+_CONCAVE_MAX_EXTRA_CUTS = 24
+
+#: Interior Gaussian curvature (radians, absolute, summed over a chart's
+#: interior vertices) above which a chart is escalated even when no single
+#: vertex is a cone.  ``2 pi`` is a full cone's worth of curvature trapped
+#: inside one chart; a flat chart measures 0 and a whole sphere measures 4 pi.
+_CONCAVE_CHART_CURVATURE_BUDGET = 2.0 * math.pi
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +435,152 @@ def edge_dihedral_deg(topo: EdgeTopology) -> np.ndarray:
     return np.degrees(np.arccos(np.clip(topo.cos_dihedral, -1.0, 1.0)))
 
 
+def edge_signed_dihedral_deg(
+    sample: "UVMeshSample",
+    topo: EdgeTopology | None = None,
+    *,
+    orient: bool = True,
+) -> np.ndarray:
+    """Return ``(E,)`` float64 dihedral in degrees, **signed**: ``+`` is convex.
+
+    :func:`edge_dihedral_deg` is ``arccos`` of a dot product and therefore lies
+    in ``[0, 180]`` with **no sign at all** -- measured, a cube's twelve outer
+    edges and the single inner edge of an L-shaped solid both report exactly
+    ``90.000``.  Convex and concave are indistinguishable through it, so
+    anything that wants to tell a ridge from a valley has to compute the sign
+    separately.  That is what this function is for.
+
+    The magnitude is taken from :func:`edge_dihedral_deg` unchanged.  The sign
+    comes from the symmetric test::
+
+        convexity = dot(n_a - n_b, c_a - c_b)
+
+    where ``n`` is a unit face normal and ``c`` the face centroid.  Reading it
+    one half at a time, ``dot(n_a, c_b - c_a)`` asks "does my neighbour sit
+    below my plane?"; below means the surface folds away from the outside,
+    i.e. a ridge.  Adding the mirrored half makes the expression invariant
+    under swapping the two faces, which matters because ``face_a``/``face_b``
+    order is an implementation detail of :func:`build_edge_topology`.  Measured
+    on hand-built solids: an outward-wound cube gives ``+90`` on all twelve
+    edges, the same cube inverted gives ``-90`` on all twelve, and an L-shaped
+    extrusion gives ``+90`` on seventeen folds and ``-90`` on exactly one --
+    the inner corner of the L.
+
+    Args:
+        sample: The mesh.  Triangle vertex indices and positions are read; UVs
+            are not.
+        topo: Optional prebuilt topology, to avoid recomputing it.
+        orient: When ``True`` (the default) a **closed** shell's dihedral signs
+            are flipped if its own signed volume says the winding points
+            *inward*.  "Concave" is meaningless without an inside and an
+            outside, and an inside-out import is common enough --
+            ``tests.conftest.make_cube`` is one, measured signed volume
+            ``-1.0`` -- that taking the winding at face value would silently
+            invert every seam decision on it.  Open shells are left exactly as
+            wound; see :func:`_shell_orientation` for why guessing there does
+            more harm than good.
+
+    Returns:
+        ``(E,)`` float64 in ``[-180, 180]``.  Boundary, loose, non-manifold and
+        degenerate edges report ``0.0``: they carry no usable dihedral.
+    """
+    if topo is None:
+        topo = build_edge_topology(sample)
+    out = np.zeros(topo.n_edges, dtype=np.float64)
+    if topo.n_edges == 0 or topo.n_tris == 0:
+        return out
+
+    verts = _as_rows(sample.verts, 3, np.float64)
+    if verts.shape[0] == 0:
+        return out
+    tv = _clip_indices(_as_rows(sample.tri_verts, 3, np.int64), verts.shape[0])
+    if tv.shape[0] != topo.n_tris:
+        return out
+
+    man = topo.face_count == 2
+    if not man.any():
+        return out
+
+    centroids = verts[tv].mean(axis=1)
+    fa = topo.face_a[man]
+    fb = topo.face_b[man]
+    convexity = np.einsum(
+        "ij,ij->i", topo.normals[fa] - topo.normals[fb], centroids[fa] - centroids[fb]
+    )
+    convexity = np.where(np.isfinite(convexity), convexity, 0.0)
+    magnitude = np.degrees(np.arccos(np.clip(topo.cos_dihedral[man], -1.0, 1.0)))
+    # A tie (exactly coplanar centroids) is called convex, which is the
+    # conservative choice: it declines to hand out a concavity discount.
+    out[man] = np.where(convexity < 0.0, -magnitude, magnitude)
+
+    if orient:
+        out = out * _shell_orientation(verts, tv, topo)
+    return out
+
+
+def _shell_orientation(
+    verts: np.ndarray, tv: np.ndarray, topo: EdgeTopology
+) -> np.ndarray:
+    """Return ``(E,)`` float64 of ``+1``/``-1``: does this edge's shell face out?
+
+    The signed volume of a **closed** shell is positive when its faces are
+    wound counter-clockwise seen from outside and negative when the mesh is
+    inside out.  That is a theorem, and it is the only case this function acts
+    on.
+
+    An open shell is deliberately left alone even though the same sum can be
+    computed for it, because for an open shell the sum is not a volume and does
+    not mean what it looks like it means.  Measured: a strip folded into a
+    shallow V -- a shape with no inside at all -- reports a volume-to-area
+    ratio of 0.050 against a sphere's 0.094, close enough that any threshold
+    which catches inside-out spheres also inverts the sign of every edge on the
+    strip, turning its one genuine crease into a ridge.  "Concave" is undefined
+    without an inside; where there is no inside, the winding's answer stands.
+
+    The sum is taken about each shell's own area-weighted centroid.  For a
+    closed shell that changes nothing (the volume is translation invariant
+    anyway) and it keeps the intermediate magnitudes small for a mesh sitting a
+    long way from the origin.
+    """
+    n_edges = topo.n_edges
+    ones = np.ones(n_edges, dtype=np.float64)
+    if topo.n_tris == 0:
+        return ones
+
+    labels, n_shells = _face_components(topo)
+    p = verts[tv]
+    cross = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
+    areas = 0.5 * np.linalg.norm(cross, axis=1)
+    areas = np.where(np.isfinite(areas), areas, 0.0)
+    tri_centroid = p.mean(axis=1)
+
+    weight = np.bincount(labels, weights=areas, minlength=n_shells)
+    shell_centre = np.stack(
+        [
+            np.bincount(labels, weights=areas * tri_centroid[:, k], minlength=n_shells)
+            / np.where(weight > 0.0, weight, 1.0)
+            for k in range(3)
+        ],
+        axis=1,
+    )
+    rel = p - shell_centre[labels][:, None, :]
+    vol6 = np.einsum("ij,ij->i", rel[:, 0], np.cross(rel[:, 1], rel[:, 2]))
+    vol6 = np.where(np.isfinite(vol6), vol6, 0.0)
+    volume = np.bincount(labels, weights=vol6, minlength=n_shells) / 6.0
+
+    floor = _CLOSED_VOLUME_RATIO * np.power(np.maximum(weight, 0.0), 1.5)
+    is_open = np.zeros(n_shells, dtype=bool)
+    rim = topo.face_count == 1
+    if rim.any():
+        is_open[labels[topo.face_a[rim]]] = True
+    shell_sign = np.where(~is_open & (volume < -floor), -1.0, 1.0)
+
+    has_face = topo.face_count >= 1
+    out = ones.copy()
+    out[has_face] = shell_sign[labels[topo.face_a[has_face]]]
+    return out
+
+
 def edge_curvature(topo: EdgeTopology) -> np.ndarray:
     """Return ``(E,)`` float64 dimensionless discrete mean curvature per edge.
 
@@ -604,6 +788,46 @@ def _roots(parent: list[int]) -> np.ndarray:
     return p
 
 
+def _face_components(
+    topo: EdgeTopology, cut: np.ndarray | None = None
+) -> tuple[np.ndarray, int]:
+    """Return ``(labels, count)``: which chart each triangle belongs to.
+
+    Triangles are joined across every manifold mesh edge that is not in ``cut``
+    and across every n-gon tessellation diagonal, which are uncuttable by
+    definition (see the module docstring).  With ``cut=None`` the result is the
+    mesh's **shells**; with a seam mask it is the **charts** that mask induces.
+
+    Note that this sees only chart *partitioning*.  A slit -- a cut whose two
+    sides stay in the same chart -- does not show up here at all, which is
+    exactly why disk-ness is tested by :func:`cut_topology` on the cut surface
+    and not by counting components.
+
+    Args:
+        topo: Prebuilt edge topology.
+        cut: Optional ``(E,)`` bool seam mask.
+
+    Returns:
+        ``(labels, count)`` with ``labels`` shaped ``(T,)`` and dense in
+        ``[0, count)``.
+    """
+    n_tris = topo.n_tris
+    if n_tris == 0:
+        return np.zeros(0, dtype=np.int64), 0
+    parent = list(range(n_tris))
+    size = [1] * n_tris
+    if topo.diag_a.size:
+        _union_all(parent, size, topo.diag_a.tolist(), topo.diag_b.tolist())
+    join = topo.face_count == 2
+    if cut is not None:
+        join = join & ~np.asarray(cut, dtype=bool)
+    if join.any():
+        _union_all(parent, size, topo.face_a[join].tolist(), topo.face_b[join].tolist())
+    roots = _roots(parent)
+    uniq, labels = np.unique(roots, return_inverse=True)
+    return labels.astype(np.int64).reshape(-1), int(uniq.size)
+
+
 # ---------------------------------------------------------------------------
 # The dual-graph strategy
 # ---------------------------------------------------------------------------
@@ -747,6 +971,1250 @@ def _dual_graph_seams(topo: EdgeTopology, *, curvature_threshold: float, seed: i
 
 
 # ---------------------------------------------------------------------------
+# The cut surface: triangle sides, charts, Euler characteristic
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _TriangleSides:
+    """The 3T directed sides of a triangle soup, grouped into shared edges.
+
+    ``build_edge_topology`` answers "which triangles touch this *mesh* edge".
+    This answers the mirror question -- "which triangle corners are welded to
+    which" -- and it is the structure disk-ness has to be measured on, because
+    a **slit** (a cut whose two sides stay in one chart) is invisible to any
+    count of mesh edges but doubles a side here.
+
+    Corner ``c = 3 * t + j`` carries vertex ``tri_verts[t, j]``; side ``c`` runs
+    from corner ``c`` to corner ``side_next[c]``.  Sides sharing an unordered
+    vertex pair form a *group*: size 1 is a mesh boundary, size 2 an interior
+    edge or an n-gon diagonal, size 3+ non-manifold.
+
+    Attributes:
+        n_tris: Triangle count.
+        side_tri: ``(3T,)`` owning triangle per side.
+        side_next: ``(3T,)`` the other corner of each side.
+        corner_vert: ``(3T,)`` vertex index per corner.
+        corner_angle: ``(3T,)`` interior angle at each corner, radians; ``0``
+            on a degenerate triangle.
+        group: ``(3T,)`` group id per side.
+        n_groups: Number of groups.
+        group_size: ``(G,)`` sides per group.
+        group_first: ``(G,)`` lowest-sorted side of the group.
+        group_second: ``(G,)`` second side, ``-1`` when the group has one.
+        group_edge: ``(G,)`` matching mesh edge index, ``-1`` for an n-gon
+            tessellation diagonal, which has no mesh edge and cannot be cut.
+    """
+
+    n_tris: int
+    side_tri: np.ndarray
+    side_next: np.ndarray
+    corner_vert: np.ndarray
+    corner_angle: np.ndarray
+    group: np.ndarray
+    n_groups: int
+    group_size: np.ndarray
+    group_first: np.ndarray
+    group_second: np.ndarray
+    group_edge: np.ndarray
+
+
+def _empty_sides() -> _TriangleSides:
+    """Return the sides structure of a mesh with no triangles."""
+    z64 = np.zeros(0, dtype=np.int64)
+    return _TriangleSides(
+        n_tris=0,
+        side_tri=z64,
+        side_next=z64,
+        corner_vert=z64,
+        corner_angle=np.zeros(0, dtype=np.float64),
+        group=z64,
+        n_groups=0,
+        group_size=z64,
+        group_first=z64,
+        group_second=z64,
+        group_edge=z64,
+    )
+
+
+def _triangle_sides(sample: "UVMeshSample", topo: EdgeTopology) -> _TriangleSides:
+    """Build the side/corner structure of ``sample``'s triangulation.
+
+    One stable sort over ``3T`` keys, the same trick
+    :func:`build_edge_topology` uses, so this costs about what building the
+    topology did.  Safe on empty and malformed samples.
+    """
+    n_tris = topo.n_tris
+    if n_tris == 0:
+        return _empty_sides()
+
+    verts = _as_rows(sample.verts, 3, np.float64)
+    tv = _as_rows(sample.tri_verts, 3, np.int64)
+    if tv.shape[0] != n_tris:
+        return _empty_sides()
+    limit = verts.shape[0]
+    tv = _clip_indices(tv, limit) if limit else np.zeros_like(tv)
+
+    n_sides = 3 * n_tris
+    corner = np.arange(n_sides, dtype=np.int64)
+    side_tri = corner // 3
+    side_next = 3 * side_tri + (corner + 1) % 3
+    corner_vert = tv.reshape(-1)
+
+    # -- corner angles --------------------------------------------------------
+    corner_angle = np.zeros(n_sides, dtype=np.float64)
+    if limit:
+        p = verts[tv]
+        for j in range(3):
+            a = p[:, (j + 1) % 3] - p[:, j]
+            b = p[:, (j + 2) % 3] - p[:, j]
+            na = np.linalg.norm(a, axis=1)
+            nb = np.linalg.norm(b, axis=1)
+            good = np.isfinite(na) & np.isfinite(nb) & (na > 0.0) & (nb > 0.0)
+            cos = np.einsum("ij,ij->i", a, b) / np.where(good, na * nb, 1.0)
+            corner_angle[j::3] = np.where(
+                good, np.arccos(np.clip(cos, -1.0, 1.0)), 0.0
+            )
+
+    # -- group sides by unordered vertex pair ---------------------------------
+    base = max(topo.n_verts, 1)
+    sv0 = corner_vert
+    sv1 = corner_vert[side_next]
+    keys = np.minimum(sv0, sv1) * np.int64(base) + np.maximum(sv0, sv1)
+
+    order = np.argsort(keys, kind="stable")
+    sorted_keys = keys[order]
+    is_new = np.empty(n_sides, dtype=bool)
+    is_new[0] = True
+    if n_sides > 1:
+        is_new[1:] = sorted_keys[1:] != sorted_keys[:-1]
+    gid_sorted = np.cumsum(is_new) - 1
+    group = np.empty(n_sides, dtype=np.int64)
+    group[order] = gid_sorted
+    n_groups = int(gid_sorted[-1]) + 1
+
+    group_size = np.bincount(gid_sorted, minlength=n_groups).astype(np.int64)
+    starts = np.flatnonzero(is_new)
+    group_first = order[starts]
+    group_second = np.where(
+        group_size >= 2, order[np.minimum(starts + 1, n_sides - 1)], -1
+    ).astype(np.int64)
+
+    # -- group -> mesh edge (unmatched groups are n-gon diagonals) ------------
+    group_edge = np.full(n_groups, -1, dtype=np.int64)
+    if topo.n_edges:
+        edge_keys = np.minimum(topo.edge_v0, topo.edge_v1) * np.int64(base) + np.maximum(
+            topo.edge_v0, topo.edge_v1
+        )
+        eorder = np.argsort(edge_keys, kind="stable")
+        sorted_ekeys = edge_keys[eorder]
+        gk = keys[group_first]
+        pos = np.clip(np.searchsorted(sorted_ekeys, gk), 0, topo.n_edges - 1)
+        matched = sorted_ekeys[pos] == gk
+        group_edge = np.where(matched, eorder[pos], -1).astype(np.int64)
+
+    return _TriangleSides(
+        n_tris=n_tris,
+        side_tri=side_tri,
+        side_next=side_next,
+        corner_vert=corner_vert,
+        corner_angle=corner_angle,
+        group=group,
+        n_groups=n_groups,
+        group_size=group_size,
+        group_first=group_first,
+        group_second=group_second,
+        group_edge=group_edge,
+    )
+
+
+@dataclass(frozen=True)
+class CutTopology:
+    """The topology a seam mask actually produces, measured not assumed.
+
+    Attributes:
+        tri_chart: ``(T,)`` chart id per triangle.
+        n_charts: Number of charts.
+        chart_tris: ``(C,)`` triangle count per chart.
+        chart_chi: ``(C,)`` Euler characteristic ``V - E + F`` per chart,
+            computed over the **cut** triangulated submesh: a slit's two sides
+            count as two edges and its interior vertices as two vertices.  A
+            chart is a disk exactly when this is ``1``.
+        chart_loops: ``(C,)`` number of boundary components per chart.
+        chart_curvature: ``(C,)`` sum of ``|angle defect|`` over the chart's
+            **interior** cut-vertices, radians.  This is the discrete
+            integrated Gaussian curvature the flattener has to absorb; it is
+            ``0`` exactly when the chart is developable.
+        corner_vertex: ``(3T,)`` cut-vertex id per corner (itself a corner
+            index, the union-find representative).
+        corner_loop: ``(3T,)`` boundary-component id per corner, ``-1`` when
+            the corner is interior.
+        side_open: ``(3T,)`` bool, ``True`` where the side is not welded to a
+            neighbour -- a mesh boundary, a non-manifold fan or a cut.  Those
+            sides are free to travel along: they are already open.
+        vertex_defect: ``(3T,)`` angle defect per cut-vertex, written at the
+            representative corner only and ``0`` elsewhere.
+        vertex_interior: ``(3T,)`` bool, ``True`` at representatives of
+            cut-vertices that touch no boundary.
+    """
+
+    tri_chart: np.ndarray
+    n_charts: int
+    chart_tris: np.ndarray
+    chart_chi: np.ndarray
+    chart_loops: np.ndarray
+    chart_curvature: np.ndarray
+    corner_vertex: np.ndarray
+    corner_loop: np.ndarray
+    side_open: np.ndarray
+    vertex_defect: np.ndarray
+    vertex_interior: np.ndarray
+
+    @property
+    def disks(self) -> np.ndarray:
+        """``(C,)`` bool: charts that pass the exact Euler disk test."""
+        return self.chart_chi == 1
+
+
+def _empty_cut_topology() -> CutTopology:
+    """Return the cut topology of a mesh with no triangles."""
+    z64 = np.zeros(0, dtype=np.int64)
+    return CutTopology(
+        tri_chart=z64,
+        n_charts=0,
+        chart_tris=z64,
+        chart_chi=z64,
+        chart_loops=z64,
+        chart_curvature=np.zeros(0, dtype=np.float64),
+        corner_vertex=z64,
+        corner_loop=z64,
+        side_open=np.zeros(0, dtype=bool),
+        vertex_defect=np.zeros(0, dtype=np.float64),
+        vertex_interior=np.zeros(0, dtype=bool),
+    )
+
+
+def cut_topology(
+    sample: "UVMeshSample",
+    seam: np.ndarray,
+    *,
+    topo: EdgeTopology | None = None,
+    sides: _TriangleSides | None = None,
+) -> CutTopology:
+    """Measure the charts a seam mask produces, and whether each is a disk.
+
+    This is the exact Euler test, ``chi = V - E + F``, over the triangulated
+    submesh **after** the cut has been applied.  The distinction matters: an
+    Euler count over the uncut submesh cannot see a slit at all, so it would
+    report a slit sphere -- which is a perfectly good disk -- as ``chi = 2``.
+    Here the slit's two sides are two edges and its interior vertices are two
+    vertices, and the sphere comes out at ``1``.
+
+    Note also that ``sample.n_edges`` is the *quad* mesh's edge count and
+    excludes tessellation diagonals; nothing in this function uses it.
+
+    Args:
+        sample: The mesh.
+        seam: ``(E,)`` bool seam mask over ``sample.edge_verts``.
+        topo: Optional prebuilt edge topology.
+        sides: Optional prebuilt side structure.
+
+    Returns:
+        A :class:`CutTopology`.  Never raises.
+    """
+    if topo is None:
+        topo = build_edge_topology(sample)
+    if sides is None:
+        sides = _triangle_sides(sample, topo)
+    n_tris = sides.n_tris
+    if n_tris == 0:
+        return _empty_cut_topology()
+
+    mask = np.asarray(seam, dtype=bool).reshape(-1)
+    if mask.shape[0] != topo.n_edges:
+        mask = np.zeros(topo.n_edges, dtype=bool)
+
+    n_sides = 3 * n_tris
+    pair = sides.group_size == 2
+    cut_group = np.ones(sides.n_groups, dtype=bool)
+    cut_group[pair] = False
+    real = pair & (sides.group_edge >= 0)
+    if real.any() and topo.n_edges:
+        cut_group[real] = mask[sides.group_edge[real]]
+    glued = pair & ~cut_group
+    glued_ids = np.flatnonzero(glued)
+
+    s1 = sides.group_first[glued_ids]
+    s2 = sides.group_second[glued_ids]
+
+    # -- charts ---------------------------------------------------------------
+    parent = list(range(n_tris))
+    size = [1] * n_tris
+    if glued_ids.size:
+        _union_all(parent, size, sides.side_tri[s1].tolist(), sides.side_tri[s2].tolist())
+    uniq, tri_chart = np.unique(_roots(parent), return_inverse=True)
+    tri_chart = tri_chart.astype(np.int64).reshape(-1)
+    n_charts = int(uniq.size)
+
+    # -- cut-vertices ---------------------------------------------------------
+    cparent = list(range(n_sides))
+    csize = [1] * n_sides
+    if glued_ids.size:
+        c1a, c1b = s1, sides.side_next[s1]
+        c2a, c2b = s2, sides.side_next[s2]
+        same = sides.corner_vert[c1a] == sides.corner_vert[c2a]
+        left = np.concatenate([c1a, c1b])
+        right = np.concatenate([np.where(same, c2a, c2b), np.where(same, c2b, c2a)])
+        _union_all(cparent, csize, left.tolist(), right.tolist())
+    croot = _roots(cparent)
+
+    # -- boundary sides, loops and interior flags -----------------------------
+    side_glued = glued[sides.group]
+    open_sides = np.flatnonzero(~side_glued)
+    on_boundary = np.zeros(n_sides, dtype=bool)
+    corner_loop = np.full(n_sides, -1, dtype=np.int64)
+    chart_loops = np.zeros(n_charts, dtype=np.int64)
+    if open_sides.size:
+        r0 = croot[open_sides]
+        r1 = croot[sides.side_next[open_sides]]
+        on_boundary[r0] = True
+        on_boundary[r1] = True
+        bparent = list(range(n_sides))
+        bsize = [1] * n_sides
+        _union_all(bparent, bsize, r0.tolist(), r1.tolist())
+        broot = _roots(bparent)
+        touched = np.unique(np.concatenate([r0, r1]))
+        labels = np.unique(broot[touched])
+        remap = np.full(n_sides, -1, dtype=np.int64)
+        remap[labels] = np.arange(labels.size, dtype=np.int64)
+        loop_of_vertex = np.full(n_sides, -1, dtype=np.int64)
+        loop_of_vertex[touched] = remap[broot[touched]]
+        corner_loop = loop_of_vertex[croot]
+        chart_loops = np.bincount(
+            tri_chart[touched // 3][loop_of_vertex[touched] >= 0][
+                np.unique(loop_of_vertex[touched], return_index=True)[1]
+            ],
+            minlength=n_charts,
+        ).astype(np.int64)
+
+    # -- Euler characteristic per chart --------------------------------------
+    reps = np.flatnonzero(croot == np.arange(n_sides, dtype=np.int64))
+    v_count = np.bincount(tri_chart[reps // 3], minlength=n_charts).astype(np.int64)
+    e_open = np.bincount(
+        tri_chart[sides.side_tri[open_sides]], minlength=n_charts
+    ).astype(np.int64)
+    e_glued = np.bincount(
+        tri_chart[sides.side_tri[s1]], minlength=n_charts
+    ).astype(np.int64)
+    f_count = np.bincount(tri_chart, minlength=n_charts).astype(np.int64)
+    chart_chi = v_count - (e_open + e_glued) + f_count
+
+    # -- angle defect per cut-vertex -----------------------------------------
+    angle_sum = np.bincount(croot, weights=sides.corner_angle, minlength=n_sides)
+    vertex_defect = np.zeros(n_sides, dtype=np.float64)
+    interior = np.zeros(n_sides, dtype=bool)
+    interior[reps] = ~on_boundary[reps]
+    vertex_defect[reps] = np.where(
+        interior[reps], 2.0 * math.pi - angle_sum[reps], math.pi - angle_sum[reps]
+    )
+    vertex_defect = np.where(np.isfinite(vertex_defect), vertex_defect, 0.0)
+    chart_curvature = np.bincount(
+        tri_chart[reps // 3],
+        weights=np.abs(vertex_defect[reps]) * interior[reps],
+        minlength=n_charts,
+    )
+
+    return CutTopology(
+        tri_chart=tri_chart,
+        n_charts=n_charts,
+        chart_tris=f_count,
+        chart_chi=chart_chi,
+        chart_loops=chart_loops,
+        chart_curvature=chart_curvature,
+        corner_vertex=croot,
+        corner_loop=corner_loop,
+        side_open=~side_glued,
+        vertex_defect=vertex_defect,
+        vertex_interior=interior,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Concavity weighting and shortest paths
+# ---------------------------------------------------------------------------
+
+
+def concavity_weights(
+    sample: "UVMeshSample",
+    topo: EdgeTopology | None = None,
+    *,
+    bias: float = _CONCAVE_BIAS,
+    signed: np.ndarray | None = None,
+) -> np.ndarray:
+    """Return ``(E,)`` float64 path cost per edge, cheap in a valley.
+
+    The cost is the edge's own 3D length scaled by ``1 + bias * t``, where
+    ``t`` is the signed dihedral divided by the mesh's own 90th percentile of
+    ``|signed dihedral|`` and clipped to ``[-1, 1]``.  A deep valley therefore
+    costs ``1 - bias`` times its length and a sharp ridge ``1 + bias``.
+
+    Two properties this shape was chosen for:
+
+    * **Scale invariance.**  The angle is dimensionless and the reference is a
+      percentile of angles, so scaling the mesh scales every weight by exactly
+      the same factor and cannot reorder a single shortest path.
+    * **Adaptivity.**  The reference is per mesh.  A hard-surface model with
+      90-degree creases and a smooth organic blob whose sharpest fold is two
+      degrees both get the full ``[1 - bias, 1 + bias]`` spread, so the
+      strategy has an opinion on a smooth mesh -- which is precisely where
+      ``SHARP`` has none (measured: zero edges at 30 degrees on a sphere, a
+      torus and an icosphere).
+
+    Boundary edges cost ``0``: they are already open, so travelling along one
+    adds no seam.  Loose edges are unusable and are excluded by the caller.
+
+    Args:
+        sample: The mesh.
+        topo: Optional prebuilt topology.
+        bias: Strength of the concavity preference, clamped to ``[0, 0.95]``.
+        signed: Optional precomputed :func:`edge_signed_dihedral_deg`.
+
+    Returns:
+        ``(E,)`` float64, finite and non-negative.
+    """
+    if topo is None:
+        topo = build_edge_topology(sample)
+    if topo.n_edges == 0:
+        return np.zeros(0, dtype=np.float64)
+    if signed is None:
+        signed = edge_signed_dihedral_deg(sample, topo)
+
+    strength = min(max(_finite(bias, _CONCAVE_BIAS), 0.0), 0.95)
+    man = topo.face_count == 2
+    ref = 0.0
+    if man.any():
+        ref = float(np.percentile(np.abs(signed[man]), _CONCAVE_REF_PERCENTILE))
+    if not math.isfinite(ref) or ref <= 0.0:
+        ref = 1.0
+
+    t = np.clip(np.asarray(signed, dtype=np.float64) / ref, -1.0, 1.0)
+    length = np.where(np.isfinite(topo.edge_len), topo.edge_len, 0.0)
+    weight = length * (1.0 + strength * t)
+    weight = np.where(topo.face_count == 1, 0.0, weight)
+    weight = np.where(np.isfinite(weight), weight, 0.0)
+    return np.maximum(weight, 0.0)
+
+
+def _build_csr(
+    n_verts: int,
+    v0: np.ndarray,
+    v1: np.ndarray,
+    weight: np.ndarray,
+    usable: np.ndarray,
+) -> tuple[list[int], list[int], list[int], list[float]]:
+    """Return a CSR adjacency as plain lists, which iterate far faster than arrays.
+
+    Args:
+        n_verts: Vertex slot count.
+        v0: ``(E,)`` first endpoint per edge.
+        v1: ``(E,)`` second endpoint per edge.
+        weight: ``(E,)`` non-negative cost per edge.
+        usable: ``(E,)`` bool, which edges are in the graph.
+
+    Returns:
+        ``(indptr, indices, edge_ids, weights)``.
+    """
+    idx = np.flatnonzero(usable)
+    src = np.concatenate([v0[idx], v1[idx]])
+    dst = np.concatenate([v1[idx], v0[idx]])
+    eid = np.concatenate([idx, idx])
+    wgt = np.concatenate([weight[idx], weight[idx]])
+    order = np.argsort(src, kind="stable")
+    counts = np.bincount(src, minlength=n_verts)
+    indptr = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(counts)])
+    return (
+        indptr.tolist(),
+        dst[order].tolist(),
+        eid[order].tolist(),
+        wgt[order].tolist(),
+    )
+
+
+def _dijkstra(
+    graph: tuple[list[int], list[int], list[int], list[float]],
+    n_verts: int,
+    sources: list[int],
+    *,
+    stop: list[bool] | None = None,
+) -> tuple[list[float], list[int], list[int], int]:
+    """Multi-source Dijkstra over a CSR graph, written against ``heapq``.
+
+    There is no scipy in Blender (ORGANIC.md section 0.5), so this is ours.
+    ``heapq`` is a C-implemented binary heap over a plain list and beats a
+    hand-rolled numpy heap comfortably, because the inner loop is scalar and
+    numpy scalar arithmetic is slow.
+
+    Determinism: the heap holds ``(distance, vertex)`` tuples, so equal
+    distances always settle in ascending vertex order.
+
+    Args:
+        graph: The tuple returned by :func:`_build_csr`.
+        n_verts: Vertex slot count.
+        sources: Zero-distance start vertices.
+        stop: Optional ``(V,)`` truthy sequence; the search returns as soon as
+            one of those vertices settles.  Sources must not be flagged, or the
+            search stops before taking a single edge.
+
+    Returns:
+        ``(dist, prev_vertex, prev_edge, hit)``.  ``hit`` is the vertex that
+        triggered ``stop``, or ``-1``.
+    """
+    indptr, indices, edge_ids, weights = graph
+    inf = float("inf")
+    dist = [inf] * n_verts
+    prev_v = [-1] * n_verts
+    prev_e = [-1] * n_verts
+    done = bytearray(n_verts)
+    heap: list[tuple[float, int]] = []
+    for s in sources:
+        if 0 <= s < n_verts and dist[s] != 0.0:
+            dist[s] = 0.0
+            heapq.heappush(heap, (0.0, s))
+    hit = -1
+    while heap:
+        d, v = heapq.heappop(heap)
+        if done[v]:
+            continue
+        done[v] = 1
+        if stop is not None and stop[v]:
+            hit = v
+            break
+        for k in range(indptr[v], indptr[v + 1]):
+            u = indices[k]
+            if done[u]:
+                continue
+            nd = d + weights[k]
+            if nd < dist[u]:
+                dist[u] = nd
+                prev_v[u] = v
+                prev_e[u] = edge_ids[k]
+                heapq.heappush(heap, (nd, u))
+    return dist, prev_v, prev_e, hit
+
+
+def _trace_edges(prev_v: list[int], prev_e: list[int], target: int) -> list[int]:
+    """Return the edge ids from ``target`` back to its Dijkstra source."""
+    out: list[int] = []
+    v = target
+    guard = 0
+    limit = len(prev_v) + 1
+    while 0 <= v < len(prev_v) and prev_e[v] >= 0 and guard < limit:
+        out.append(prev_e[v])
+        v = prev_v[v]
+        guard += 1
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The concave strategy
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ConcaveReport:
+    """What :func:`concave_seams` did, in numbers rather than adjectives.
+
+    Attributes:
+        shells: Face-connected components of the input mesh.
+        charts: Charts the returned cut produces.
+        disks: Charts passing the exact Euler test ``chi == 1``.
+        non_disks: Charts that do not.  Anything but ``0`` is a bug.
+        cut_edges: Mesh edges marked.
+        cut_length: Their total 3D length.
+        concave_edges: Marked manifold edges with a negative signed dihedral.
+        concave_length: Their total 3D length.
+        concave_fraction: ``concave_length`` over the marked manifold length.
+        baseline_fraction: The same fraction over the whole mesh's cuttable
+            length.  Without it ``concave_fraction`` means nothing: on a mesh
+            that is half concave, hitting 50% is hitting nothing.
+        joins: Shortest paths added to connect two boundary loops.
+        handle_loops: Non-separating loops cut to remove a handle.
+        arcs: Paths cut between two curvature extremes of a closed shell.
+        extra_cuts: Cuts added by the distortion escalation.
+        splits: How many of those were boundary-to-boundary splits rather than
+            slits, i.e. driven by a chart's total curvature rather than by one
+            cone singularity.
+        fallbacks: Charts opened by the spanning-tree fallback because the
+            measured loop could not make them disks.  Should be ``0``.
+        rounds: Topology rounds run.
+    """
+
+    shells: int = 0
+    charts: int = 0
+    disks: int = 0
+    non_disks: int = 0
+    cut_edges: int = 0
+    cut_length: float = 0.0
+    concave_edges: int = 0
+    concave_length: float = 0.0
+    concave_fraction: float = 0.0
+    baseline_fraction: float = 0.0
+    joins: int = 0
+    handle_loops: int = 0
+    arcs: int = 0
+    extra_cuts: int = 0
+    splits: int = 0
+    fallbacks: int = 0
+    rounds: int = 0
+
+
+@dataclass(frozen=True)
+class _CutGraph:
+    """The 1-skeleton of the cut surface, as a graph a path can be routed on.
+
+    Routing over the mesh's *original* vertices is the obvious thing to do and
+    it is wrong, in a way that only shows up once a cut already exists.  Cut a
+    torus along a meridian and it becomes a cylinder with two boundary loops --
+    but both loops occupy the **same original vertices**, so a shortest path
+    between them measures zero, marks nothing, and the algorithm stalls
+    (measured: exactly this, before this structure existed).  On the cut
+    surface the two sides of a slit are two distinct nodes and the path between
+    them is the lengthwise cut the cylinder actually needs.
+
+    Nodes are cut-vertices, densely numbered.  Arcs are triangle *sides*, which
+    is what lets an already-open side cost nothing: travelling along an
+    existing boundary or an existing cut adds no new seam.
+
+    Attributes:
+        n_nodes: Node count.
+        node_of_corner: ``(3T,)`` node id per corner.
+        side_node0: ``(3T,)`` node at the start of each side.
+        side_node1: ``(3T,)`` node at the end of each side.
+        side_cost: ``(3T,)`` cost of cutting each side.
+        side_edge: ``(3T,)`` mesh edge behind each side, ``-1`` for an n-gon
+            diagonal, which cannot be cut.
+        side_ok: ``(3T,)`` bool, sides usable as graph arcs.
+        side_open: ``(3T,)`` bool, sides that are already open and free.
+        node_chart: ``(n_nodes,)`` chart per node.
+        node_loop: ``(n_nodes,)`` boundary component per node, ``-1`` inside.
+        node_defect: ``(n_nodes,)`` angle defect per node.
+        node_interior: ``(n_nodes,)`` bool, node touches no boundary.
+    """
+
+    n_nodes: int
+    node_of_corner: np.ndarray
+    side_node0: np.ndarray
+    side_node1: np.ndarray
+    side_cost: np.ndarray
+    side_edge: np.ndarray
+    side_ok: np.ndarray
+    side_open: np.ndarray
+    node_chart: np.ndarray
+    node_loop: np.ndarray
+    node_defect: np.ndarray
+    node_interior: np.ndarray
+
+
+class _ConcaveCutter:
+    """Working state for one :func:`concave_seams` call.
+
+    A class rather than a dozen free functions with eleven arguments each: the
+    mesh, its topology, the side structure, the weights and the growing seam
+    mask are threaded through every step and are genuinely one object.
+    """
+
+    __slots__ = (
+        "sample",
+        "topo",
+        "sides",
+        "signed",
+        "weight",
+        "seam",
+        "cuttable",
+        "joins",
+        "handle_loops",
+        "arcs",
+        "extra_cuts",
+        "splits",
+        "fallbacks",
+    )
+
+    def __init__(
+        self,
+        sample: "UVMeshSample",
+        topo: EdgeTopology,
+        sides: _TriangleSides,
+        *,
+        bias: float,
+    ) -> None:
+        self.sample = sample
+        self.topo = topo
+        self.sides = sides
+        self.signed = edge_signed_dihedral_deg(sample, topo)
+        self.weight = concavity_weights(sample, topo, bias=bias, signed=self.signed)
+        self.seam = topo.nonmanifold_mask.copy()
+        self.cuttable = topo.face_count >= 2
+        self.joins = 0
+        self.handle_loops = 0
+        self.arcs = 0
+        self.extra_cuts = 0
+        self.splits = 0
+        self.fallbacks = 0
+
+    # -- measuring and graph building ----------------------------------------
+
+    def measure(self) -> CutTopology:
+        """Re-measure the charts the current seam mask produces."""
+        return cut_topology(self.sample, self.seam, topo=self.topo, sides=self.sides)
+
+    def graph(self, ct: CutTopology) -> _CutGraph:
+        """Build the cut surface's routing graph for the current cut."""
+        sides = self.sides
+        n_sides = 3 * sides.n_tris
+        reps = np.flatnonzero(ct.corner_vertex == np.arange(n_sides, dtype=np.int64))
+        node_of = np.full(n_sides, -1, dtype=np.int64)
+        node_of[reps] = np.arange(reps.size, dtype=np.int64)
+        node_of_corner = node_of[ct.corner_vertex]
+
+        side_edge = sides.group_edge[sides.group]
+        safe_edge = np.maximum(side_edge, 0)
+        # An already-open side (mesh boundary, non-manifold fan, existing cut)
+        # is free: it is a boundary, so running along it adds nothing.  A glued
+        # side costs its mesh edge's concavity weight -- unless it has no mesh
+        # edge at all, which makes it an n-gon diagonal and uncuttable.
+        cost = np.where(ct.side_open, 0.0, self.weight[safe_edge])
+        side_ok = ct.side_open | (side_edge >= 0)
+
+        return _CutGraph(
+            n_nodes=int(reps.size),
+            node_of_corner=node_of_corner,
+            side_node0=node_of_corner,
+            side_node1=node_of_corner[sides.side_next],
+            side_cost=cost,
+            side_edge=side_edge,
+            side_ok=side_ok,
+            side_open=ct.side_open,
+            node_chart=ct.tri_chart[reps // 3],
+            node_loop=ct.corner_loop[reps],
+            node_defect=ct.vertex_defect[reps],
+            node_interior=ct.vertex_interior[reps],
+        )
+
+    def _csr(self, g: _CutGraph, usable: np.ndarray):
+        """CSR adjacency over ``usable`` sides; arc ids are side indices."""
+        return _build_csr(g.n_nodes, g.side_node0, g.side_node1, g.side_cost, usable)
+
+    def _chart_sides(self, g: _CutGraph, chart: int) -> np.ndarray:
+        """``(3T,)`` bool: usable sides belonging to ``chart``."""
+        return g.side_ok & (g.node_chart[g.side_node0] == chart)
+
+    def _mark_sides(self, g: _CutGraph, side_ids) -> int:
+        """Cut the mesh edges behind ``side_ids``; return how many were new."""
+        ids = np.asarray(list(side_ids), dtype=np.int64)
+        if ids.size == 0:
+            return 0
+        edges = g.side_edge[ids]
+        edges = edges[edges >= 0]
+        if edges.size == 0:
+            return 0
+        edges = edges[self.cuttable[edges]]
+        if edges.size == 0:
+            return 0
+        added = int((~self.seam[edges]).sum())
+        self.seam[edges] = True
+        # A side that has just been cut is open, and running along an open side
+        # costs nothing, so the next path in this same round can reuse it for
+        # free.  Without this the second and third cuts of a round pay again
+        # for ground the first one already opened.
+        if added:
+            g.side_cost[np.isin(g.side_edge, edges)] = 0.0
+        return added
+
+    # -- the three topological cuts ------------------------------------------
+
+    def join_loops(self, ct: CutTopology, g: _CutGraph, chart: int) -> int:
+        """Connect every boundary loop of ``chart`` with shortest weighted paths.
+
+        Prim over the loops: grow the connected set to the nearest node of a
+        loop it does not yet contain.  On Suzanne's head -- genus 0, two
+        boundary loops, measured ``chi = 0`` -- there is exactly one such path
+        and it is the entire cut the head topologically needs (ORGANIC.md
+        section 0.1).  Nothing about that is hard-coded; it falls out of the
+        measurement.
+        """
+        usable = self._chart_sides(g, chart)
+        nodes = np.flatnonzero(g.node_chart == chart)
+        loops = g.node_loop[nodes]
+        labels = np.unique(loops[loops >= 0])
+        if labels.size < 2:
+            return 0
+        added = 0
+        joined = set(nodes[loops == labels[0]].tolist())
+        pending = [set(nodes[loops == label].tolist()) for label in labels[1:]]
+        while pending:
+            stop = [False] * g.n_nodes
+            waiting = False
+            for group in pending:
+                for v in group:
+                    if v not in joined:
+                        stop[v] = True
+                        waiting = True
+            if not waiting:
+                break
+            graph = self._csr(g, usable)
+            _, prev_v, prev_e, hit = _dijkstra(graph, g.n_nodes, sorted(joined), stop=stop)
+            if hit < 0:
+                break
+            path = _trace_edges(prev_v, prev_e, hit)
+            if self._mark_sides(g, path) == 0 and path:
+                # The whole path already lay on open sides; nothing to cut, so
+                # the loops are joined for free.  Still count it as progress.
+                pass
+            added += 1
+            self.joins += 1
+            for side in path:
+                joined.add(int(g.side_node0[side]))
+                joined.add(int(g.side_node1[side]))
+            reached = next((grp for grp in pending if hit in grp), None)
+            if reached is None:
+                break
+            pending.remove(reached)
+            joined |= reached
+        return added
+
+    def cut_arc(self, g: _CutGraph, chart: int, seed: int) -> int:
+        """Cut a path between two curvature extremes of a closed chart.
+
+        The source is a maximum of ``|angle defect|`` -- the sharpest cone the
+        chart owns -- and the target is the node farthest from it under the
+        concavity-weighted metric, which on a smooth closed shell is the
+        antipode and on a faceted one the opposite corner.  ``seed`` rotates
+        the source among the sharpest few, so different candidates in a grid
+        get genuinely different but equally valid cuts, exactly the way
+        ``DUAL_GRAPH`` uses its seed on a cube.
+        """
+        usable = self._chart_sides(g, chart)
+        nodes = np.flatnonzero(g.node_chart == chart)
+        if nodes.size < 2 or not usable.any():
+            return 0
+        interior = nodes[g.node_interior[nodes]]
+        ranked = interior if interior.size else nodes
+        order = np.lexsort((ranked, -np.abs(g.node_defect[ranked])))
+        top = ranked[order][: max(1, min(8, ranked.size))]
+        source = int(top[seed % top.size])
+
+        dist, prev_v, prev_e, _ = _dijkstra(self._csr(g, usable), g.n_nodes, [source])
+        best, best_d = -1, -1.0
+        for v in nodes.tolist():
+            d = dist[v]
+            if math.isfinite(d) and d > best_d:
+                best_d, best = d, int(v)
+        if best < 0 or best == source:
+            return 0
+        added = self._mark_sides(g, _trace_edges(prev_v, prev_e, best))
+        if added:
+            self.arcs += 1
+        return added
+
+    def cut_handle_loop(self, g: _CutGraph, chart: int) -> int:
+        """Cut the cheapest non-contractible loop of a chart that has a handle.
+
+        Tree-cotree (Eppstein; Erickson and Whittlesey): take a shortest-path
+        tree ``T`` over the chart's cut-vertices, then a spanning tree of its
+        dual built only from edges outside ``T``.  Every edge in neither tree
+        closes a non-contractible loop with ``T``, and the dual tree is grown
+        from the *expensive* end so the loops left over are the cheap ones.
+        The single cheapest is cut and the caller re-measures ``chi``.
+
+        A torus goes ``chi = 0, b = 0`` -> loop cut -> ``chi = 0, b = 2``, and
+        :meth:`join_loops` then takes it to ``chi = 1``: a disk, measured
+        rather than assumed.
+        """
+        usable = self._chart_sides(g, chart)
+        nodes = np.flatnonzero(g.node_chart == chart)
+        if nodes.size == 0 or not usable.any():
+            return 0
+        root = int(nodes[0])
+        dist, prev_v, prev_e = _dijkstra(self._csr(g, usable), g.n_nodes, [root])[:3]
+
+        # Tree membership is tracked per *mesh edge*, not per side: an interior
+        # mesh edge owns two sides, and treating the twin of a tree side as a
+        # free candidate would offer a loop that is really no loop at all.
+        tree_edge = np.zeros(self.topo.n_edges, dtype=bool)
+        used = [int(g.side_edge[s]) for s in prev_e if s >= 0]
+        used = [e for e in used if e >= 0]
+        if used:
+            tree_edge[np.asarray(used, dtype=np.int64)] = True
+
+        one_per_edge = np.zeros(g.side_ok.shape[0], dtype=bool)
+        one_per_edge[self.sides.group_first] = True
+        candidate = usable & one_per_edge & ~g.side_open & (g.side_edge >= 0)
+        candidate &= ~tree_edge[np.maximum(g.side_edge, 0)]
+        ids = np.flatnonzero(candidate)
+        if ids.size == 0:
+            return 0
+
+        du = np.asarray([dist[v] for v in g.side_node0[ids].tolist()])
+        dv = np.asarray([dist[v] for v in g.side_node1[ids].tolist()])
+        cost = g.side_cost[ids] + du + dv
+        keep = np.isfinite(cost)
+        ids, cost = ids[keep], cost[keep]
+        if ids.size == 0:
+            return 0
+
+        # Grow the dual tree from the expensive end so the cheap loops survive
+        # as leftovers.  n-gon diagonals are contracted first: Blender cannot
+        # cut a quad down its diagonal, so those triangles are one dual node.
+        parent = list(range(self.topo.n_tris))
+        size = [1] * self.topo.n_tris
+        if self.topo.diag_a.size:
+            _union_all(parent, size, self.topo.diag_a.tolist(), self.topo.diag_b.tolist())
+        order = np.lexsort((ids, -cost))
+        edges = g.side_edge[ids[order]]
+        rejected = _kruskal_reject(
+            parent,
+            size,
+            self.topo.face_a[edges].tolist(),
+            self.topo.face_b[edges].tolist(),
+        )
+        leftover = ids[order][rejected]
+        if leftover.size == 0:
+            return 0
+        left_cost = cost[order][rejected]
+        pick = int(leftover[int(np.lexsort((leftover, left_cost))[0])])
+
+        # The loop is the side plus the tree path between its endpoints, which
+        # is the symmetric difference of the two root paths: the shared suffix
+        # appears in both and cancels.
+        a = set(_trace_edges(prev_v, prev_e, int(g.side_node0[pick])))
+        b = set(_trace_edges(prev_v, prev_e, int(g.side_node1[pick])))
+        added = self._mark_sides(g, (a ^ b) | {pick})
+        if added:
+            self.handle_loops += 1
+        return added
+
+    def open_by_spanning_tree(self, ct: CutTopology, chart: int) -> int:
+        """Last-resort fallback: cut everything but a spanning tree of the dual.
+
+        A tree of triangles glued edge to edge is always a disk, so this cannot
+        fail to open a chart.  It is long and ugly, which is why it is a
+        fallback and why :class:`ConcaveReport` counts it: a non-zero
+        ``fallbacks`` means the measured loop above gave up on something.
+        """
+        inside = ct.tri_chart == chart
+        allowed = np.zeros(self.topo.n_edges, dtype=bool)
+        man = self.topo.face_count == 2
+        if man.any():
+            allowed[man] = inside[self.topo.face_a[man]] & inside[self.topo.face_b[man]]
+        ids = np.flatnonzero(allowed)
+        if ids.size == 0:
+            return 0
+        parent = list(range(self.topo.n_tris))
+        size = [1] * self.topo.n_tris
+        if self.topo.diag_a.size:
+            _union_all(parent, size, self.topo.diag_a.tolist(), self.topo.diag_b.tolist())
+        order = np.lexsort((ids, -self.weight[ids]))
+        rejected = _kruskal_reject(
+            parent,
+            size,
+            self.topo.face_a[ids[order]].tolist(),
+            self.topo.face_b[ids[order]].tolist(),
+        )
+        cut = ids[order][rejected]
+        cut = cut[self.cuttable[cut]]
+        added = int((~self.seam[cut]).sum())
+        self.seam[cut] = True
+        if added:
+            self.fallbacks += 1
+        return added
+
+    # -- the distortion escalation -------------------------------------------
+
+    def _slit_to(self, g: _CutGraph, chart: int, target: int) -> list[int]:
+        """Shortest path from ``chart``'s boundary to ``target``; sides, or []."""
+        usable = self._chart_sides(g, chart)
+        nodes = np.flatnonzero(g.node_chart == chart)
+        rim = nodes[g.node_loop[nodes] >= 0].tolist()
+        if not rim or target in rim:
+            return []
+        stop = [False] * g.n_nodes
+        stop[target] = True
+        _, prev_v, prev_e, hit = _dijkstra(self._csr(g, usable), g.n_nodes, rim, stop=stop)
+        if hit < 0:
+            return []
+        return _trace_edges(prev_v, prev_e, hit)
+
+    def _split_chart(self, g: _CutGraph, chart: int) -> list[int]:
+        """A boundary-to-boundary arc bisecting ``chart``, as a list of sides.
+
+        A slit relieves the curvature it passes through but leaves the chart
+        one chart; only an arc running boundary to boundary divides the chart's
+        remaining curvature in two.
+
+        The arc is aimed at the interior node **farthest from the chart's own
+        boundary** under the concavity-weighted metric -- the pole of
+        inaccessibility, near enough -- and not at the node of highest
+        curvature.  Aiming at curvature is the obvious choice and it is wrong:
+        the sharpest interior vertex is usually the one just inside the
+        boundary, so the arc carves off a sliver and the chart stays over
+        budget.  Measured before this change, a UV sphere shed 24 slivers, hit
+        the escalation cap and still had one oversized chart.
+
+        The second leg is routed with the first leg's interior nodes removed,
+        so the two legs cannot overlap and the result really does separate.
+        """
+        usable = self._chart_sides(g, chart)
+        nodes = np.flatnonzero(g.node_chart == chart)
+        rim = nodes[g.node_loop[nodes] >= 0].tolist()
+        if not rim:
+            return []
+        dist, prev_v, prev_e, _ = _dijkstra(self._csr(g, usable), g.n_nodes, rim)
+        target, best = -1, -1.0
+        for v in nodes[g.node_interior[nodes]].tolist():
+            d = dist[v]
+            if math.isfinite(d) and d > best:
+                best, target = d, int(v)
+        if target < 0:
+            return []
+        first = _trace_edges(prev_v, prev_e, target)
+        if not first:
+            return []
+        blocked = set()
+        for side in first:
+            blocked.add(int(g.side_node0[side]))
+            blocked.add(int(g.side_node1[side]))
+        blocked.discard(target)
+        if blocked:
+            bad = np.zeros(g.n_nodes, dtype=bool)
+            bad[np.asarray(sorted(blocked), dtype=np.int64)] = True
+            usable = usable & ~bad[g.side_node0] & ~bad[g.side_node1]
+        stop = [False] * g.n_nodes
+        for v in rim:
+            if v not in blocked and v != target:
+                stop[v] = True
+        if not any(stop):
+            return first
+        _, prev_v, prev_e, hit = _dijkstra(
+            self._csr(g, usable), g.n_nodes, [target], stop=stop
+        )
+        if hit < 0:
+            return first
+        return first + _trace_edges(prev_v, prev_e, hit)
+
+    def escalate(self, *, cone: float, chart_budget: float, budget: int) -> int:
+        """Add cuts only where a curvature measurement asks for one.
+
+        The measurement is exact discrete Gaussian curvature -- the angle
+        defect of each interior cut-vertex -- not a proxy.  Two things it can
+        say, and each has its own answer:
+
+        * **Too much curvature in one chart**: more than ``chart_budget``
+          radians summed over the interior.  No amount of slitting fixes that
+          -- a slit relieves only the vertices it passes -- so the answer is a
+          boundary-to-boundary *split*, which halves the chart's curvature.
+          Without this a sphere would stay one 4-pi chart and the escalation
+          would crawl to its cap achieving nothing (measured: exactly that).
+        * **A cone singularity**: one interior vertex over ``cone`` radians of
+          defect.  No flattening absorbs that without stretching, and the fix
+          is a *slit* from the boundary to the vertex, which moves the cone
+          onto the boundary where the angle is free.  This is Sheffer and
+          Hart's Seamster criterion, and it is what turns a cube's topological
+          arc into something close to its cross net.
+
+        **Splits go first, and the order is not cosmetic.**  Measured on
+        Suzanne with the slits taking priority: the cone rule fired on every
+        one of the 24 permitted cuts, no split ever ran, and the result was 3
+        charts with ``stretch_l2`` 1.394 and an overlap of 3.9e-2, scoring
+        16.6.  With splits first the same mesh comes out at 8 charts,
+        ``stretch_l2`` 1.045 and overlap exactly 0.  A chart carrying more
+        curvature than one disk can hold has to be divided before it is worth
+        refining, and slitting to individual cones inside it is refinement.
+
+        Progress is guaranteed: a split strictly divides a chart and a slit
+        puts its target on the boundary, so the same vertex is never chosen
+        twice.  The loop therefore stops on its own well before ``budget``.
+        """
+        added = 0
+        for _ in range(max(0, budget)):
+            ct = self.measure()
+            g = self.graph(ct)
+            interior = np.flatnonzero(g.node_interior)
+            if interior.size == 0:
+                break
+            defect = np.abs(g.node_defect[interior])
+
+            heavy = np.flatnonzero(ct.chart_curvature > chart_budget)
+            if heavy.size:
+                worst_chart = int(heavy[int(np.argmax(ct.chart_curvature[heavy]))])
+                path = self._split_chart(g, worst_chart)
+                kind = "split"
+            else:
+                over = defect > cone
+                cones = interior[over]
+                if cones.size == 0:
+                    break
+                pick = int(cones[int(np.lexsort((cones, -defect[over]))[0])])
+                path = self._slit_to(g, int(g.node_chart[pick]), pick)
+                kind = "slit"
+
+            grew = self._mark_sides(g, path)
+            if grew == 0:
+                break
+            added += grew
+            self.extra_cuts += 1
+            if kind == "split":
+                self.splits += 1
+        return added
+
+    # -- driver ---------------------------------------------------------------
+
+    def run(self, *, curvature_threshold: float, seed: int, max_extra_cuts: int) -> int:
+        """Cut until every chart is a disk, then until distortion is satisfied.
+
+        Returns the number of topology rounds run.
+        """
+        ct = self.measure()
+        limit = 8 + 2 * int(ct.n_charts + int(ct.chart_loops.sum()))
+        rounds = 0
+        for _ in range(max(1, limit)):
+            bad = np.flatnonzero(ct.chart_chi != 1)
+            if bad.size == 0:
+                break
+            rounds += 1
+            g = self.graph(ct)
+            changed = 0
+            for chart in bad.tolist():
+                if int(ct.chart_loops[chart]) >= 2:
+                    changed += self.join_loops(ct, g, chart)
+                elif int(ct.chart_chi[chart]) < 1:
+                    changed += self.cut_handle_loop(g, chart)
+                else:
+                    changed += self.cut_arc(g, chart, seed)
+            if changed == 0:
+                break
+            ct = self.measure()
+
+        # Whatever the measured loop could not open, open by brute force.
+        for chart in np.flatnonzero(ct.chart_chi != 1).tolist():
+            self.open_by_spanning_tree(ct, chart)
+
+        scale = min(max(_finite(curvature_threshold, 0.35), 0.02), 0.95)
+        self.escalate(
+            cone=scale * math.pi,
+            chart_budget=scale * 4.0 * math.pi,
+            budget=max_extra_cuts,
+        )
+        return rounds
+
+
+def concave_seams(
+    sample: "UVMeshSample",
+    *,
+    curvature_threshold: float = 0.35,
+    seed: int = 0,
+    bias: float = _CONCAVE_BIAS,
+    max_extra_cuts: int = _CONCAVE_MAX_EXTRA_CUTS,
+    topo: EdgeTopology | None = None,
+) -> tuple[np.ndarray, ConcaveReport]:
+    """Cut ``sample`` the way an artist would: down the valleys, and no further.
+
+    Why concavity, and why it is not merely a stylistic preference: a seam in a
+    concave crease is both **hidden** -- the geometry folds away from the
+    camera there -- and **cheap**, because a valley is where the surface is
+    least developable and a cut relieves the most distortion per unit length.
+    Those two wants coincide, which is the whole idea.
+
+    The algorithm, in order:
+
+    1. **Weight.**  Every edge costs its 3D length scaled down in a valley and
+       up on a ridge (:func:`concavity_weights`).
+    2. **Cut the topological minimum.**  Measure each chart's Euler
+       characteristic on the *cut* surface (:func:`cut_topology`) and add one
+       cut per defect: a shortest weighted path joining two boundary loops, a
+       tree-cotree loop to remove a handle, or -- for a closed shell -- a path
+       between two curvature extremes.  Repeat until ``chi == 1`` everywhere.
+       Nothing here is hard-coded per shape: Suzanne's head is discovered to
+       need exactly one join because it is measured at ``chi = 0`` with two
+       boundary loops, and her eyeballs are discovered to need none.
+    3. **Escalate only on evidence.**  Add further cuts only where the measured
+       interior Gaussian curvature says a chart cannot be flattened without a
+       cone singularity.
+
+    Args:
+        sample: The mesh to cut.
+        curvature_threshold: Escalation sensitivity.  Multiplied by ``pi`` to
+            give the per-vertex angle-defect threshold in radians, so the
+            default ``0.35`` fires at roughly 63 degrees of defect -- a cube
+            corner (90) escalates, a smooth sphere vertex (1.5) does not.
+        seed: Rotates the source among a closed shell's sharpest few curvature
+            extremes, so different grid candidates get different valid cuts.
+        bias: Concavity preference strength; see :func:`concavity_weights`.
+        max_extra_cuts: Ceiling on the distortion escalation.
+        topo: Optional prebuilt edge topology.
+
+    Returns:
+        ``(mask, report)`` with ``mask`` an ``(E,)`` bool seam mask and
+        ``report`` a :class:`ConcaveReport` of measured counts.  Never raises:
+        a mesh this cannot analyse comes back with an empty cut and a report
+        that says so.
+    """
+    if topo is None:
+        topo = build_edge_topology(sample)
+    if topo.n_edges == 0 or topo.n_tris == 0:
+        return np.zeros(max(topo.n_edges, 0), dtype=bool), ConcaveReport()
+
+    sides = _triangle_sides(sample, topo)
+    cutter = _ConcaveCutter(sample, topo, sides, bias=bias)
+    rounds = 0
+    try:
+        rounds = cutter.run(
+            curvature_threshold=curvature_threshold,
+            seed=_as_seed(seed),
+            max_extra_cuts=max(0, int(max_extra_cuts)),
+        )
+    except Exception:
+        # ARCHITECTURE.md section 1.4: a failure is contained, never thrown.
+        # Whatever was already marked is still a legal -- if incomplete -- cut,
+        # and the dual-graph strategy is the guaranteed-openable fallback.
+        cutter.seam |= _dual_graph_seams(
+            topo, curvature_threshold=_finite(curvature_threshold, 0.35), seed=_as_seed(seed)
+        )
+        cutter.fallbacks += 1
+
+    seam = cutter.seam & topo.cuttable_mask
+    ct = cut_topology(sample, seam, topo=topo, sides=sides)
+    _, shells = _face_components(topo)
+
+    length = np.where(np.isfinite(topo.edge_len), topo.edge_len, 0.0)
+    man = topo.face_count == 2
+    marked_man = seam & man
+    concave = marked_man & (cutter.signed < 0.0)
+    marked_len = float(length[marked_man].sum())
+    mesh_len = float(length[man].sum())
+    return seam, ConcaveReport(
+        shells=shells,
+        charts=ct.n_charts,
+        disks=int((ct.chart_chi == 1).sum()),
+        non_disks=int((ct.chart_chi != 1).sum()),
+        cut_edges=int(seam.sum()),
+        cut_length=float(length[seam].sum()),
+        concave_edges=int(concave.sum()),
+        concave_length=float(length[concave].sum()),
+        concave_fraction=float(length[concave].sum() / marked_len) if marked_len else 0.0,
+        baseline_fraction=(
+            float(length[man & (cutter.signed < 0.0)].sum() / mesh_len) if mesh_len else 0.0
+        ),
+        joins=cutter.joins,
+        handle_loops=cutter.handle_loops,
+        arcs=cutter.arcs,
+        extra_cuts=cutter.extra_cuts,
+        splits=cutter.splits,
+        fallbacks=cutter.fallbacks,
+        rounds=rounds,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -802,12 +2270,13 @@ def compute_seams(
         angle_deg: Normal-deviation threshold in **degrees** for ``ANGLE`` and
             ``SHARP``.  An edge is sharp when its dihedral strictly exceeds it.
         curvature_threshold: Dimensionless threshold for ``CURVATURE`` (see
-            :func:`edge_curvature`), and the dangling-cut protection level for
-            ``DUAL_GRAPH``.
+            :func:`edge_curvature`), the dangling-cut protection level for
+            ``DUAL_GRAPH``, and the escalation sensitivity for ``CONCAVE``
+            (see :func:`concave_seams`).
         existing: Optional ``(E,)`` seam mask overriding ``sample.edge_seam``.
             Ignored when its length does not match the edge count.
-        seed: Determinism seed.  Only ``DUAL_GRAPH`` consumes it, where it
-            selects among equally-good cuts.
+        seed: Determinism seed.  ``DUAL_GRAPH`` and ``CONCAVE`` consume it,
+            where it selects among equally-good cuts.
 
     Returns:
         ``(E,)`` bool.  Boundary and loose edges are always ``False``; the array
@@ -857,6 +2326,14 @@ def compute_seams(
         seam = (edge_curvature(topo) > limit) & manifold
         seam |= forced
         return seam
+
+    if strat == "CONCAVE":
+        return concave_seams(
+            sample,
+            curvature_threshold=_finite(curvature_threshold, 0.35),
+            seed=_as_seed(seed),
+            topo=topo,
+        )[0]
 
     return _dual_graph_seams(
         topo,

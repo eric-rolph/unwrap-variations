@@ -83,7 +83,7 @@ except BaseException:  # pragma: no cover - keep importable if seams.py is absen
         return np.asarray(existing, dtype=bool).reshape(-1)
 
 
-__all__ = ["BlenderNativeBackend", "WORK_UV_LAYER"]
+__all__ = ["BlenderNativeBackend", "WORK_UV_LAYER", "repack_uvs"]
 
 #: Name of the scratch UV layer the operators write into.  Deleted on exit; a
 #: leftover from a crashed run is removed at the start of the next one.
@@ -757,6 +757,83 @@ def _post_process(bpy: ModuleType, params: UnwrapParams, notes: _Notes,
             notes.add("average_islands_scale returned %s", detail)
 
     _pack_islands(bpy, params, notes, n_tris)
+
+
+def repack_uvs(obj: Any, uvs: np.ndarray, params: UnwrapParams, n_tris: int) -> np.ndarray | None:
+    """Repack a caller-supplied layout with Blender's packer, non-destructively.
+
+    The refinement chain (:mod:`unwrap_variations.core.refine`) merges charts,
+    which changes island shapes and leaves the old packing arrangement stale.
+    Repacking has to go through ``bpy.ops.uv.pack_islands``, so it cannot live
+    in the bpy-free core -- and it must reuse this module's packing path rather
+    than a fresh one, because that path carries two fixes that are easy to lose
+    and expensive to rediscover: the ``uv.select_all(action='SELECT')`` that
+    stops 4.5 cancelling the operator outright, and the ``shape_method='AABB'``
+    substitution that took a 12-triangle cube from 11.6 s to 0.013 s.
+
+    The mesh is left as it was found: the layout is written to the same scratch
+    layer the backend uses, packed, read back and the layer removed.
+
+    Args:
+        obj: The Blender object.  Its mesh is restored before returning.
+        uvs: ``(L, 2)`` layout to pack.
+        params: Recipe, read for the packing dials.
+        n_tris: Triangle count, for the small-mesh shape-method substitution.
+
+    Returns:
+        The packed ``(L, 2)`` layout, or ``None`` if packing could not run.
+        ``None`` is not an error -- the caller keeps the unpacked layout.
+    """
+    bpy = _import_bpy()
+    if bpy is None or obj is None:
+        return None
+    mesh = getattr(obj, "data", None)
+    if mesh is None:
+        return None
+
+    arr = np.asarray(uvs, dtype=np.float64).reshape(-1, 2)
+    if arr.shape[0] != len(mesh.loops):
+        return None
+
+    notes = _Notes()
+    state = _capture_state(bpy, obj)
+    try:
+        view_layer = bpy.context.view_layer
+        if obj.name not in view_layer.objects:
+            return None
+        _quiet(lambda: setattr(obj, "hide_viewport", False))
+        _quiet(lambda: obj.hide_set(False))
+        _quiet(lambda: obj.select_set(True))
+        view_layer.objects.active = obj
+        if obj.mode != "OBJECT":
+            _call_op(bpy.ops.object.mode_set, mode="OBJECT")
+
+        layer = _prepare_work_layer(mesh, state, notes)
+        work_name = layer.name
+        _write_uv_array(layer, arr)
+        mesh.update()
+
+        ok, detail = _call_op(bpy.ops.object.mode_set, mode="EDIT")
+        if not ok:
+            return None
+        try:
+            _call_op(bpy.ops.mesh.select_all, action="SELECT")
+            _pack_islands(bpy, params, notes, n_tris)
+        finally:
+            _call_op(bpy.ops.object.mode_set, mode="OBJECT")
+
+        layer = mesh.uv_layers.get(work_name)
+        if layer is None:
+            return None
+        packed = _read_uv_array(layer, len(mesh.loops))
+        if not np.isfinite(packed).all():
+            return None
+        return packed
+    except Exception:  # noqa: BLE001 - repacking is an optimisation; a failure
+        # means the caller keeps the layout it already had.
+        return None
+    finally:
+        _restore_state(bpy, state)
 
 
 # ---------------------------------------------------------------------------
