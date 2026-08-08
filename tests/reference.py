@@ -57,9 +57,29 @@ __all__ = [
     "UnionFind",
 ]
 
-#: Areas at or below this are treated as degenerate.  Matches the epsilon used
-#: by :func:`unwrap_variations.core.meshdata.degenerate_mask`.
+#: Relative area floor below which a triangle is unusable for distortion maths.
+#: Matches :func:`unwrap_variations.core.meshdata.degenerate_mask`: the epsilon
+#: is scaled by the mesh's own mean triangle area, *per domain*, so degeneracy is
+#: scale invariant.  An absolute floor would call every triangle of a 0.1 mm CAD
+#: part degenerate -- their areas are legitimately around 5e-15 -- and score a
+#: perfectly good unwrap of it at zero.
 EPS_AREA = 1e-12
+
+
+def area_floor(areas) -> float:
+    """Return the degeneracy floor for one domain, from its own finite areas.
+
+    Multiplies, and deliberately does not take a maximum against the bare
+    epsilon: clamping the floor up to 1e-12 would reinstate the absolute test on
+    exactly the sub-millimetre models the relative one exists to rescue.
+    """
+    finite = [a for a in areas if math.isfinite(a)]
+    if not finite:
+        return EPS_AREA
+    scale = sum(finite) / len(finite)
+    if not math.isfinite(scale) or scale <= 0.0:
+        return EPS_AREA
+    return EPS_AREA * scale
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +117,17 @@ def tri_area_uv_signed(p1, p2, p3):
     return 0.5 * ((p2[0] - p1[0]) * (p3[1] - p1[1]) - (p3[0] - p1[0]) * (p2[1] - p1[1]))
 
 
-def stretch_singular_values(q, p):
+def stretch_singular_values(q, p, uv_area_floor: float = 1e-14):
     """Return ``(Gamma, gamma)`` for one triangle, or ``None`` when degenerate.
 
     Args:
         q: Three 3D corner positions.
         p: Three UV corner positions, in the same corner order.
+        uv_area_floor: Absolute UV-area threshold below which the Jacobian
+            inverse is not numerically meaningful.  Callers that classify
+            degeneracy relatively (see :func:`area_floor`) pass their own floor
+            so this guard cannot silently reclassify a triangle they already
+            accepted.
 
     Returns:
         The larger and smaller singular value of the parametrisation Jacobian,
@@ -113,7 +138,7 @@ def stretch_singular_values(q, p):
     s2, t2 = p2
     s3, t3 = p3
     area = ((s2 - s1) * (t3 - t1) - (s3 - s1) * (t2 - t1)) / 2.0
-    if abs(area) < 1e-14:
+    if abs(area) < uv_area_floor:
         return None
     inv = 1.0 / (2.0 * area)
     ss = tuple(
@@ -286,13 +311,20 @@ def reference_metrics(sample, *, do_overlap: bool = True, overlap_limit: int = 4
 
     # The normalisation constant MUST be computed over exactly the same subset
     # of triangles that contributes to the sums below (see the module docstring).
+    # The floor is relative to each domain's own mean area, over the triangles
+    # with representable geometry -- see :func:`area_floor`.
+    finite3 = [i for i in range(n_tris) if _finite3(verts, tv[i])]
+    finite2 = [i for i in range(n_tris) if _finite2(uvs, tl[i])]
+    floor_3d = area_floor([a3_list[i] for i in finite3])
+    floor_uv = area_floor([abs(auv_list[i]) for i in finite2])
+
     good = [
         i
         for i in range(n_tris)
         if _finite3(verts, tv[i])
         and _finite2(uvs, tl[i])
-        and a3_list[i] > EPS_AREA
-        and abs(auv_list[i]) > EPS_AREA
+        and a3_list[i] > floor_3d
+        and abs(auv_list[i]) > floor_uv
     ]
     good_set = set(good)
     sum_a3 = sum(a3_list[i] for i in good)
@@ -327,7 +359,7 @@ def reference_metrics(sample, *, do_overlap: bool = True, overlap_limit: int = 4
             degenerate += 1
             continue
 
-        sv = stretch_singular_values(q, p)
+        sv = stretch_singular_values(q, p, uv_area_floor=floor_uv)
         if sv is None:
             degenerate += 1
             continue

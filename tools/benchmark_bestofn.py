@@ -31,7 +31,7 @@ measurement.** A margin smaller than the run-to-run spread is not a win, and an
 earlier single-run version of this script reported two such non-wins as wins.
 So every column is measured ``--repeats`` times, reported as median with the
 observed range, and a verdict is only awarded when the median margin clears
-both half the combined spread and an absolute floor of 1.0 point.
+both the full combined spread and an absolute floor of 1.0 point.
 
 Columns
 -------
@@ -207,15 +207,15 @@ def verdict(ours, baseline):
     Returns:
         ``(label, margin, noise)``. ``noise`` is the combined observed spread of
         both series. A verdict is awarded only when the median margin clears
-        **both** half that spread and :data:`MIN_MARGIN`, so a difference that
+        **both** that full spread and :data:`MIN_MARGIN`, so a difference that
         could plausibly be a different roll of Blender's non-deterministic
         packer is reported as a tie.
     """
     margin = statistics.median(ours) - statistics.median(baseline)
     noise = (max(ours) - min(ours)) + (max(baseline) - min(baseline))
-    if margin > noise / 2.0 and margin > MIN_MARGIN:
+    if margin > noise and margin > MIN_MARGIN:
         return "WIN", margin, noise
-    if margin < -noise / 2.0 and margin < -MIN_MARGIN:
+    if margin < -noise and margin < -MIN_MARGIN:
         return "LOSS", margin, noise
     return "tie", margin, noise
 
@@ -253,7 +253,7 @@ def main():
     print("BEST-OF-%d vs SINGLE-PASS, median of %d runs [min-max], Blender %s"
           % (args.count, repeats, bpy.app.version_string))
     print("preset %r | seed %d" % (args.preset, args.seed))
-    print("A verdict requires the median margin to exceed HALF the combined spread")
+    print("A verdict requires the median margin to exceed the FULL combined spread")
     print("and to exceed %.1f point; anything else is reported as a tie." % MIN_MARGIN)
     if repeats < 2:
         print("WARNING: --repeats 1 produces a sample, not a measurement. Do not publish it.")
@@ -289,7 +289,7 @@ def main():
 
         # The per-repeat maximum, not the maximum of the medians: on any given
         # run the user would have taken whichever baseline happened to be better.
-        baseline = [max(a, b) for a, b in zip(smart_runs, unwrap_runs)]
+        baseline = [max(a, b) for a, b in zip(smart_runs, unwrap_runs, strict=True)]
         label, margin, noise = verdict(our_runs, baseline)
         record[label] += 1
 

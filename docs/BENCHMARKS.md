@@ -1,11 +1,13 @@
 # Benchmarks
 
 > **Status: PROVISIONAL.** The numbers in this file were measured on
-> **2026-08-07** against a work-in-progress build. The scoring weights are
-> actively being retuned, and because every column here is scored by the same
-> scorer, a weight change moves **all** of them. Treat these figures as a
-> direction of travel, not as a published result. Regeneration instructions are
-> at the bottom.
+> **2026-08-07** against a work-in-progress build. Two things are still moving:
+> the scoring weights are being retuned -- and because every column here is
+> scored by the same scorer, a weight change moves **all** of them -- and work
+> is underway on the icosphere loss and on candidate diversity for closed
+> meshes. Treat these figures as a direction of travel, not as a published
+> result. Regeneration instructions are in
+> [section 6](#6-regenerating-this-table).
 
 This file is the single source of truth for every performance and quality
 number the project claims. The README quotes only the headline record and two

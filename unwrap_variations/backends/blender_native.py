@@ -112,34 +112,54 @@ PROJECTION_METHODS = ("SMART_PROJECT", "CUBE_PROJECT")
 #: :meth:`UnwrapParams.signature`, so overriding still de-duplicates correctly.
 DEFAULT_PACK_ROTATE_METHOD = "ANY"
 
-#: Triangle count below which ``shape_method='CONCAVE'`` is downgraded to
-#: ``'CONVEX'`` for packing.
+#: Triangle count below which packing always uses ``shape_method='AABB'``.
 #:
-#: Blender's packer runs an exhaustive placement search whose cost *rises* as the
-#: island count *falls*, and ``CONCAVE`` (which fits islands into each other's
-#: concavities) is by far its most expensive mode.  The effect is dramatic and
-#: inverted against mesh size -- measured on Blender 4.5.4, ``pack_islands``
-#: alone, subdividing one cube:
+#: Blender's island packer runs an exhaustive placement search whose cost *rises*
+#: as the island count *falls*, so it is pathologically slow on exactly the
+#: meshes that should be instant.  Subdividing a single cube, measured on 4.5.4
+#: with ``pack_islands`` alone:
 #:
-#: ======  =======  ==========
+#: ======  =======  ===========
 #: faces   islands  ``CONCAVE``
-#: ======  =======  ==========
-#: 6             6      8.46 s
-#: 24            6      0.34 s
-#: 54            6      0.23 s
-#: 96            6      0.15 s
-#: ======  =======  ==========
+#: ======  =======  ===========
+#: 6             6       8.46 s
+#: 24            6       0.34 s
+#: 54            6       0.23 s
+#: 96            6       0.15 s
+#: ======  =======  ===========
 #:
-#: and on a bare cube ``CONCAVE`` takes 7.18 s where ``CONVEX`` takes 0.044 s --
-#: 163x -- for a measured packing-coverage gain of **exactly zero**.  Concave
-#: packing can only pay off when there are enough islands to nestle together; on
-#: the handful of islands a small mesh produces it burns seconds to arrive at
-#: the same layout.  Above this threshold ``CONCAVE`` is both affordable
-#: (0.15-0.4 s on 500-tri meshes) and genuinely better (+0.08 coverage on a
-#: torus), so it is passed through untouched.
+#: No constant choice of ``rotate_method``/``shape_method`` is safe: the knobs
+#: interact chaotically and non-monotonically (on one cube recipe ``CONCAVE``
+#: costs 7.18 s and ``CONVEX`` 0.044 s; on another, substituting ``CONVEX``
+#: made a ten-candidate run *nine times slower*).  So instead of guessing, six
+#: policies were benchmarked end-to-end -- ten candidates from
+#: :func:`~unwrap_variations.core.params.sample_grid`, on Blender 4.5.4:
 #:
-#: Set ``params.extra["pack_shape_guard"] = False`` to disable the downgrade.
-CONCAVE_MIN_TRIS = 256
+#: =============================  ========  ========  =========  =============
+#: policy                             cube      cone    Suzanne  mean coverage
+#: =============================  ========  ========  =========  =============
+#: ``ANY`` + shape as-is            10.64 s   28.65 s     6.77 s         0.6855
+#: ``AXIS_ALIGNED_X`` + as-is        9.36 s    3.66 s     2.25 s         0.6741
+#: ``AXIS_ALIGNED_Y`` + as-is        3.07 s   12.04 s     2.68 s         0.6728
+#: ``ANY`` + small -> ``CONVEX``    98.99 s   25.32 s     7.02 s         0.6857
+#: ``ANY`` + small -> ``AABB``       0.01 s    0.02 s     7.19 s         0.6906
+#: ``AXIS_ALIGNED_X`` + ``AABB``     0.01 s    0.02 s     2.19 s         0.6862
+#: =============================  ========  ========  =========  =============
+#:
+#: Substituting ``AABB`` below this threshold is ~1000x faster on a cube and
+#: ~1400x on a cone, and -- because the exhaustive search was not actually
+#: finding better layouts on so few islands -- it also scores the **highest**
+#: mean packing coverage of any policy tested.  Above the threshold the
+#: requested shape method is passed through untouched, where it is both
+#: affordable and genuinely better (+0.08 coverage on a torus).
+#:
+#: Consequence worth knowing: on a mesh below this size ``pack_shape_method``
+#: has no effect, which is why a candidate says so in its message.
+#: ``params.extra["pack_shape_guard"] = False`` disables the substitution.
+SMALL_MESH_TRIS = 256
+
+#: Shape method substituted for small meshes.  See :data:`SMALL_MESH_TRIS`.
+SMALL_MESH_SHAPE_METHOD = "AABB"
 
 #: Legal ``rotate_method`` identifiers for ``uv.pack_islands`` (a superset of
 #: :data:`unwrap_variations.core.params.ROTATE_METHODS`).
@@ -634,19 +654,20 @@ def _select_all_uvs(bpy: ModuleType) -> bool:
 def _pack_shape_method(params: UnwrapParams, n_tris: int, notes: _Notes) -> str:
     """Return the ``shape_method`` to pack with, applying the small-mesh guard.
 
-    See :data:`CONCAVE_MIN_TRIS` for the measurements behind the downgrade.  The
-    guard is announced in the candidate's message, so a user who wonders why two
-    recipes differing only in ``pack_shape_method`` came out identical on a cube
+    See :data:`SMALL_MESH_TRIS` for the benchmark behind the substitution.  It is
+    announced in the candidate's message, so a user who wonders why two recipes
+    differing only in ``pack_shape_method`` came out identical on a small mesh
     can see exactly why.
     """
     requested = _enum(params.pack_shape_method, PACK_SHAPE_METHODS, "CONCAVE")
     extra = params.extra if isinstance(params.extra, dict) else {}
     if not extra.get("pack_shape_guard", True):
         return requested
-    if requested == "CONCAVE" and 0 < n_tris < CONCAVE_MIN_TRIS:
-        notes.add("concave packing downgraded to convex below %d tris (no measurable "
-                  "gain, up to 160x slower)", CONCAVE_MIN_TRIS)
-        return "CONVEX"
+    if requested != SMALL_MESH_SHAPE_METHOD and 0 < n_tris < SMALL_MESH_TRIS:
+        notes.add("packed as %s: below %d tris Blender's exhaustive packer costs "
+                  "seconds without packing any tighter", SMALL_MESH_SHAPE_METHOD,
+                  SMALL_MESH_TRIS)
+        return SMALL_MESH_SHAPE_METHOD
     return requested
 
 

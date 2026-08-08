@@ -247,10 +247,26 @@ def compute_seams(sample: UVMeshSample, strategy: str, *,
 
 - `ANGLE` — dihedral angle between adjacent face normals exceeds `angle_deg`.
 - `CURVATURE` — normalised discrete mean curvature per edge over threshold.
-- `DUAL_GRAPH` — build the face dual graph weighted by coplanarity
-  `w = 1 - clamp(n1·n2)`, take a **maximum spanning tree**, and cut the mesh
-  edges whose dual edge is *not* in the tree, then prune the resulting seam set
-  to remove dangling ends. Yields few, well-placed cuts on a connected chart.
+- `DUAL_GRAPH` -- build the face dual graph weighted by **coplanarity**
+  `c = clamp(dot(n1, n2), -1, 1)`, take a **maximum spanning forest** over `c`,
+  cut the mesh edges whose dual edge is *not* in the forest, then prune
+  dangling ends. Yields few, well-placed cuts.
+
+  > **Corrected.** This originally read "weighted by coplanarity
+  > `w = 1 - clamp(dot)`, take a maximum spanning tree". That is
+  > self-contradictory: `1 - dot` is a *sharpness*, so maximising it keeps the
+  > sharpest adjacencies in the tree and cuts across flat regions -- the exact
+  > opposite of the stated intent. Maximise coplanarity `c` directly.
+  > **Forest**, not tree, because a mesh may have several disconnected shells.
+  >
+  > The prune rule as first written was also wrong. On a *closed* component the
+  > complement of a dual spanning forest is exactly a spanning tree of that
+  > component's vertices, and a tree is nothing but dangling ends -- so pruning
+  > to a fixpoint deletes the entire cut and leaves a surface with no disk
+  > parameterisation at all. A cube would return 0 cuts instead of 7. The
+  > implementation therefore protects a dangling cut sharper than
+  > `curvature_threshold`, and restores a closed component's raw cut wholesale
+  > if the peel empties it. Open components prune normally.
 - Must handle **non-manifold** edges (>2 incident faces) and boundary edges
   (1 face) without raising — boundary edges are never seams.
 - Pure numpy/stdlib. No `bpy`.

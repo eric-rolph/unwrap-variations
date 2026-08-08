@@ -262,6 +262,11 @@ joined whenever their faces share an edge. That is the *face dual graph*. Now
 weight each connection by how **flat** the join is -- two coplanar faces get a
 high weight, a sharp crease gets a low one.
 
+(Internally the mesh is triangulated, so a quad arrives as two triangles
+sharing a diagonal that does not exist as a real edge. Those pairs are merged
+into a single node up front, which is why this strategy will never try to cut
+a quad down its diagonal -- there is no such edge for Blender to mark.)
+
 Then:
 
 1. **Build a maximum spanning forest.** Walk the connections from flattest to

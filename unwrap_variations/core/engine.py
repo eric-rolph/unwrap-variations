@@ -570,19 +570,30 @@ def generate(
     report = GenerationReport()
     tried: set[str] = set()
     round_seed = int(seed)
+    # Each refill round repeats the per-run setup (snapshot, extract, topology),
+    # so rounds are not free. Without a total budget a SMALL request could cost
+    # more than a large one -- measured at 26.2s for count=4 against 8.7s for
+    # count=10 on a cube, because the small request needed more rounds. Bound
+    # the total recipes attempted and stop as soon as a round adds nothing.
+    attempt_budget = max(target * 2, target + 6)
+    attempted = 0
     for attempt in range(_MAX_REFILL_ROUNDS):
         want = target - len(report.candidates)
-        if want <= 0:
+        if want <= 0 or attempted >= attempt_budget:
             break
-        # Over-request on refills: some fraction will fail again.
-        batch = sample_grid(
-            want if attempt == 0 else want * 2, seed=round_seed, base=base
-        )
+        # Over-request modestly on refills, since some will fail again, but
+        # never beyond the remaining budget.
+        ask = want if attempt == 0 else min(want * 2, attempt_budget - attempted)
+        if ask <= 0:
+            break
+        batch = sample_grid(ask, seed=round_seed, base=base)
         batch = [p for p in batch if p.signature() not in tried]
         tried.update(p.signature() for p in batch)
         if not batch:
             round_seed += 977
             continue
+        attempted += len(batch)
+        before = len(report.candidates)
 
         part = _run_recipes(
             obj,
@@ -598,6 +609,10 @@ def generate(
         _merge(report, part, target)
         if part.cancelled:
             report.cancelled = True
+            break
+        if len(report.candidates) == before:
+            # This round contributed nothing usable; more rounds of the same
+            # will not either, and each one costs a full setup.
             break
         round_seed += 977
 

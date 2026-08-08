@@ -92,9 +92,21 @@ __all__ = ["evaluate"]
 # Tunables
 # ---------------------------------------------------------------------------
 
-#: Area below which a triangle is unusable for distortion maths.  Matches the
-#: default of :func:`unwrap_variations.core.meshdata.degenerate_mask` so the two
-#: never disagree about which triangles are countable.
+#: Fraction of the mesh's **own mean triangle area** below which a triangle is
+#: unusable for distortion maths.  This is a *relative* floor, matching the
+#: default and the semantics of
+#: :func:`unwrap_variations.core.meshdata.degenerate_mask`, so the two never
+#: disagree about which triangles are countable.
+#:
+#: It has to be relative.  An absolute 1e-12 is not a small number for a small
+#: model: a 0.1 mm part, entirely ordinary in a CAD or photogrammetry import,
+#: has triangles of about 5e-15, so every one of them would be called degenerate
+#: and a flawless unwrap would score near zero.  Every other metric in this
+#: module is scale free -- the same mesh in millimetres and in metres scores
+#: identically -- and degeneracy has to be as well.  The floor is applied
+#: separately to the 3D areas and to the UV areas, each against its own mean,
+#: because the two live in unrelated units and UV coordinates may legitimately
+#: be tiny on their own account.
 _DEGENERATE_EPS = 1e-12
 
 #: Relative tolerance for calling two UVs "the same UV vertex" when welding
@@ -312,16 +324,41 @@ def _evaluate_impl(sample: UVMeshSample, compute_overlap: bool) -> UVMetrics:
     tri_hi_v = np.maximum(np.maximum(v0, v1c), v2c)
 
     # A NaN or Inf anywhere in a corner necessarily reaches at least one of the
-    # three fundamental-form scalars, so six finiteness tests on (T,) arrays
-    # replace a pass over the (T, 3, 3) and (T, 3, 2) coordinate blocks.
-    finite3 = np.isfinite(e3) & np.isfinite(f3) & np.isfinite(g3)
-    finite2 = np.isfinite(e2d) & np.isfinite(f2d) & np.isfinite(g2d)
-    # Same rule as meshdata.degenerate_mask, expressed on the scalars.
-    good = finite3 & finite2 & (area3 > _DEGENERATE_EPS) & (abs_uv > _DEGENERATE_EPS)
+    # three fundamental-form scalars, so finiteness tests on (T,) arrays replace
+    # a pass over the (T, 3, 3) and (T, 3, 2) coordinate blocks.  The area is
+    # tested too rather than inferred: ``e3 * g3`` can overflow to infinity from
+    # perfectly finite inputs, and ``inf - inf`` is a NaN area on a triangle
+    # whose fundamental form looked fine.
+    finite3 = np.isfinite(e3) & np.isfinite(f3) & np.isfinite(g3) & np.isfinite(area3)
+    finite2 = np.isfinite(e2d) & np.isfinite(f2d) & np.isfinite(g2d) & np.isfinite(signed_uv)
+
+    # Same rule as meshdata.degenerate_mask, expressed on the scalars: a
+    # relative floor per domain, taken against that domain's own mean area.
+    # The helper is deliberately *not* called here even though it computes the
+    # identical mask -- it works from the (T, 3, 3) and (T, 3, 2) corner blocks
+    # and costs 137 ms at 522k triangles against 194 ms for this entire
+    # function, which would put the evaluation 30% over its budget.  The two
+    # implementations are pinned together by test instead.
+    n_finite3 = int(np.count_nonzero(finite3))
+    n_finite2 = int(np.count_nonzero(finite2))
+    if n_finite3 == area3.shape[0]:
+        total_area3 = float(area3.sum())
+    else:
+        total_area3 = float(area3[finite3].sum()) if n_finite3 else 0.0
+    if n_finite2 == abs_uv.shape[0]:
+        total_uv_finite = float(abs_uv.sum())
+    else:
+        total_uv_finite = float(abs_uv[finite2].sum()) if n_finite2 else 0.0
+
+    good = (
+        finite3
+        & finite2
+        & (area3 > _relative_floor(total_area3, n_finite3))
+        & (abs_uv > _relative_floor(total_uv_finite, n_finite2))
+    )
     n_good = int(good.sum())
     degenerate_tris = int(good.shape[0] - n_good) + data.n_dropped
 
-    total_area3 = float(area3[finite3].sum()) if finite3.any() else 0.0
     flipped_tris = int(np.count_nonzero(good & (signed_uv < 0.0)))
 
     seam_length, seam_ratio = _seam_metrics(data, total_area3)
@@ -1359,3 +1396,33 @@ def _finite(value: float, fallback: float) -> float:
     """Return ``value`` as a float, substituting ``fallback`` if non-finite."""
     number = float(value)
     return number if math.isfinite(number) else fallback
+
+
+def _relative_floor(total_area: float, count: int) -> float:
+    """Return the degeneracy area floor for one domain, from its sum and count.
+
+    The floor is ``_DEGENERATE_EPS`` times the mean area, which is what makes
+    degeneracy scale invariant; see the constant's own docstring for why an
+    absolute floor is wrong.  Note this multiplies -- it does **not** take a
+    maximum against the bare epsilon.  Clamping the floor up to 1e-12 would
+    reinstate the absolute test on exactly the sub-millimetre models the
+    relative one exists to rescue, because every one of their triangles is
+    legitimately smaller than that.
+
+    Args:
+        total_area: Summed area over the triangles with representable geometry.
+        count: How many triangles that sum covers.
+
+    Returns:
+        The absolute area threshold to compare against.  Falls back to the bare
+        epsilon when there is no usable scale to work from -- an empty mesh, or
+        one whose areas are all zero or unrepresentable -- so a fully collapsed
+        mesh still resolves to "everything is degenerate" rather than to a floor
+        of zero, which would call collapsed triangles measurable.
+    """
+    if count <= 0:
+        return _DEGENERATE_EPS
+    scale = total_area / count
+    if not math.isfinite(scale) or scale <= 0.0:
+        return _DEGENERATE_EPS
+    return _DEGENERATE_EPS * scale

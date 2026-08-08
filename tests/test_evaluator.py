@@ -139,23 +139,51 @@ def test_l2_invariant_survives_uv_scaling(evaluator):
         )
 
 
-def test_extreme_uv_downscale_collapses_consistently(evaluator):
-    """Below the degeneracy epsilon everything is unmeasurable -- in both engines.
+@pytest.mark.parametrize("uv_scale", [1e-6, 1e-3, 1e3, 1e6])
+def test_extreme_uv_scaling_does_not_fake_degeneracy(evaluator, uv_scale):
+    """Shrinking a whole UV layout does not turn it into a "degenerate" mesh.
 
-    The degeneracy test is an *absolute* area threshold (1e-12), so shrinking a
-    whole UV layout by 1e-6 shrinks every triangle's area by 1e-12 and pushes
-    the lot under it.  That is a documented limitation rather than a bug, but it
-    has to be a *consistent* one: the fast path and the oracle must agree that
-    nothing is measurable, and the reported stretch must not be some plausible-
-    looking number computed from a handful of survivors.
+    The degeneracy floor is *relative* to the mesh's own mean triangle area, not
+    an absolute 1e-12.  That matters for real work: a 0.1 mm CAD or
+    photogrammetry part has per-triangle areas around 5e-15, so an absolute
+    floor would report a perfectly good unwrap of it as 100 % degenerate and
+    score it at zero.  Scaling the UVs by a million in either direction must
+    change nothing at all.
     """
     sample = make_random_mesh(3, mode="jittered")
-    shrunk = sample.with_uvs(sample.uvs * 1e-6)
-    got = evaluator.evaluate(shrunk, compute_overlap=False)
-    want = ref.reference_metrics(shrunk, do_overlap=False)
-    assert got.degenerate_tris == shrunk.n_tris
-    assert want["degenerate_tris"] == shrunk.n_tris
-    _assert_neutral_stretch(got.stretch_l2, "1e-6 UV downscale")
+    base = evaluator.evaluate(sample, compute_overlap=False)
+    scaled = sample.with_uvs(sample.uvs * uv_scale)
+    got = evaluator.evaluate(scaled, compute_overlap=False)
+    assert got.degenerate_tris == base.degenerate_tris == 0, (
+        "UV scale %g reported %d degenerate triangles against %d at scale 1"
+        % (uv_scale, got.degenerate_tris, base.degenerate_tris)
+    )
+    assert got.stretch_l2 == pytest.approx(base.stretch_l2, rel=1e-6)
+    # And the naive oracle, which models the same relative floor, agrees.
+    want = ref.reference_metrics(scaled, do_overlap=False)
+    assert want["degenerate_tris"] == 0
+    assert got.stretch_l2 == pytest.approx(want["stretch_l2"], rel=1e-8)
+
+
+def test_a_sub_millimetre_model_is_not_reported_as_degenerate(evaluator):
+    """A tiny-but-valid model measures exactly like the same model scaled up.
+
+    The regression this guards: with an absolute 1e-12 area floor, every
+    triangle of a 0.1 mm part falls below it, the whole mesh is classified
+    degenerate, and a flawless unwrap scores zero.
+    """
+    normal = make_flat_grid(8, size=1.0)
+    tiny = dataclasses.replace(normal, verts=normal.verts * 1e-4)
+    tiny = tiny.with_uvs(normal.uvs * 1e-4)
+
+    a = evaluator.evaluate(normal, compute_overlap=False)
+    b = evaluator.evaluate(tiny, compute_overlap=False)
+    assert b.degenerate_tris == 0, (
+        "a 0.1 mm model reported %d of %d triangles degenerate"
+        % (b.degenerate_tris, tiny.n_tris)
+    )
+    assert b.stretch_l2 == pytest.approx(a.stretch_l2, rel=1e-9)
+    assert b.stretch_l2 == pytest.approx(1.0, abs=1e-9)
 
 
 # ---------------------------------------------------------------------------
@@ -595,26 +623,17 @@ def test_pathological_meshes_never_raise(evaluator, compute_overlap):
         _assert_sane(m, sample.name)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "BUG (cosmetic but user-visible) in core/evaluator.py: the vectorised "
-        "path emits numpy RuntimeWarnings on degenerate input -- 'overflow "
-        "encountered in divide' at the conformal-error ratio (the "
-        "np.maximum(sig_min_sq, _TINY) guard is too small to stop the overflow "
-        "when sig_max_sq is astronomically large), and 'invalid value "
-        "encountered in minimum/maximum' from the np.minimum.at / np.maximum.at "
-        "island-bounds reduction when a UV is NaN. Every returned value is "
-        "still finite, so this is noise rather than wrongness -- but it is "
-        "noise printed into Blender's console on any mesh with a collapsed "
-        "face or a NaN UV, which is exactly the mesh the user is already "
-        "confused about. Fix: wrap _evaluate_impl in "
-        "`with np.errstate(all='ignore'):`, or mask non-finite UVs before the "
-        "bounds reduction."
-    ),
-    strict=False,
-)
 def test_evaluate_emits_no_numpy_warnings(evaluator):
-    """A clean run leaves nothing in the console, even on broken geometry."""
+    """A clean run leaves nothing in the console, even on broken geometry.
+
+    Regression test.  The vectorised path used to emit numpy RuntimeWarnings on
+    degenerate input -- "overflow encountered in divide" from the
+    conformal-error ratio, and "invalid value encountered in minimum/maximum"
+    from the island-bounds reduction when a UV is NaN.  The values were always
+    finite, so this was noise rather than wrongness -- but it was noise printed
+    into Blender's console on exactly the mesh the user is already confused
+    about.  Now contained by ``np.errstate`` inside the evaluator.
+    """
     import warnings
 
     samples = all_pathological() + [
