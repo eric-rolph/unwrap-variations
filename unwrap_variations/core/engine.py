@@ -247,8 +247,432 @@ def dead_layout_reason(uvs: np.ndarray, previous: np.ndarray | None = None) -> s
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Chart cuts: segmentation seams for surfaces a heuristic cannot open
+# ---------------------------------------------------------------------------
+#
+# ``DUAL_GRAPH`` cuts the complement of a maximum spanning forest of the face
+# dual graph.  On a *faceted* mesh that is exactly right -- a cube comes out at
+# its seven-edge cross net.  On a *smooth* closed mesh it is a disaster, because
+# the complement of a dual spanning tree is always a spanning tree of every
+# interior vertex: 161 of 480 edges on a subdivision-3 icosphere (seam length
+# 45.1 against a model whose sqrt(area) is 3.5) and 1105 of 2256 on a UV sphere.
+# The layout is perfectly isometric -- a polyhedral net is developable by
+# construction -- but the cut is unusable, it packs at 0.22 efficiency, and
+# ``MINIMUM_STRETCH`` folds the resulting spiky chart over itself (measured
+# overlap 7.9e-03 on the icosphere).
+#
+# The cut below is the other classic answer: segment the surface into charts
+# (variational-shape-approximation style clustering of polygon normals) and cut
+# on the chart boundaries.  Those are closed loops, so the cut is short, and
+# each chart is compact, so it packs and it does not fold.
+#
+# The one thing clustering cannot guarantee is that a chart is a *disk* -- the
+# top half of a torus is an annulus, and a solver handed an annulus either fails
+# or folds.  So every chart is checked and bisected until it is one.  Disk-ness
+# is decided exactly, by Euler characteristic, from three bincounts.
+
 #: Solvers that need the surface cut open into disks before they can run.
 _SEAM_DRIVEN = ("ANGLE_BASED", "CONFORMAL", "MINIMUM_STRETCH")
+
+#: ``params.extra`` key requesting an engine-computed chart cut; the value is
+#: the number of seed clusters.
+CHART_CUT_KEY = "chart_cut"
+#: ``params.extra`` key rotating the seed directions, so several chart recipes
+#: on one mesh produce genuinely different -- and equally valid -- layouts.
+CHART_SEED_KEY = "chart_seed"
+
+#: Cluster counts the escalation path chooses between.
+_CHART_CLUSTERS = (3, 4, 6, 8, 12)
+#: Guard on the bisection loop.  Each round at most doubles the chart count, so
+#: twelve is far more than any real mesh needs; it exists so a pathological
+#: input cannot spin.
+_CHART_MAX_SPLITS = 12
+
+
+def _label_components(n_nodes: int, ea: np.ndarray, eb: np.ndarray) -> np.ndarray:
+    """Label the connected components of an undirected graph, vectorised.
+
+    Hook every node to the smallest label in its neighbourhood, then flatten the
+    pointer forest by doubling.  Returns ``(n_nodes,)`` int64 labels where the
+    label is the smallest node id in the component.
+    """
+    labels = np.arange(max(n_nodes, 0), dtype=np.int64)
+    if n_nodes <= 0 or ea.size == 0:
+        return labels
+    ea = np.ascontiguousarray(ea, dtype=np.int64)
+    eb = np.ascontiguousarray(eb, dtype=np.int64)
+    for _ in range(64):
+        la = labels[ea]
+        lb = labels[eb]
+        if np.array_equal(la, lb):
+            break
+        smallest = np.minimum(la, lb)
+        np.minimum.at(labels, ea, smallest)
+        np.minimum.at(labels, eb, smallest)
+        for _ in range(32):
+            jumped = labels[labels]
+            if np.array_equal(jumped, labels):
+                break
+            labels = jumped
+    return labels
+
+
+def _seed_directions(clusters: int, seed: int) -> np.ndarray:
+    """Return ``(k, 3)`` evenly spread unit directions, rotated by ``seed``.
+
+    A Fibonacci lattice spreads k directions over the sphere far more evenly
+    than random sampling, and a seeded random rotation of the whole set is what
+    makes two chart recipes with the same ``k`` produce different charts rather
+    than the same one twice.
+    """
+    k = max(int(clusters), 1)
+    i = np.arange(k, dtype=np.float64) + 0.5
+    z = 1.0 - 2.0 * i / k
+    radius = np.sqrt(np.maximum(1.0 - z * z, 0.0))
+    theta = np.pi * (1.0 + 5.0 ** 0.5) * i
+    dirs = np.stack([np.cos(theta) * radius, np.sin(theta) * radius, z], axis=1)
+    if not seed:
+        return dirs
+    rng = np.random.default_rng(int(seed) & 0xFFFFFFFF)
+    quat = rng.normal(size=4)
+    norm = float(np.linalg.norm(quat))
+    if norm <= 0.0:
+        return dirs
+    w, x, y, z4 = quat / norm
+    rot = np.array(
+        [
+            [1 - 2 * (y * y + z4 * z4), 2 * (x * y - z4 * w), 2 * (x * z4 + y * w)],
+            [2 * (x * y + z4 * w), 1 - 2 * (x * x + z4 * z4), 2 * (y * z4 - x * w)],
+            [2 * (x * z4 - y * w), 2 * (y * z4 + x * w), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+    return dirs @ rot.T
+
+
+#: Chart area, as a fraction of the mean chart area, below which a chart is
+#: absorbed into its largest neighbour instead of becoming its own island.
+#:
+#: Clustering by normal is a global operation, so one cluster routinely lands in
+#: several disconnected places on an organic model -- Suzanne's four normal
+#: clusters come apart into 75 connected charts, most of them slivers around the
+#: ears and eyes.  Every sliver is an island the artist has to place by hand, and
+#: cutting one buys almost no distortion relief.  Absorbing them measured
+#: (Suzanne, 3 clusters, Blender 4.5.4): 52 islands at score 15.6 -> 8 islands at
+#: score 26.9.  It is a no-op on a mesh whose charts are already even, which is
+#: every primitive in the benchmark.
+_CHART_MIN_AREA_SHARE = 0.3
+#: Absorption rounds; each one merges every current sliver, so this is a
+#: safety net rather than a schedule.
+_CHART_ABSORB_ROUNDS = 8
+
+
+def chart_seams(
+    sample: UVMeshSample,
+    topo: "seam_mod.EdgeTopology",
+    *,
+    clusters: int = 6,
+    seed: int = 0,
+    max_splits: int = _CHART_MAX_SPLITS,
+    min_area_share: float = _CHART_MIN_AREA_SHARE,
+) -> np.ndarray:
+    """Return an ``(E,)`` seam mask that cuts ``sample`` into disk-shaped charts.
+
+    Algorithm
+    ---------
+
+    1. **Contract tessellation diagonals.**  ``tri_verts`` comes from
+       ``loop_triangles``, so a quad is two triangles sharing a diagonal that is
+       not a mesh edge and therefore cannot be cut.  Contracting those
+       adjacencies turns the triangle soup back into polygons, which is the
+       level every step below works at.
+    2. **Cluster polygon normals.**  Area-weighted k-means seeded from a
+       Fibonacci lattice of ``clusters`` directions.  This is Cohen-Steiner's
+       variational shape approximation with the proxy fixed to a plane normal:
+       cheap, deterministic, and it lands cuts on the creases of a hard-surface
+       model and on the "cube map" boundaries of a smooth one.
+    3. **Cut between clusters, and absorb the slivers.**  The boundary of a face
+       partition is a set of closed loops (or paths ending on a real boundary),
+       which is why this cut is short where a spanning-tree cut is long.  A
+       cluster can land in several disconnected places, though, so any chart
+       below ``min_area_share`` of the mean is merged back into its largest
+       neighbour -- see :data:`_CHART_MIN_AREA_SHARE`.
+    4. **Bisect until every chart is a disk.**  For a chart with ``F`` polygons,
+       ``U`` uncut interior mesh edges and ``Vint`` vertices touching no cut,
+       boundary or non-manifold edge, the Euler characteristic is exactly
+       ``chi = F - U + Vint``; a connected orientable chart is a disk precisely
+       when ``chi == 1`` (``chi = 2 - 2*genus - boundary_loops``).  Any chart
+       that is not is split in half along its principal axis and the test is
+       repeated.  An annulus -- the top half of a torus -- becomes two disks in
+       one round.
+
+    Args:
+        sample: The mesh to cut.  Nothing is mutated.
+        topo: Prebuilt edge topology for ``sample``.
+        clusters: Number of seed clusters.  More clusters means more, smaller,
+            flatter charts.
+        seed: Rotates the seed directions; different seeds give different charts.
+        max_splits: Guard on the bisection loop.
+        min_area_share: Charts smaller than this fraction of the mean chart area
+            are absorbed into a neighbour.  ``0`` disables absorption.
+
+    Returns:
+        ``(E,)`` bool.  Never raises; an empty or degenerate mesh yields an
+        all-``False`` mask.
+    """
+    n_edges = int(topo.n_edges)
+    n_tris = int(topo.n_tris)
+    seam = np.zeros(max(n_edges, 0), dtype=bool)
+    if n_tris == 0 or n_edges == 0:
+        return seam
+
+    verts = np.asarray(sample.verts, dtype=np.float64).reshape(-1, 3)
+    if verts.shape[0] == 0:
+        return seam
+    tri_verts = np.clip(
+        np.asarray(sample.tri_verts, dtype=np.int64).reshape(-1, 3), 0, verts.shape[0] - 1
+    )
+
+    # (1) polygons
+    group = _label_components(n_tris, topo.diag_a, topo.diag_b)
+    is_rep = group == np.arange(n_tris, dtype=np.int64)
+
+    areas = np.asarray(topo.areas, dtype=np.float64)
+    weighted_normals = np.asarray(topo.normals, dtype=np.float64) * areas[:, None]
+    poly_normal = np.zeros((n_tris, 3), dtype=np.float64)
+    np.add.at(poly_normal, group, weighted_normals)
+    poly_centre = np.zeros((n_tris, 3), dtype=np.float64)
+    np.add.at(poly_centre, group, verts[tri_verts].mean(axis=1) * areas[:, None])
+    poly_area = np.zeros(n_tris, dtype=np.float64)
+    np.add.at(poly_area, group, areas)
+    poly_centre /= np.where(poly_area > 0.0, poly_area, 1.0)[:, None]
+    length = np.linalg.norm(poly_normal, axis=1)
+    live = length > 0.0
+    unit = np.where(live[:, None], poly_normal / np.where(live, length, 1.0)[:, None], 0.0)
+
+    # (2) area-weighted k-means over polygon normals
+    dirs = _seed_directions(clusters, seed)
+    label = np.argmax(unit @ dirs.T, axis=1).astype(np.int64)
+    for _ in range(12):
+        accum = np.zeros_like(dirs)
+        np.add.at(accum, label, poly_normal)
+        norms = np.linalg.norm(accum, axis=1)
+        keep = norms > 1e-12
+        dirs = np.where(keep[:, None], accum / np.where(keep, norms, 1.0)[:, None], dirs)
+        nxt = np.argmax(unit @ dirs.T, axis=1).astype(np.int64)
+        if np.array_equal(nxt, label):
+            break
+        label = nxt
+    tri_label = label[group]
+
+    manifold = np.flatnonzero(topo.face_count == 2)
+    forced = topo.face_count >= 3
+    opening = (topo.face_count == 1) | forced
+    face_a = np.asarray(topo.face_a, dtype=np.int64)
+    face_b = np.asarray(topo.face_b, dtype=np.int64)
+    mf_a = face_a[manifold]
+    mf_b = face_b[manifold]
+
+    # (3b) absorb slivers
+    if min_area_share > 0.0:
+        tri_label = _absorb_slivers(
+            tri_label, topo, manifold, mf_a, mf_b, float(min_area_share)
+        )
+    next_label = int(tri_label.max()) + 1 if tri_label.size else 1
+
+    for _ in range(max(int(max_splits), 0) + 1):
+        # (3) cut between clusters
+        cross = tri_label[mf_a] != tri_label[mf_b]
+        seam = np.zeros(n_edges, dtype=bool)
+        seam[manifold[cross]] = True
+        seam |= forced
+
+        uncut = manifold[~cross]
+        # Diagonals never separate a polygon, so they always join two charts.
+        chart = _label_components(
+            n_tris,
+            np.concatenate([face_a[uncut], topo.diag_a]),
+            np.concatenate([face_b[uncut], topo.diag_b]),
+        )
+
+        # (4) chi = F - U + Vint, per chart
+        f_count = np.bincount(chart[is_rep], minlength=n_tris)
+        u_count = np.bincount(chart[face_a[uncut]], minlength=n_tris)
+        blocked = seam | opening
+        touched = np.zeros(topo.n_verts, dtype=bool)
+        if blocked.any():
+            touched[topo.edge_v0[blocked]] = True
+            touched[topo.edge_v1[blocked]] = True
+        vert_face = np.full(topo.n_verts, -1, dtype=np.int64)
+        vert_face[topo.edge_v0[uncut]] = face_a[uncut]
+        vert_face[topo.edge_v1[uncut]] = face_a[uncut]
+        interior = (~touched) & (vert_face >= 0)
+        v_count = np.bincount(chart[vert_face[interior]], minlength=n_tris)
+
+        broken = (f_count > 0) & ((f_count - u_count + v_count) != 1)
+        if not broken.any():
+            break
+
+        promoted = np.zeros(n_tris, dtype=np.int64)
+        changed = False
+        for chart_id in np.flatnonzero(broken).tolist():
+            members = np.flatnonzero((chart == chart_id) & is_rep)
+            if members.size < 2:
+                continue
+            points = poly_centre[members]
+            centred = points - points.mean(axis=0)
+            try:
+                axis = np.linalg.eigh(centred.T @ centred)[1][:, -1]
+            except np.linalg.LinAlgError:  # pragma: no cover - defensive
+                axis = np.array([1.0, 0.0, 0.0])
+            order = np.argsort(centred @ axis, kind="stable")
+            promoted[members[order[members.size // 2:]]] = next_label
+            next_label += 1
+            changed = True
+        if not changed:
+            break
+        moved = promoted[group]
+        tri_label = np.where(moved > 0, moved, tri_label)
+    return seam
+
+
+def _absorb_slivers(
+    tri_label: np.ndarray,
+    topo: "seam_mod.EdgeTopology",
+    manifold: np.ndarray,
+    mf_a: np.ndarray,
+    mf_b: np.ndarray,
+    min_area_share: float,
+) -> np.ndarray:
+    """Merge every under-sized chart into its largest neighbour.
+
+    Charts are the connected components of the same-label face graph, so a
+    cluster that lands in three places is three charts and only the big one is
+    worth its own island.  Merging is done by relabelling the small chart's
+    faces to the neighbour's label, which merges exactly those two components --
+    a distant component that happens to share the label stays separate, because
+    charts are defined by adjacency, not by label.
+
+    Args:
+        tri_label: ``(T,)`` current label per triangle.
+        topo: Prebuilt edge topology.
+        manifold: Indices of the manifold mesh edges.
+        mf_a: First incident face of each manifold edge.
+        mf_b: Second incident face of each manifold edge.
+        min_area_share: Threshold as a fraction of the mean chart area.
+
+    Returns:
+        A new ``(T,)`` label array.
+    """
+    labels = np.array(tri_label, dtype=np.int64, copy=True)
+    areas = np.asarray(topo.areas, dtype=np.float64)
+    n_tris = topo.n_tris
+    for _ in range(_CHART_ABSORB_ROUNDS):
+        cross = labels[mf_a] != labels[mf_b]
+        uncut = manifold[~cross]
+        chart = _label_components(
+            n_tris,
+            np.concatenate([topo.face_a[uncut], topo.diag_a]),
+            np.concatenate([topo.face_b[uncut], topo.diag_b]),
+        )
+        chart_area = np.bincount(chart, weights=areas, minlength=n_tris)
+        live = chart_area > 0.0
+        if int(live.sum()) < 2:
+            return labels
+        small = live & (chart_area < chart_area[live].mean() * min_area_share)
+        if not small.any():
+            return labels
+
+        cut = manifold[cross]
+        side_a, side_b = chart[topo.face_a[cut]], chart[topo.face_b[cut]]
+        # For every small chart, the adjacent chart with the largest area wins.
+        donor = np.where(small[side_a], side_a, side_b)
+        host = np.where(small[side_a], side_b, side_a)
+        usable = (small[side_a] | small[side_b]) & (side_a != side_b)
+        donor, host = donor[usable], host[usable]
+        if donor.size == 0:
+            return labels
+        order = np.lexsort((chart_area[host], donor))
+        donor, host = donor[order], host[order]
+        keep = np.empty(donor.size, dtype=bool)
+        keep[-1] = True
+        keep[:-1] = donor[1:] != donor[:-1]  # last of each run = largest host
+        donor, host = donor[keep], host[keep]
+
+        # A chain of merges (small -> small -> big) is resolved next round.
+        target = np.arange(n_tris, dtype=np.int64)
+        target[donor] = host
+        move = target[chart] != chart
+        if not move.any():
+            return labels
+        # Every face of a donor chart takes its host's label.  All faces of one
+        # chart carry the same label by construction, so this scatter is
+        # well-defined whichever representative lands last.
+        chart_label = np.zeros(n_tris, dtype=np.int64)
+        chart_label[chart] = labels
+        labels = np.where(move, chart_label[target[chart]], labels)
+    return labels
+
+
+def chart_cut_request(params: UnwrapParams) -> tuple[int, int] | None:
+    """Return ``(clusters, seed)`` when ``params`` asks for a chart cut.
+
+    The request travels in ``params.extra``, which already participates in
+    :meth:`UnwrapParams.signature`, so two chart recipes differing only in their
+    cluster count de-duplicate correctly.  Projection methods ignore seams
+    entirely, so a chart request on one of them is meaningless and is refused
+    here rather than silently producing a duplicate of the plain recipe.
+    """
+    if params.method not in _SEAM_DRIVEN:
+        return None
+    extra = params.extra if isinstance(params.extra, dict) else {}
+    raw = extra.get(CHART_CUT_KEY)
+    if raw is None:
+        return None
+    try:
+        clusters = int(raw)
+        seed = int(extra.get(CHART_SEED_KEY, 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if clusters < 1:
+        return None
+    return clusters, seed
+
+
+class _CutCache:
+    """Memoises chart cuts within one generation run.
+
+    A ten-slot grid on a closed mesh asks for several chart cuts and the refill
+    rounds ask again; recomputing a cut per request would repeat the clustering
+    and the bisection loop for nothing.
+    """
+
+    __slots__ = ("_sample", "_topo", "_cache")
+
+    def __init__(self, sample: UVMeshSample, topo: "seam_mod.EdgeTopology") -> None:
+        self._sample = sample
+        self._topo = topo
+        self._cache: dict[tuple[int, int], np.ndarray | None] = {}
+
+    def get(self, clusters: int, seed: int) -> np.ndarray | None:
+        """Return the cut for ``(clusters, seed)``, or ``None`` if it raised.
+
+        An *empty* cut is a legitimate answer, not a failure: a mesh that is
+        already one disk -- a plane, a grid, an open shell -- needs no seams at
+        all.  A closed mesh cannot come back empty, because the bisection loop
+        only stops once every chart has ``chi == 1`` and a closed component
+        starts at 2.
+        """
+        key = (int(clusters), int(seed))
+        if key not in self._cache:
+            try:
+                mask = chart_seams(
+                    self._sample, self._topo, clusters=key[0], seed=key[1]
+                )
+            except Exception:  # noqa: BLE001 - a cut failure must not kill the run
+                mask = None
+            self._cache[key] = mask
+        return self._cache[key]
 
 
 def repair_recipe(
@@ -258,18 +682,26 @@ def repair_recipe(
 ) -> tuple[UnwrapParams, str]:
     """Rewrite a recipe that provably cannot work on *this* mesh.
 
-    A closed surface has no boundary, so a seam-driven solver given an empty
-    seam set has no disk to flatten and simply gives up -- and, because Blender
-    reports success anyway (see :func:`dead_layout_reason`), the slot is wasted
-    silently.  On an icosphere that was six of ten slots.
+    Two cases are provably dead before a solver is ever started:
 
-    Rather than let the artist pay for dead slots, escalate the seam strategy to
-    ``DUAL_GRAPH``, which is guaranteed to produce a cut on a closed component
-    because it cuts the complement of a spanning forest of the face dual graph.
+    * **A closed surface with an empty seam set.**  There is no boundary, so a
+      seam-driven solver has no disk to flatten and gives up -- and, because
+      Blender reports success anyway (see :func:`dead_layout_reason`), the slot
+      is wasted silently.  On a UV sphere that was six of ten slots.
+    * **``EXISTING`` on a mesh with no marked seams.**  The recipe's entire
+      premise -- "respect what the artist marked" -- is void, and what comes back
+      is either the same dead layout or, on an open mesh, a single sheet
+      stretched over the whole model (measured L2 stretch of 50 on Suzanne).
 
-    This is deliberately conservative: it only fires when the strategy yields
-    *no* seams at all on a mesh with *no* boundary, which is exactly the case
-    that cannot succeed.  Anything that might work is left untouched.
+    Both escalate to a :func:`chart_seams` cut, which is guaranteed to open every
+    component into disks.  The cluster count and rotation are derived from the
+    recipe's own signature, so several recipes escalating in one run produce
+    genuinely *different* charts instead of collapsing onto one layout and being
+    de-duplicated away.
+
+    Anything that might work is left untouched -- in particular ``NONE`` on an
+    open surface, which is the legitimate "flatten the whole thing as one sheet"
+    control case.
 
     Args:
         params: The recipe to check.
@@ -283,10 +715,13 @@ def repair_recipe(
         return params, ""
     if sample.n_edges == 0:
         return params, ""
+    if chart_cut_request(params) is not None:
+        return params, ""
     try:
-        if bool(topo.boundary_mask().any()):
-            # An open surface can always be flattened without extra cuts.
-            return params, ""
+        # ``boundary_mask`` is a property, not a method -- calling it used to
+        # raise TypeError straight into the except below, which silently
+        # disabled this whole repair path.
+        closed = not bool(np.asarray(topo.boundary_mask).any())
         mask = seam_mod.compute_seams(
             sample,
             params.seam_strategy,
@@ -295,20 +730,26 @@ def repair_recipe(
             existing=sample.edge_seam,
             seed=params.seed,
         )
-        if bool(np.asarray(mask).any()):
-            return params, ""
+        empty = not bool(np.asarray(mask).any())
     except Exception:  # noqa: BLE001 - a probe failure must not kill the run
         return params, ""
 
-    # Derive a distinct seed from the original recipe so that several recipes
-    # escalating at once produce *different* dual-graph cuts instead of
-    # collapsing onto one identical signature and being de-duplicated away.
-    # Different seeds give genuinely different (and equally valid) cut sets.
-    spread = int(params.signature()[:8], 16) & 0x3FFFFFFF
+    if not empty:
+        return params, ""
+    if not closed and params.seam_strategy != "EXISTING":
+        # An open surface can be flattened without extra cuts; only EXISTING is
+        # escalated there, because "keep nothing" is not a recipe.
+        return params, ""
+
+    spread = int(params.signature()[:8], 16)
+    clusters = _CHART_CLUSTERS[spread % len(_CHART_CLUSTERS)]
+    extra = dict(params.extra) if isinstance(params.extra, dict) else {}
+    extra[CHART_CUT_KEY] = int(clusters)
+    extra[CHART_SEED_KEY] = int((spread >> 8) & 0xFFFF) + 1
     return (
-        params.replace(seam_strategy="DUAL_GRAPH", seed=spread),
-        "%s yields no seams on a closed mesh; escalated to DUAL_GRAPH"
-        % params.seam_strategy,
+        params.replace(seam_strategy="EXISTING", extra=extra),
+        "%s yields no seams%s; escalated to a %d-chart cut"
+        % (params.seam_strategy, " on a closed mesh" if closed else "", clusters),
     )
 
 
@@ -366,6 +807,7 @@ def _run_recipes(
             return report
 
         topo = seam_mod.build_edge_topology(sample)
+        cuts = _CutCache(sample, topo)
         total = max(len(recipes), 1)
         # Tracks the last layout a backend produced, so a solver that
         # silently does nothing and inherits it can be detected.
@@ -413,8 +855,24 @@ def _run_recipes(
                 report.failures.append((params, "%s: %s" % (backend_id, why_not)))
                 continue
 
+            # A chart-cut recipe carries its seams in the sample rather than in
+            # a strategy name: the backend stamps ``sample.edge_seam`` when the
+            # strategy is EXISTING, so handing it a re-seamed copy is all it
+            # takes.  The mesh itself is untouched -- the sample is a value.
+            request_sample = sample
+            wanted_cut = chart_cut_request(params)
+            if wanted_cut is not None:
+                mask = cuts.get(*wanted_cut)
+                if mask is None:
+                    report.failures.append(
+                        (params, "chart cut (%d clusters) could not be computed"
+                         % wanted_cut[0])
+                    )
+                    continue
+                request_sample = sample.with_seams(mask)
+
             result = backend.safe_unwrap(
-                UnwrapRequest(obj_name=obj.name, params=params, sample=sample)
+                UnwrapRequest(obj_name=obj.name, params=params, sample=request_sample)
             )
             if not result.ok or result.uvs is None:
                 report.failures.append((params, result.message or "backend failed"))

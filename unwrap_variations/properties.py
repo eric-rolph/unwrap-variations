@@ -741,14 +741,19 @@ def on_active_object_changed() -> None:
     buttons the operators then quite correctly refuse to act on.  Resyncing on
     the change is the only way the two views can agree.
 
-    Registered through ``bpy.msgbus`` rather than a depsgraph handler on
-    purpose: the message bus fires on the specific RNA change (the view layer's
-    active object) and is allowed to write, whereas resyncing from
-    ``depsgraph_update_post`` writes scene data from inside a depsgraph
-    evaluation and can re-trigger itself.
+    Driven from **two** places, because neither is sufficient alone.
+    ``bpy.msgbus`` fires when the user clicks an object in the viewport or the
+    outliner, which is the common case, but a programmatic
+    ``view_layer.objects.active = obj`` does not publish and so never notifies.
+    The depsgraph handler covers exactly that gap.  Both funnel through this
+    one function, and the name comparison below makes the duplicate call free.
 
-    Never raises: a message-bus callback that throws is reported on every
-    selection click for the rest of the session.
+    That comparison is also what stops the depsgraph route from looping:
+    writing the mirror list tags the scene, which schedules another depsgraph
+    update, whose call finds the name already matching and returns immediately.
+
+    Never raises: a callback that throws here is reported on every selection
+    click for the rest of the session.
     """
     try:
         context = bpy.context
@@ -764,6 +769,19 @@ def on_active_object_changed() -> None:
         _LOG.debug("mirror list re-pointed at %r", name or "<nothing>")
     except Exception:  # noqa: BLE001 - a notify callback must never raise.
         _LOG.debug("active-object resync failed", exc_info=True)
+
+
+@persistent
+def _on_depsgraph_update(_scene: Any, _depsgraph: Any = None) -> None:
+    """Catch active-object changes the message bus does not publish.
+
+    Selecting a different object from a script -- which is what an artist's own
+    tooling, and every add-on that calls ``view_layer.objects.active = obj``,
+    actually does -- updates the RNA without notifying the message bus.  This
+    handler is the backstop; see :func:`on_active_object_changed` for why the
+    write it may trigger cannot loop.
+    """
+    on_active_object_changed()
 
 
 def _subscribe_active_object() -> None:
@@ -811,29 +829,43 @@ def _on_load_post(_dummy: Any) -> None:
     _LOG.debug("cleared candidate caches on file load")
 
 
+#: ``(handler list attribute, function)`` pairs installed by this module.
+_HANDLERS: tuple[tuple[str, Any], ...] = (
+    ("load_post", _on_load_post),
+    ("depsgraph_update_post", _on_depsgraph_update),
+)
+
+
 def _install_handlers() -> None:
-    """Add the file-load handler exactly once and open the message-bus subscription."""
-    handlers = bpy.app.handlers.load_post
-    if _on_load_post not in handlers:
-        handlers.append(_on_load_post)
+    """Add each handler exactly once and open the message-bus subscription."""
+    for attribute, function in _HANDLERS:
+        handlers = getattr(bpy.app.handlers, attribute, None)
+        if handlers is None:
+            continue
+        if function not in handlers:
+            handlers.append(function)
     _subscribe_active_object()
 
 
 def _remove_handlers() -> None:
-    """Remove the file-load handler and the message-bus subscription.
+    """Remove every handler this module installed, and the subscription.
 
     Compares by name as well as by identity because a module reload creates a
     *new* function object while the old one is still in the handler list, which
     is the classic way an add-on leaks a handler across F8.
     """
     _unsubscribe_active_object()
-    handlers = bpy.app.handlers.load_post
-    for handler in list(handlers):
-        if handler is _on_load_post or getattr(handler, "__name__", "") == "_on_load_post":
-            try:
-                handlers.remove(handler)
-            except Exception:  # noqa: BLE001
-                _LOG.debug("could not remove load_post handler", exc_info=True)
+    for attribute, function in _HANDLERS:
+        handlers = getattr(bpy.app.handlers, attribute, None)
+        if handlers is None:
+            continue
+        name = getattr(function, "__name__", "")
+        for handler in list(handlers):
+            if handler is function or getattr(handler, "__name__", "") == name:
+                try:
+                    handlers.remove(handler)
+                except Exception:  # noqa: BLE001
+                    _LOG.debug("could not remove %s handler", attribute, exc_info=True)
 
 
 # ---------------------------------------------------------------------------

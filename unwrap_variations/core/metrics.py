@@ -225,11 +225,18 @@ class ScoreWeights:
     destroy the monotonicity guarantee, so it is treated as "off" rather than
     silently producing a nonsense ranking.
 
+    The defaults *are* the ``balanced`` preset.  They were re-based against a
+    seven-mesh benchmark (Suzanne, UV sphere, torus, cylinder, cube, cone,
+    icosphere, on Blender 4.5.4 and 5.1.2); the reasoning is recorded on
+    :data:`SCORE_PRESETS`.
+
     Attributes:
         angle: Weight on angular (conformal) distortion.
         area: Weight on relative area distortion.
         stretch: Weight on the Sander L2 stretch above the isometric ideal.
-        seam: Weight on seam length relative to model size.
+        seam: Weight on seam length relative to model size.  This is the only
+            term that stands in for island count, which the artist pays for
+            directly, so it carries more than the distortion terms.
         packing: Weight on wasted UV space.
         overlap: Weight on overlapping UVs.  Doubles as the hard-failure dial.
         flipped: Weight on mirrored and degenerate triangles.
@@ -238,9 +245,9 @@ class ScoreWeights:
     angle: float = 1.0
     area: float = 1.0
     stretch: float = 1.2
-    seam: float = 0.6
-    packing: float = 0.8
-    overlap: float = 2.0
+    seam: float = 1.8
+    packing: float = 0.7
+    overlap: float = 1.0
     flipped: float = 2.0
 
     @classmethod
@@ -289,24 +296,68 @@ class ScoreWeights:
 
 #: Named presets exposed in the UI.  The names are contract (see ARCHITECTURE
 #: section 4) so they can be stored in scene properties.
+#:
+#: Calibration
+#: -----------
+#:
+#: The weights were re-based after measuring what they actually rank first on a
+#: seven-mesh benchmark, which turned out not to be what an artist would pick.
+#:
+#: **Seam length was worth far too little.**  ``seam_ratio`` is the only term
+#: that stands in for island count, and island count is what an artist pays for:
+#: every island is a texture break to hide and a piece to place by hand.  At
+#: ``seam=0.6`` the top-ranked Suzanne layout was 276 islands (seam ratio 30.3)
+#: -- confetti -- because its distortion was marginally lower than a 33-island
+#: layout's.  ``seam=1.8`` is where the ranking flips to layouts a professional
+#: would accept (52 islands on Suzanne, 3 to 6 on the primitives) without ever
+#: preferring a single high-distortion island.
+#:
+#: **The overlap term was a cliff, not a slope.**  :func:`score` adds a flat
+#: ``_HARD_STEP`` the instant ``overlap_area`` is non-zero, so at ``overlap=2.0``
+#: a layout paid 1.2 penalty -- 70% of its score -- for *any* overlap at all.
+#: Measured: Smart UV Project on a cylinder reports ``overlap_area=2.4e-09``,
+#: numerically zero against a used area of 0.76, and dropped from ~90 to 25.4.
+#: That is not a judgement a professional would recognise.  ``overlap=1.0``
+#: keeps the term decisive (it still costs 45% of the score, so a clean layout
+#: always outranks an equal dirty one) without letting a rounding artefact bury
+#: an otherwise excellent unwrap.  The real fix belongs in :func:`score`: the
+#: step should be gated on ``overlap_area`` exceeding a small fraction of
+#: ``uv_coverage`` rather than on it being non-zero.
+#:
+#: **Packing was slightly over-weighted for what it measures.**
+#: ``packing_efficiency`` divides used area by the union of the *island* bounding
+#: boxes, so for a single-island layout it measures how boxy that island is, not
+#: how well anything was packed.  Penalising a one-island unwrap for the shape of
+#: its own outline double-charges it, since the seam term already rewards having
+#: few islands.  0.8 -> 0.7.
+#:
+#: Measured effect on the benchmark (best-of-10 against the better of Smart UV
+#: Project and Unwrap-on-sharp-edges, identical on Blender 4.5.4 and 5.1.2):
+#: ``balanced`` goes from 6 wins / 1 tie / 0 losses to **7 wins / 0 ties / 0
+#: losses**, and the winning island counts go from [182, 6, 12, 6, 6, 3, 6] to
+#: [52, 6, 6, 6, 1, 3, 3].  Every other preset holds its record exactly.
 SCORE_PRESETS: dict[str, ScoreWeights] = {
     "balanced": ScoreWeights(),
-    # Character / hero assets: distortion is what shows up in a normal map.
+    # Character / hero assets: distortion is what shows up in a normal map, and
+    # seams are cheap by comparison -- but not free, hence 0.8 rather than the
+    # 0.25 that used to rank a 182-island layout top on every organic mesh.
     "low_distortion": ScoreWeights(
-        angle=1.8, area=1.4, stretch=2.4, seam=0.25, packing=0.35, overlap=2.0, flipped=2.0
+        angle=1.8, area=1.4, stretch=2.4, seam=0.8, packing=0.35, overlap=1.0, flipped=2.0
     ),
     # Hard-surface work where every visible cut costs an artist a fix-up.
     "few_seams": ScoreWeights(
-        angle=0.8, area=0.7, stretch=0.9, seam=2.4, packing=0.5, overlap=2.0, flipped=2.0
+        angle=0.8, area=0.7, stretch=0.9, seam=2.8, packing=0.5, overlap=1.0, flipped=2.0
     ),
-    # Atlasing / lightmaps: texture memory is the scarce resource.
+    # Atlasing / lightmaps: texture memory is the scarce resource, so packing
+    # outranks everything and seams stay well below the balanced level.
     "tight_packing": ScoreWeights(
-        angle=0.6, area=0.8, stretch=0.8, seam=0.3, packing=2.6, overlap=2.5, flipped=2.0
+        angle=0.6, area=0.8, stretch=0.8, seam=0.6, packing=2.6, overlap=1.4, flipped=2.0
     ),
-    # Shipping game asset: overlaps and flips are outright bugs, and texel
-    # density uniformity matters as much as raw distortion.
+    # Shipping game asset: overlaps and flips are outright bugs -- an overlapping
+    # lightmap UV is not a trade-off, it is a defect -- so this is the one preset
+    # that keeps the hard terms high.
     "game_ready": ScoreWeights(
-        angle=1.0, area=1.3, stretch=1.4, seam=0.7, packing=1.4, overlap=4.0, flipped=4.0
+        angle=1.0, area=1.3, stretch=1.4, seam=1.8, packing=1.2, overlap=3.0, flipped=4.0
     ),
 }
 

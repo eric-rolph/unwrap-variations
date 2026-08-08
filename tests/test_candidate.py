@@ -538,21 +538,16 @@ def _blob_with_entry(entry: dict, *, loop_count: int = 12) -> bytes:
     return STORE_MAGIC + struct.pack("<I", STORE_VERSION) + zlib.compress(inner, 1)
 
 
-_NON_FINITE_REASON = (
-    "BUG in core/candidate.py Candidate.from_header_dict: index, generation and "
-    "score are converted with bare int()/float() outside any try. "
-    "int(float('inf')) raises OverflowError, and float() of a JSON integer "
-    "literal too large for a double raises OverflowError too. Same class as the "
-    "ParamSpec.clamp bug that was just fixed. The metrics sub-dict IS guarded "
-    "(broad `except Exception`), so only these three scalars are exposed. "
-    "Consequence: CandidateStore.load_from_id -- documented as returning False "
-    "on unreadable data and never raising -- propagates OverflowError straight "
-    "out of the .blend load path. Fix: coerce through a helper that catches "
-    "(TypeError, ValueError, OverflowError) and falls back to the default."
-)
+# Regression guard. `Candidate.from_header_dict` once converted index,
+# generation and score with bare int()/float() outside any guard, so a stored
+# `Infinity` (json emits and accepts it) or a 400-digit integer literal raised
+# OverflowError -- neither a TypeError nor a ValueError -- straight out of
+# `CandidateStore.load_from_id`, which is documented as returning False on
+# unreadable data and never raising. That made a corrupt header break opening
+# the .blend entirely. Fixed by coercing through helpers that catch
+# OverflowError; these tests keep it fixed.
 
 
-@pytest.mark.xfail(reason=_NON_FINITE_REASON, raises=OverflowError, strict=False)
 @pytest.mark.parametrize(
     "payload",
     [
@@ -571,7 +566,6 @@ def test_from_header_dict_contains_non_finite_scalars(payload):
     assert isinstance(c.score, float)
 
 
-@pytest.mark.xfail(reason=_NON_FINITE_REASON, raises=OverflowError, strict=False)
 @pytest.mark.parametrize(
     "entry",
     [
