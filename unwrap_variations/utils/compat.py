@@ -251,8 +251,9 @@ def pack_islands(**kwargs: Any) -> tuple[bool, str]:
     if ok:
         return True, ""
     if not IS_50_OR_NEWER and "CANCELLED" in message:
-        return False, "pack_islands unavailable in this context (Blender %s); islands left unpacked" % (
-            version_string(),
+        return False, (
+            "pack_islands unavailable in this context (Blender %s); "
+            "islands left unpacked" % version_string()
         )
     return False, "pack_islands failed: %s" % message
 
@@ -294,7 +295,9 @@ def read_uv_layer(layer: Any, *, out: np.ndarray | None = None) -> np.ndarray:
     try:
         layer.data.foreach_get("uv", flat)
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError("cannot read UV layer %r: %s" % (getattr(layer, "name", "?"), exc))
+        raise RuntimeError(
+            "cannot read UV layer %r: %s" % (getattr(layer, "name", "?"), exc)
+        ) from exc
     return _shape_uv(flat, out)
 
 
@@ -498,7 +501,10 @@ class object_mode:
             return False
 
 
-def tag_redraw(context: Any = None, area_types: Sequence[str] = ("VIEW_3D", "IMAGE_EDITOR")) -> None:
+def tag_redraw(
+    context: Any = None,
+    area_types: Sequence[str] = ("VIEW_3D", "IMAGE_EDITOR"),
+) -> None:
     """Request a redraw of the areas that show candidate state.
 
     Args:

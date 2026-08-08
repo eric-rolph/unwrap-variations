@@ -50,10 +50,19 @@ _ADDON_VERSION = (0, 1, 0)
 #: predates extensions; deleted (see above) by 4.2+, which uses
 #: ``blender_manifest.toml``.  The version must be kept in step with the
 #: manifest and with pyproject.toml.
+#:
+#: **Every value here must be a literal.**  ``addon_utils.modules()`` populates
+#: the Add-ons list without importing anything: it locates the ``bl_info``
+#: assignment in the *source text* and runs ``ast.literal_eval`` on it.  A
+#: reference to a constant -- even one defined three lines above -- makes that
+#: raise ``ValueError: malformed node``, and the add-on then shows up in
+#: Blender's list with no name, no description and no version.  Hence the
+#: duplication with ``_ADDON_NAME``/``_ADDON_VERSION`` above, which must be
+#: kept in step by hand.
 bl_info = {
-    "name": _ADDON_NAME,
+    "name": "Unwrap Variations",
     "author": "Eric Rolph",
-    "version": _ADDON_VERSION,
+    "version": (0, 1, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport and UV Editor > Sidebar > UV Variations",
     "description": "Generate, score and compare many UV unwraps side by side",

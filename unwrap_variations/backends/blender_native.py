@@ -98,6 +98,40 @@ SOLVER_METHODS = ("ANGLE_BASED", "CONFORMAL", "MINIMUM_STRETCH")
 #: Methods that project rather than solve, and therefore ignore seams entirely.
 PROJECTION_METHODS = ("SMART_PROJECT", "CUBE_PROJECT")
 
+#: ``rotate_method`` handed to ``bpy.ops.uv.pack_islands``.
+#:
+#: This is a **performance** choice, measured rather than guessed.  Blender's
+#: packer runs a rotation search per island inside a binary search over scale,
+#: and that search -- not the unwrap solver -- dominates generation time.
+#: Measured on Blender 4.5.4, ten meshes (cube/cone/cylinder/torus/Suzanne, each
+#: unwrapped both ways), summing the ``pack_islands`` call only:
+#:
+#: ===================  ==========  ==============
+#: ``rotate_method``    total time  mean coverage
+#: ===================  ==========  ==============
+#: ``AXIS_ALIGNED_X``       1.13 s          0.681
+#: ``AXIS_ALIGNED_Y``       5.49 s          0.679
+#: ``CARDINAL``            25.06 s          0.719
+#: ``ANY``                 26.12 s          0.694
+#: ``AXIS_ALIGNED``        26.29 s          0.694
+#: ===================  ==========  ==============
+#:
+#: ``AXIS_ALIGNED_X`` is ~23x faster than ``ANY`` for ~2% less mean packing
+#: coverage, and it also defuses a pathological case: a cone packed with
+#: ``margin_method='FRACTION'`` takes 31.8 s under ``ANY`` and 0.29 s here.
+#: Since the whole point of this add-on is generating ten candidates and
+#: comparing them, a 23x speedup at 2% coverage is the right trade -- but it is
+#: a trade, so a recipe can opt back into maximum quality with
+#: ``params.extra["pack_rotate_method"] = "ANY"``.  ``extra`` participates in
+#: :meth:`UnwrapParams.signature`, so overriding it still de-duplicates
+#: correctly.
+DEFAULT_PACK_ROTATE_METHOD = "AXIS_ALIGNED_X"
+
+#: Legal ``rotate_method`` identifiers for ``uv.pack_islands`` (a superset of
+#: :data:`unwrap_variations.core.params.ROTATE_METHODS`).
+PACK_ROTATE_METHODS = ("ANY", "CARDINAL", "AXIS_ALIGNED", "AXIS_ALIGNED_X",
+                       "AXIS_ALIGNED_Y")
+
 #: Names of the boolean mesh attributes that carry UV selection and pinning.
 #: Blender 4.5 stores them per UV map as ``.vs.<name>`` / ``.es.<name>`` /
 #: ``.pn.<name>``; Blender 5.x replaced those with single global layers.  Both
@@ -596,15 +630,20 @@ def _pack_islands(bpy: ModuleType, params: UnwrapParams, notes: _Notes) -> bool:
     3. If packing genuinely cannot run, record a note and carry on: an unpacked
        layout is a worse candidate, not an invalid one.
 
-    ``rotate_method`` is deliberately pinned to ``ANY`` rather than taken from
+    ``rotate_method`` comes from :data:`DEFAULT_PACK_ROTATE_METHOD` (see there
+    for the measurements behind that choice), overridable per recipe through
+    ``params.extra["pack_rotate_method"]``.  It is deliberately *not* taken from
     :attr:`UnwrapParams.rotate_method`, which the parameter space scopes to
-    Smart Project only.  Feeding it in here would let two recipes that hash to
+    Smart Project only: feeding that in here would let two recipes which hash to
     the same signature produce different UVs, breaking grid de-duplication.
     """
+    extra = params.extra if isinstance(params.extra, dict) else {}
+    rotate_method = _enum(extra.get("pack_rotate_method", DEFAULT_PACK_ROTATE_METHOD),
+                          PACK_ROTATE_METHODS, DEFAULT_PACK_ROTATE_METHOD)
     kwargs: dict[str, Any] = {
         "udim_source": "CLOSEST_UDIM",
         "rotate": bool(params.pack_rotate),
-        "rotate_method": "ANY",
+        "rotate_method": rotate_method,
         "scale": True,
         "merge_overlap": False,
         "margin_method": _enum(params.margin_method, MARGIN_METHODS, "SCALED"),

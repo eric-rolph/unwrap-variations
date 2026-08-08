@@ -88,9 +88,8 @@ class UVVAR_OT_clear_candidates(Operator):
         if props is not None and len(props.candidates):
             return True
         try:
-            return uvvar_props.CandidateStore is not None and (
-                uvvar_props.CandidateStore.ID_KEY in obj.data.keys()
-            )
+            store_cls = uvvar_props.CandidateStore
+            return store_cls is not None and obj.data.get(store_cls.ID_KEY) is not None
         except Exception:  # noqa: BLE001
             return False
 
@@ -190,7 +189,7 @@ class UVVAR_OT_clear_candidates(Operator):
         except Exception:  # noqa: BLE001
             key = "uvvar_store_v1"
         try:
-            if key in mesh.keys():
+            if mesh.get(key) is not None:
                 del mesh[key]
                 return True
         except Exception:  # noqa: BLE001

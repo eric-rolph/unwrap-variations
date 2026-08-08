@@ -45,6 +45,9 @@ __all__ = [
     "draw_candidate_grid",
     "draw_metric_readout",
     "draw_warnings",
+    "draw_empty_state",
+    "draw_object_state",
+    "region_width",
     "op_exists",
     "draw_op",
     "set_op_props",
@@ -196,21 +199,30 @@ def draw_prop(
     name: str,
     *,
     text: str | None = None,
+    optional: bool = False,
     **kwargs: Any,
 ) -> bool:
     """Draw a property widget, or a dimmed placeholder if the property is gone.
+
+    A missing *contract* property (ARCHITECTURE section 11) is worth surfacing,
+    so it leaves a greyed-out row that names what is absent.  A missing
+    *optional* property is not a fault, so it draws nothing at all rather than
+    littering the panel with dead rows.
 
     Args:
         layout: Layout to draw into.
         data: The property group (may be ``None``).
         name: Property identifier.
         text: Optional label override.
+        optional: Draw nothing when the property does not exist.
         **kwargs: Passed straight through to ``layout.prop``.
 
     Returns:
         ``True`` when a real widget was drawn.
     """
     if data is None or not hasattr(data, name):
+        if optional:
+            return False
         row = layout.row()
         row.enabled = False
         row.label(text=text if text is not None else name.replace("_", " ").title())
@@ -1036,7 +1048,9 @@ class UVVAR_PT_overlay(_UVVarViewportPanel, Panel):
                     )
                     set_op_props(op, action="SET_MODE", mode=name)
 
-            draw_prop(layout, props, "overlay_opacity", text="Opacity")
+            draw_prop(
+                layout, props, "overlay_opacity", text="Opacity", optional=True
+            )
 
             if stretch_overlay is not None:
                 stretch_overlay.draw_legend(layout, mode)

@@ -34,7 +34,7 @@ import time
 from typing import Any, Callable, Iterator
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty
+from bpy.props import BoolProperty, EnumProperty, IntProperty
 from bpy.types import Context, Event, Operator
 
 from .. import properties as uvvar_props

@@ -88,7 +88,8 @@ WEIGHT_PRESETS = (
     ("low_distortion", "Low Distortion", "Prefer faithful angles and areas over tight packing"),
     ("few_seams", "Few Seams", "Prefer fewer, shorter cuts even at some distortion cost"),
     ("tight_packing", "Tight Packing", "Prefer efficient use of the UV square"),
-    ("game_ready", "Game Ready", "Punish overlaps and flipped faces hard; favour even texel density"),
+    ("game_ready", "Game Ready",
+     "Punish overlaps and flipped faces hard; favour even texel density"),
 )
 
 #: Viewport overlay modes.
@@ -593,7 +594,8 @@ def sync_ui_list(scene: Scene | None, obj: Any, *, store: Any = None) -> int:
 
     weights = score_weights(props)
     try:
-        items = store.ranked(weights) if (weights is not None and props.sort_by_score) else store.all()
+        rank_it = weights is not None and props.sort_by_score
+        items = store.ranked(weights) if rank_it else store.all()
     except Exception:  # noqa: BLE001 - ranking must never break the panel.
         _LOG.debug("ranking failed; falling back to store order", exc_info=True)
         try:

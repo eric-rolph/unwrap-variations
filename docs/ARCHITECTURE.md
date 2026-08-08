@@ -24,6 +24,23 @@ These facts were probed empirically against **Blender 4.5.4 LTS** and
 | ID-property blobs | `mesh["key"] = bytes(...)` round-trips as `bytes` |
 | `gpu.shader.from_builtin` | available (overlay is feasible) |
 
+### Further probed facts (added as workers verified them)
+
+| Fact | Detail |
+| --- | --- |
+| **`uv.unwrap` lies about success** | Returns `{'FINISHED'}` even when it fails. On a closed mesh with no seams it prints `Unwrap failed to solve 1 of 1 island(s)` and **leaves the previous UVs untouched**. Never treat the operator return value as success -- detect a degenerate or unchanged UV buffer instead (`engine.dead_layout_reason`). A dead slot silently inherits its predecessor's layout. |
+| **4.5 cancels more than packing** | Headless on 4.5, `pack_islands`, `average_islands_scale` **and** `minimize_stretch` all return `CANCELLED`; all three return `FINISHED` on 5.1. |
+| **Raw operator cost is negligible** | Every `bpy.ops.uv.*` call is sub-millisecond on a small mesh, both versions. Any per-candidate cost above that is our own overhead. |
+| **`gpu.shader.from_builtin` names** | The `3D_`/`2D_` prefixed names (`'3D_SMOOTH_COLOR'`, `'2D_IMAGE'`) **do not exist** on 4.5 or 5.1 and raise `ValueError`. Valid on both: `FLAT_COLOR`, `IMAGE`, `IMAGE_COLOR`, `SMOOTH_COLOR`, `UNIFORM_COLOR`, `POLYLINE_*`, `POINT_*`. Resolve through a preference list, not a version branch. |
+| **`layout.progress()` exists on both** | But `hasattr(bpy.types.UILayout, "progress")` returns **False** -- `dir()` does not list RNA functions. Probe with `"progress" in bpy.types.UILayout.bl_rna.functions`. |
+| **GPU draw is unavailable headless** | `SystemError: GPU functions for drawing are not available in background mode`. Headless overlay tests must assert graceful degradation, not drawing. |
+| **Edit-mode meshes read empty** | In Edit Mode the original datablock reports a stale pre-edit triangle count and the evaluated object's `.data` has zero triangles. Only `evaluated.to_mesh()` returns real geometry. |
+| **ID-prop blobs survive save/reload** | Verified byte-identical at 1 KB, 1 MB, 4 MB, 16 MB and 64 MB on both versions, with a real `save_as_mainfile` + `open_mainfile`. |
+| **`layer.uv`/`"vector"` is 25-50x faster** | Than the legacy `layer.data`/`"uv"` alias (0.27 ms vs 22 ms at 1M loops). Not a style preference. |
+| **Reads that allocate** | Reading `layer.pin` *allocates* `.pn.<uv>` on 4.5, corrupting an in-progress `uv_layers` iteration. Writing all-false `hide` flags allocates `.hide_vert/.hide_edge/.hide_poly` on 5.1. Read through `mesh.attributes` instead. |
+| **Stale layer pointers** | Cached `MeshUVLoopLayer` pointers go stale across a removal on 4.5. Always re-resolve by name. |
+| **UV sidecar split** | 4.5 has `MeshUVLoopLayer.vertex_selection`/`.edge_selection`; **5.1 removed both** (moved to mesh-level `.uv_select_vert`/`_edge`/`_face`). `layer.pin` reports length 0 on 5.1 until allocated, where `foreach_get` raises `TypeError`. |
+
 ### Verified fast data paths (all `foreach_get`-able)
 
 ```python
@@ -378,6 +395,15 @@ candidate never aborts the run.
 | Clear | `uvvar.clear_candidates` | drop store + preview layer |
 | Overlay toggle | `uvvar.toggle_overlay` | stretch/checker viewport overlay |
 | Cycle | `uvvar.cycle_candidate` | next/prev preview (keymap-friendly) |
+| Overlay control | `uvvar.overlay_control` | set overlay mode/opacity (owned by `ui/stretch_overlay.py`) |
+| Checker material | `uvvar.checker_material` | apply/restore the procedural checker material |
+
+`uvvar.toggle_overlay` is the contract entry point and is implemented by
+`ui.stretch_overlay.sync_from_props(context)`; `uvvar.overlay_control` and
+`uvvar.checker_material` are the finer-grained operators behind it. All three
+are reserved in the `uvvar.` namespace -- do not redefine them elsewhere. Call
+`ui.stretch_overlay.invalidate()` after blitting a preview so the overlay
+rebuilds its batch.
 
 All operators: `bl_options = {"REGISTER", "UNDO"}` where mutating, correct
 `poll()`, and `self.report({"ERROR"}, ...)` + `return {"CANCELLED"}` instead of

@@ -163,7 +163,8 @@ def evaluate(sample: UVMeshSample, *, compute_overlap: bool = True) -> UVMetrics
 def _fallback_metrics(sample: object) -> UVMetrics:
     """Return the most honest record we can build when evaluation blew up."""
     try:
-        n_tris = int(np.asarray(sample.tri_verts).reshape(-1, 3).shape[0])  # type: ignore[attr-defined]
+        tris = np.asarray(sample.tri_verts)  # type: ignore[attr-defined]
+        n_tris = int(tris.reshape(-1, 3).shape[0])
     except Exception:  # noqa: BLE001
         n_tris = 0
     return UVMetrics.empty(n_tris=n_tris, degenerate_tris=n_tris)
@@ -473,7 +474,9 @@ def _stretch_metrics(
     )
 
 
-def _triangle_angles(e: np.ndarray, f: np.ndarray, g: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _triangle_angles(
+    e: np.ndarray, f: np.ndarray, g: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return the three interior angles (radians) of triangles given ``E,F,G``.
 
     Squared side lengths are ``E`` (corner 0 to 1), ``G`` (corner 0 to 2) and
@@ -1061,12 +1064,14 @@ def _overlap_area(
     pair_a = packed // n_tris
     pair_b = packed - pair_a * n_tris
 
-    # Cheap bounding-box rejection before any geometry.
+    # Cheap bounding-box rejection before any geometry.  The comparison is
+    # strict: boxes that merely touch along a line bound triangles that can at
+    # most touch, and touching contributes no area.
     keep = (
-        (lo[pair_a, 0] <= hi[pair_b, 0])
-        & (lo[pair_b, 0] <= hi[pair_a, 0])
-        & (lo[pair_a, 1] <= hi[pair_b, 1])
-        & (lo[pair_b, 1] <= hi[pair_a, 1])
+        (lo[pair_a, 0] < hi[pair_b, 0])
+        & (lo[pair_b, 0] < hi[pair_a, 0])
+        & (lo[pair_a, 1] < hi[pair_b, 1])
+        & (lo[pair_b, 1] < hi[pair_a, 1])
     )
     pair_a = pair_a[keep]
     pair_b = pair_b[keep]
@@ -1074,12 +1079,17 @@ def _overlap_area(
         return 0.0
 
     oriented = _orient_ccw(uv)
+    tri_scale = np.maximum(hi[:, 0] - lo[:, 0], hi[:, 1] - lo[:, 1])
     area_eps = 1e-12 * max(total_uv_area, _TINY)
     accumulated = 0.0
     for start in range(0, pair_a.size, _OVERLAP_CHUNK):
         stop = min(start + _OVERLAP_CHUNK, pair_a.size)
+        sub_a = pair_a[start:stop]
+        sub_b = pair_b[start:stop]
         areas = _pair_intersection_area(
-            oriented[pair_a[start:stop]], oriented[pair_b[start:stop]]
+            oriented[sub_a],
+            oriented[sub_b],
+            scale=np.maximum(tri_scale[sub_a], tri_scale[sub_b]),
         )
         accumulated += float(areas[areas > area_eps].sum())
 
@@ -1153,12 +1163,17 @@ def _orient_ccw(uv: np.ndarray) -> np.ndarray:
     return out
 
 
-def _pair_intersection_area(tri_a: np.ndarray, tri_b: np.ndarray) -> np.ndarray:
+def _pair_intersection_area(
+    tri_a: np.ndarray, tri_b: np.ndarray, scale: np.ndarray | None = None
+) -> np.ndarray:
     """Return the exact intersection area of matched CCW triangle pairs.
 
     Args:
         tri_a: ``(N, 3, 2)`` counter-clockwise triangles.
         tri_b: ``(N, 3, 2)`` counter-clockwise triangles.
+        scale: Optional ``(N,)`` characteristic length per pair, used to set the
+            relative tolerance.  Callers that already know each triangle's
+            extent pass it in to avoid a reduction over the ``(N, 3, 2)`` block.
 
     Returns:
         ``(N,)`` intersection areas, ``0.0`` where the pair does not overlap.
@@ -1167,46 +1182,86 @@ def _pair_intersection_area(tri_a: np.ndarray, tri_b: np.ndarray) -> np.ndarray:
     if n == 0:
         return np.zeros(0, dtype=np.float64)
 
-    da = np.roll(tri_a, -1, axis=1) - tri_a
-    db = np.roll(tri_b, -1, axis=1) - tri_b
-    scale = np.maximum(np.abs(da).max(axis=(1, 2)), np.abs(db).max(axis=(1, 2)))
-    scale = np.where(scale > 0.0, scale, 1.0)
-    tol = (1e-12 * scale * scale)[:, None]
-
-    # Signed distance of every corner of one triangle from every edge of the
-    # other.  These 18 cross products answer both questions we need: which
-    # corners are contained, and whether an edge separates the pair.
-    cross_ab = _edge_cross(tri_a, tri_b, db)
-    cross_ba = _edge_cross(tri_b, tri_a, da)
-
-    separated = (cross_ab <= tol[:, :, None]).all(axis=1).any(axis=1)
-    separated |= (cross_ba <= tol[:, :, None]).all(axis=1).any(axis=1)
-    if separated.all():
-        return np.zeros(n, dtype=np.float64)
-
-    a_in_b = (cross_ab >= -tol[:, :, None]).all(axis=2)
-    b_in_a = (cross_ba >= -tol[:, :, None]).all(axis=2)
-
-    if separated.any():
-        live = np.flatnonzero(~separated)
-        areas = _clip_area(
-            tri_a[live], tri_b[live], da[live], db[live],
-            a_in_b[live], b_in_a[live], tol[live],
+    da = tri_a[:, [1, 2, 0], :] - tri_a
+    db = tri_b[:, [1, 2, 0], :] - tri_b
+    if scale is None:
+        scale = np.maximum(
+            np.abs(da).max(axis=(1, 2)), np.abs(db).max(axis=(1, 2))
         )
-        out = np.zeros(n, dtype=np.float64)
-        out[live] = areas
-        return out
-    return _clip_area(tri_a, tri_b, da, db, a_in_b, b_in_a, tol)
+    scale = np.where(scale > 0.0, scale, 1.0)
+    tol = 1e-12 * scale * scale
+
+    live = _sat_survivors(tri_a, tri_b, da, db, tol)
+    if live.size == 0:
+        return np.zeros(n, dtype=np.float64)
+    if live.size == n:
+        return _clip_area(tri_a, tri_b, da, db, tol)
+    out = np.zeros(n, dtype=np.float64)
+    out[live] = _clip_area(tri_a[live], tri_b[live], da[live], db[live], tol[live])
+    return out
+
+
+def _sat_survivors(
+    tri_a: np.ndarray,
+    tri_b: np.ndarray,
+    da: np.ndarray,
+    db: np.ndarray,
+    tol: np.ndarray,
+) -> np.ndarray:
+    """Return indices of pairs that no edge of either triangle separates.
+
+    Two convex polygons are disjoint if and only if some edge of one of them is
+    a separating axis, so six half-plane tests settle the question -- far
+    cheaper than constructing the intersection polygon.  Touching counts as
+    separated (the comparison is ``<= +tol``), which is what makes two triangles
+    sharing an edge cost almost nothing and report exactly zero overlap.
+
+    Each axis is applied to the survivors of the previous one, so on a clean
+    layout -- where nearly every candidate pair is disjoint -- the working set
+    collapses geometrically and the later axes are nearly free.
+    """
+    n = tri_a.shape[0]
+    idx: np.ndarray | None = None
+    for tri, other, edge in ((tri_a, tri_b, da), (tri_b, tri_a, db)):
+        for corner in range(3):
+            if idx is None:
+                ox = tri[:, corner, 0]
+                oy = tri[:, corner, 1]
+                ex = edge[:, corner, 0]
+                ey = edge[:, corner, 1]
+                far = other
+                limit = tol
+            else:
+                if idx.size == 0:
+                    return idx
+                ox = tri[idx, corner, 0]
+                oy = tri[idx, corner, 1]
+                ex = edge[idx, corner, 0]
+                ey = edge[idx, corner, 1]
+                far = other[idx]
+                limit = tol[idx]
+            separated = ex * (far[:, 0, 1] - oy) - ey * (far[:, 0, 0] - ox) <= limit
+            separated &= ex * (far[:, 1, 1] - oy) - ey * (far[:, 1, 0] - ox) <= limit
+            separated &= ex * (far[:, 2, 1] - oy) - ey * (far[:, 2, 0] - ox) <= limit
+            if not separated.any():
+                continue
+            keep = ~separated
+            idx = np.flatnonzero(keep) if idx is None else idx[keep]
+    return np.arange(n, dtype=np.int64) if idx is None else idx
 
 
 def _edge_cross(pts: np.ndarray, origin: np.ndarray, edge: np.ndarray) -> np.ndarray:
     """Return ``(N, 3 points, 3 edges)`` cross products ``edge x (pt - origin)``.
 
     Positive means the point is to the left of the directed edge, i.e. inside a
-    counter-clockwise triangle.
+    counter-clockwise triangle.  Written as four ``(N, 3, 3)`` broadcasts rather
+    than one ``(N, 3, 3, 2)`` difference, which halves the peak footprint.
     """
-    rel = pts[:, :, None, :] - origin[:, None, :, :]
-    return edge[:, None, :, 0] * rel[..., 1] - edge[:, None, :, 1] * rel[..., 0]
+    ex = edge[:, None, :, 0]
+    ey = edge[:, None, :, 1]
+    ox = origin[:, None, :, 0]
+    oy = origin[:, None, :, 1]
+    return ex * (pts[:, :, None, 1] - oy) - ey * (pts[:, :, None, 0] - ox)
 
 
 def _clip_area(
@@ -1214,12 +1269,13 @@ def _clip_area(
     tri_b: np.ndarray,
     da: np.ndarray,
     db: np.ndarray,
-    a_in_b: np.ndarray,
-    b_in_a: np.ndarray,
     tol: np.ndarray,
 ) -> np.ndarray:
     """Return the intersection area of pairs already known to be non-separated."""
     n = tri_a.shape[0]
+    tol = tol[:, None]
+    a_in_b = (_edge_cross(tri_a, tri_b, db) >= -tol[:, :, None]).all(axis=2)
+    b_in_a = (_edge_cross(tri_b, tri_a, da) >= -tol[:, :, None]).all(axis=2)
     ea = da[:, :, None, :]
     eb = db[:, None, :, :]
     rel = tri_b[:, None, :, :] - tri_a[:, :, None, :]
