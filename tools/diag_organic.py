@@ -455,6 +455,42 @@ def _total_area_3d(best) -> float:
 # ---------------------------------------------------------------------------
 
 
+def _clipper_selftest(rep: Report, *, mc_samples: int) -> None:
+    """Exercise the clipper on geometry whose overlap is known independently.
+
+    Two cases with answers that do not come from this file:
+
+    * A pair of unit triangles offset so they share exactly a quarter of their
+      area -- closed form, no measurement involved.
+    * A pair that does not overlap at all, which is the case a clipper with an
+      inverted half-plane test gets *wrong in the reassuring direction*: it
+      reports the subject triangle's whole area, or it reports zero for a pair
+      that does overlap.  Both failure modes have actually happened in this
+      project, in opposite directions, in two different files.
+
+    Each is cross-checked against a Monte-Carlo area estimate, so the exact
+    path and the sampled path have to agree as well.
+    """
+    rep.say("clipper self-test (answers known independently of this file):")
+    a = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    cases = (
+        ("identical triangles", a, a.copy(), 0.5),
+        ("half-overlap", a, a + np.array([0.5, 0.0]), 0.125),
+        ("disjoint, far apart", a, a + np.array([5.0, 5.0]), 0.0),
+        ("disjoint, touching at a corner", a, a + np.array([1.0, 0.0]), 0.0),
+    )
+    rng = np.random.default_rng(0)
+    ok = True
+    for name, p, q, expected in cases:
+        exact = clip_area(p, q)
+        mc = monte_carlo_area(p, q, samples=mc_samples, rng=rng)
+        good = abs(exact - expected) <= 1e-12 and abs(exact - mc) <= 5e-3
+        ok = ok and good
+        rep.say("  %-32s exact %.6f  expected %.6f  MC %.6f  %s"
+                % (name, exact, expected, mc, "ok" if good else "WRONG"))
+    rep.say("  => clipper is %s" % ("sound" if ok else "BROKEN -- do not trust 0.3"))
+
+
 def section_overlap(rep: Report, sample, metrics, tri_island, *, mc_samples: int) -> None:
     """Reproduce ORGANIC.md section 0.3: the overlap is not a flip."""
     rep.head("0.3  The overlap is a global injectivity failure, not a flip")
@@ -492,8 +528,27 @@ def section_overlap(rep: Report, sample, metrics, tri_island, *, mc_samples: int
     rep.say("evaluator overlap_area              %.10g" % metrics.overlap_area)
     rep.say("independent exact convex-clip       %.10g  over %d pairs" % (total, len(hits)))
     rel = abs(total - metrics.overlap_area) / max(metrics.overlap_area, 1e-30)
-    rep.say("relative difference                 %.3g  => the evaluator is %s"
-            % (rel, "NOT lying" if rel < 1e-9 else "DISAGREEING -- investigate"))
+    agree = rel < 1e-9
+
+    # A cross-check that compares 0 with 0 over zero pairs proves nothing, and
+    # this one exists precisely because a scratch clipper with an inverted
+    # half-plane test once reported Suzanne's overlap as exactly zero and
+    # nobody noticed (BENCHMARKS.md 7.5). Now that the pipeline routinely
+    # produces overlap-free layouts, the guard against that recurrence would
+    # pass unconditionally -- so say so, loudly, rather than print a
+    # reassurance the run did not earn.
+    if len(hits) == 0 and metrics.overlap_area == 0.0:
+        rep.say("relative difference                 n/a")
+        rep.say("=> VACUOUS: 0 == 0 over ZERO pairs. This layout is clean, so")
+        rep.say("   nothing was cross-checked. The clipper is exercised against")
+        rep.say("   a known-overlapping fixture below instead; a clipper that")
+        rep.say("   silently returns zero is the exact bug this section exists")
+        rep.say("   to catch, and it would survive the check above.")
+    else:
+        rep.say("relative difference                 %.3g  => the evaluator is %s"
+                % (rel, "NOT lying" if agree else "DISAGREEING -- investigate"))
+    rep.say("")
+    _clipper_selftest(rep, mc_samples=mc_samples)
     rep.say("")
 
     shared2 = [h for h in hits if len(vsets[h[0]] & vsets[h[1]]) >= 2]
