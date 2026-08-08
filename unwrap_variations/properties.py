@@ -467,6 +467,16 @@ class UVVAR_SceneProps(PropertyGroup):
         default=True,
     )
 
+    refine_layouts: BoolProperty(
+        name="Refine Layouts",
+        description=(
+            "After each unwrap, merge over-cut islands and repair folded UVs, "
+            "keeping the result only when it scores better. Much better on "
+            "organic meshes and several times slower"
+        ),
+        default=True,
+    )
+
     # -- browsing ------------------------------------------------------------
 
     active_index: IntProperty(

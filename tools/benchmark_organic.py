@@ -616,8 +616,13 @@ def main() -> int:
         if timeouts["after"] or timeouts["before"]:
             note = "  TIMED OUT: before %d/%d, after %d/%d repeats" % (
                 timeouts["before"], repeats, timeouts["after"], repeats)
+        # The full numbers, not just a "done" marker.  A run on this corpus can
+        # take an hour, and a run that is interrupted after forty minutes should
+        # leave forty minutes of usable measurements behind rather than nothing.
         say("%-17s measured (%d tris, %.1fs median generation)%s"
-              % (name, mesh.n_tris, statistics.median(seconds), note))
+            % (name, mesh.n_tris, statistics.median(seconds), note))
+        say("    partial: smart %s | unwrap %s | before %s | after %s"
+            % (band(smart_runs), band(unwrap_runs), band(before_runs), band(after_runs)))
 
     say()
     _print_baseline_table(rows, args)

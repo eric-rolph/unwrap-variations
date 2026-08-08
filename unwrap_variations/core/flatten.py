@@ -1259,6 +1259,21 @@ def _tutte(chart: Chart, topo: ChartTopology) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+def _indexes(tris: np.ndarray, n_verts: int) -> bool:
+    """Return True when every corner of ``tris`` addresses a row of an ``n`` array.
+
+    ``chart_topology`` already reports an out-of-range corner as a problem, but
+    it is the only function that checks: everything downstream indexes the
+    layout directly and would take an :class:`IndexError` instead.  That matters
+    because ``core/charts.py`` hands this module foreign chart-like objects
+    (:func:`_as_chart`) whose indices it never validates, and both
+    :func:`flatten_chart` and :func:`repair_folds` promise never to raise.
+    """
+    if tris.size == 0:
+        return True
+    return int(tris.min()) >= 0 and int(tris.max()) < int(n_verts)
+
+
 def _signed_areas(uv: np.ndarray, tris: np.ndarray) -> np.ndarray:
     """Return ``(T,)`` signed UV areas."""
     a = uv[tris[:, 0]]
@@ -1560,6 +1575,11 @@ def _certify_layout(
     tris = np.asarray(chart.tris, dtype=np.int64).reshape(-1, 3)
     if tris.shape[0] == 0:
         return 0, 0, 0
+    if not _indexes(tris, np.asarray(uv).reshape(-1, 2).shape[0]):
+        # Nothing about this chart can be measured, so nothing about it may be
+        # certified.  Reporting every triangle degenerate is both true -- no
+        # usable area is readable -- and can never read as a clean verdict.
+        return 0, int(tris.shape[0]), 0
     signed = _signed_areas(uv, tris)
     finite = np.isfinite(signed)
     magnitude = np.abs(np.where(finite, signed, 0.0))
@@ -1775,6 +1795,8 @@ def _align_to_target(
 
     src = uv
     tris = np.asarray(chart.tris, dtype=np.int64).reshape(-1, 3)
+    if not _indexes(tris, uv.shape[0]):
+        tris = np.zeros((0, 3), dtype=np.int64)
     if tris.shape[0]:
         want = float(np.sum(_signed_areas(dst, tris)))
         have = float(np.sum(_signed_areas(src, tris)))

@@ -757,6 +757,40 @@ def test_the_disk_oracle_has_teeth():
     assert_all_disks(cylinder, compute_seams(cylinder, "CONCAVE"), "capped_cylinder")
 
 
+def test_the_organic_corpus_comes_out_as_disks_and_prefers_its_valleys():
+    """The real target: ORGANIC.md section 8.1's procedural organic corpus.
+
+    These are the meshes this strategy exists for -- a metaball creature, a
+    hand with five close protrusions, a noise-displaced sphere with no sharp
+    edge anywhere, a genus-1 knot, and a deliberately degenerate one.  Two
+    things are asserted per mesh: every chart is a disk by the independent
+    Euler count, and the cut is measurably more concave than the mesh's own
+    average.  Measured concave share of cut length against baseline:
+    blob_limbs 87.0/35.6, hand 74.2/27.1, displaced_sphere 75.4/29.9,
+    torus_knot 75.9/51.1, pinched 35.3/15.8.
+    """
+    try:
+        from tools import organic_corpus
+    except ImportError:  # pragma: no cover - the corpus is another worker's
+        pytest.skip("tools.organic_corpus has not landed yet")
+
+    checked = 0
+    for mesh in organic_corpus.build_all(skip_blender=True):
+        sample = organic_corpus.to_sample(mesh)
+        mask, report = concave_seams(sample, curvature_threshold=0.35, seed=1)
+        assert_all_disks(sample, mask, mesh.name)
+        assert report.fallbacks == 0, "%s needed the fallback" % mesh.name
+        checked += 1
+        if report.baseline_fraction == 0.0 or not mask.any():
+            continue
+        assert report.concave_fraction > report.baseline_fraction, (
+            "%s: the cut is %.1f%% concave against a mesh baseline of %.1f%% -- "
+            "no preference at all"
+            % (mesh.name, 100 * report.concave_fraction, 100 * report.baseline_fraction)
+        )
+    assert checked >= 5, "expected the procedural corpus, got %d meshes" % checked
+
+
 def test_a_disk_is_left_completely_uncut():
     """A flat grid already unwraps perfectly.  Cutting it is pure damage."""
     mask, report = concave_seams(make_flat_grid(10))
@@ -1144,6 +1178,39 @@ def test_a_zero_area_mesh_does_not_raise():
     mask, report = concave_seams(make_all_identical(8))
     assert mask.dtype == bool
     assert report.non_disks >= 0
+
+
+def test_non_finite_vertices_produce_no_numpy_warnings():
+    """``inf - inf`` warns before any guard sees it, and warnings are output.
+
+    A NaN or infinite coordinate is real -- a bad import, a driver that divided
+    by zero -- and this module is supposed to survive one silently.  Coordinates
+    are therefore zeroed once on entry rather than guarded after the fact, which
+    makes a bad vertex simply degenerate.
+
+    ``build_edge_topology`` predates this work and does still warn on the same
+    input (its guard runs *after* the cross product), so it is called with the
+    warning suppressed.  Zeroing there would be wrong for a different reason:
+    ``edge_len`` would become the distance to the origin instead of ``0``,
+    inventing a long edge out of a vertex that has no position at all.
+    """
+    import warnings
+
+    base = uv_sphere(12, 6)
+    verts = np.asarray(base.verts, dtype=np.float64).copy()
+    verts[3] = (np.nan, np.inf, -np.inf)
+    verts[7] = (np.inf, np.inf, np.inf)
+    broken = dataclasses.replace(base, verts=verts)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        topo = seams.build_edge_topology(broken)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        mask, report = concave_seams(broken, topo=topo, curvature_threshold=0.15)
+    assert mask.shape == (broken.n_edges,)
+    assert report.non_disks == 0
+    assert_all_disks(broken, mask, "sphere with non-finite vertices")
 
 
 def test_out_of_range_indices_do_not_raise():

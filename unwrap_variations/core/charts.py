@@ -977,7 +977,19 @@ def _flatten_uv(
         chart: The chart to flatten.
         iters: Optional descent budget.  Passed as ``iters=`` when the flattener
             accepts it and dropped silently when it does not, so an injected
-            stub never has to grow the argument.
+            stub never has to grow the argument.  ``None`` means "the
+            flattener's own default" and passes no ``iters`` at all.
+
+    Warning:
+        A wrapper that fills the budget in with ``kwargs.setdefault("iters", n)``
+        does **not** compose with this: ``setdefault`` cannot override the
+        explicit value passed for screening, and it *does* fill in the omission
+        that means full quality.  Both budgets then come out inverted, silently.
+        Measured on Suzanne with such a wrapper pinned at 16: 24 screening calls
+        ran at 32 (this module's value, not the wrapper's) and the 4 polish calls
+        ran at 16 (the wrapper's, not the flattener's 256).  A caller that wants
+        to choose the screening budget should set ``screen_iters`` on
+        :func:`merge_charts`, which is the one knob that owns it.
 
     Returns:
         ``(uv, ok)``, with ``uv`` ``None`` when nothing usable came back and

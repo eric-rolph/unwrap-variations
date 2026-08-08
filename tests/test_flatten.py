@@ -893,6 +893,40 @@ def test_chart_topology_survives_out_of_range_indices(flatten):
     assert topo.problems
 
 
+def test_flatten_chart_survives_out_of_range_indices(flatten):
+    """``flatten_chart`` documents "Never raises"; a corrupt index must not.
+
+    ``chart_topology`` already reports this chart as broken, so the flattener
+    takes its not-a-disk branch -- but that branch still certifies the
+    projection, and certification indexes ``uv`` with the corrupt triangles.
+    A chart-like object arriving from ``core/charts.py`` with a stale index
+    would take an ``IndexError`` straight out of a Blender operator.
+    """
+    chart = flatten.Chart(
+        np.zeros((3, 3)),
+        np.array([[0, 1, 9]], dtype=np.int32),
+        np.full((1, 3), -1, np.int32),
+        "corrupt",
+    )
+    result = flatten.flatten_chart(chart)
+    assert result.ok is False
+    assert np.isfinite(result.uv).all()
+    assert result.uv.shape == (3, 2)
+
+
+def test_certify_layout_refuses_a_chart_it_cannot_index(flatten):
+    """An unindexable chart is never certified clean, whatever its layout."""
+    chart = flatten.Chart(
+        np.zeros((3, 3)),
+        np.array([[0, 1, 7]], dtype=np.int32),
+        np.full((1, 3), -1, np.int32),
+        "corrupt",
+    )
+    topo = flatten.chart_topology(chart)
+    verdict = flatten._certify_layout(np.zeros((3, 2)), chart, topo)
+    assert verdict != (0, 0, 0)
+
+
 def test_symmetric_dirichlet_energy_of_an_isometric_map_is_four(flatten):
     """The energy's normalisation is pinned: isometric reads exactly 4.0."""
     chart = grid_chart(flatten, 5)

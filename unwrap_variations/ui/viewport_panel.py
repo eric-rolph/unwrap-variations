@@ -1128,6 +1128,7 @@ class UVVAR_PT_advanced(_UVVarViewportPanel, Panel):
             col = layout.column(align=True)
             draw_prop(col, props, "backend_filter", text="Backends")
             draw_prop(col, props, "compute_overlap", text="Detect Overlaps")
+            draw_prop(col, props, "refine_layouts", text="Refine Layouts")
             draw_prop(col, props, "auto_preview", text="Auto Preview")
 
             layout.separator()

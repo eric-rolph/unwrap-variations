@@ -250,6 +250,24 @@ def _as_rows(arr: np.ndarray, cols: int, dtype: type) -> np.ndarray:
     return flat[: (flat.shape[0] // cols) * cols].reshape(-1, cols)
 
 
+def _finite_verts(sample: "UVMeshSample") -> np.ndarray:
+    """Return ``(V, 3)`` float64 positions with every non-finite value zeroed.
+
+    ``build_edge_topology`` guards its *results* against NaN, which is enough
+    when the only arithmetic is one cross product.  The concave strategy does
+    more with the coordinates -- centroids, corner angles, shortest paths -- and
+    ``inf - inf`` emits a ``RuntimeWarning`` from numpy before the guard ever
+    sees it, which is noise in a user's console and, under a ``-W error``
+    harness, an exception out of a module that promises never to raise.
+    Zeroing the coordinate makes the triangle degenerate, which is the honest
+    reading of a vertex with no usable position.
+    """
+    verts = _as_rows(sample.verts, 3, np.float64)
+    if verts.size and not np.isfinite(verts).all():
+        verts = np.where(np.isfinite(verts), verts, 0.0)
+    return verts
+
+
 def _pair_keys(pairs: np.ndarray, base: int) -> np.ndarray:
     """Return an order-independent int64 key per undirected vertex pair.
 
@@ -507,7 +525,7 @@ def edge_signed_dihedral_deg(
     if topo.n_edges == 0 or topo.n_tris == 0:
         return out
 
-    verts = _as_rows(sample.verts, 3, np.float64)
+    verts = _finite_verts(sample)
     if verts.shape[0] == 0:
         return out
     tv = _clip_indices(_as_rows(sample.tri_verts, 3, np.int64), verts.shape[0])
@@ -1065,7 +1083,7 @@ def _triangle_sides(sample: "UVMeshSample", topo: EdgeTopology) -> _TriangleSide
     if n_tris == 0:
         return _empty_sides()
 
-    verts = _as_rows(sample.verts, 3, np.float64)
+    verts = _finite_verts(sample)
     tv = _as_rows(sample.tri_verts, 3, np.int64)
     if tv.shape[0] != n_tris:
         return _empty_sides()

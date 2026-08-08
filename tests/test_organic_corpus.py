@@ -329,6 +329,65 @@ def test_pinched_survives_the_oracles(meshes):
 # ---------------------------------------------------------------------------
 
 
+def test_exact_clipper_rejects_a_collapsed_triangle():
+    """A zero-area triangle overlaps nothing, however the clipper is written.
+
+    This is a regression, not a hypothetical.  Sutherland-Hodgman clips against
+    each edge of the clip polygon by a half-plane test, and a zero-length edge's
+    half-plane test is vacuously true -- so a collapsed clip triangle clips
+    *nothing* and the routine hands back the subject triangle's entire area for
+    a pair that does not overlap at all.  ``tests/reference.py`` carried exactly
+    that bug.  It matters most on ``pinched``, whose whole purpose is to carry
+    exactly zero-area faces, and where it would paint most of the mesh as a
+    defect in the visual report.
+    """
+    flat = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    collapsed = np.array([[5.0, 5.0], [5.0, 5.0], [5.0, 5.0]])
+    degenerate_edge = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
+    assert corpus.tri_clip_area_uv(flat, collapsed) == 0.0
+    assert corpus.tri_clip_area_uv(collapsed, flat) == 0.0
+    assert corpus.tri_clip_area_uv(flat, degenerate_edge) == 0.0
+    assert corpus.tri_clip_area_uv(flat, flat) == pytest.approx(0.5)
+    # Sharing an edge is touching, not overlapping: measure zero.
+    neighbour = np.array([[1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+    assert corpus.tri_clip_area_uv(flat, neighbour) == pytest.approx(0.0, abs=1e-15)
+
+
+def test_overlap_mask_flags_the_ribbon_and_clears_the_control(meshes):
+    """The grid-accelerated mask agrees with the layouts it is given.
+
+    The defective ribbon has overlapping triangles; the same ribbon unrolled
+    flat has none. The mask is what paints red in the visual report, so a false
+    positive here becomes a picture that cries wolf.
+    """
+    mesh = meshes["folded_ribbon"]
+    broken = corpus.overlapping_triangle_mask(mesh.uvs)
+    clean = corpus.overlapping_triangle_mask(corpus.folded_ribbon_flat_uvs())
+    assert int(broken.sum()) > 0
+    assert int(clean.sum()) == 0
+
+
+def test_overlap_mask_is_silent_on_a_clean_projection(meshes):
+    """A non-overlapping projection of a corpus mesh flags nothing.
+
+    ``pinched`` is used because its zero-area faces are what the collapsed-clip
+    bug turns into false positives.
+    """
+    sample = corpus.to_sample(meshes["pinched"])
+    flat = sample.verts[sample.tri_verts][:, :, :2]
+    lo = flat.reshape(-1, 2).min(axis=0)
+    hi = flat.reshape(-1, 2).max(axis=0)
+    # Spread the triangles onto a grid so none of them can genuinely overlap.
+    n = flat.shape[0]
+    side = int(math.ceil(math.sqrt(n)))
+    cell = 1.0 / side
+    normalised = (flat - lo) / np.maximum(hi - lo, 1e-12) * (cell * 0.8)
+    idx = np.arange(n)
+    offset = np.stack([(idx % side) * cell, (idx // side) * cell], axis=1)
+    spread = normalised + offset[:, None, :]
+    assert int(corpus.overlapping_triangle_mask(spread).sum()) == 0
+
+
 def test_union_rect_area_on_known_cases():
     """The rectangle-union sweep gets the textbook answers right."""
     assert reference_union_rect_area([]) == 0.0

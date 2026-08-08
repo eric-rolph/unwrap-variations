@@ -238,117 +238,12 @@ def save_png(rgb: np.ndarray, path: str) -> None:
 def overlapping_triangles(tri_uv: np.ndarray, *, cells: int = 128) -> np.ndarray:
     """Return a ``(T,)`` bool mask of triangles that really overlap another.
 
-    A uniform grid over triangle bounding boxes, then an exact convex clip on
-    each surviving pair.  The exact clip matters: a separating-axis boolean
-    reported 8773 false positives on a flat grid whose true answer is zero (see
-    ``tests/reference.py``), and a picture full of false red is worse than no
-    picture at all.
+    Thin wrapper over ``organic_corpus.overlapping_triangle_mask``.  The exact
+    clipper lives in the corpus module rather than here because it is bpy-free
+    and therefore testable under plain pytest, and because two copies of a
+    routine with two subtle failure modes is one copy too many.
     """
-    n = tri_uv.shape[0]
-    mask = np.zeros(n, dtype=bool)
-    if n == 0:
-        return mask
-    lo = tri_uv.min(axis=1)
-    hi = tri_uv.max(axis=1)
-    finite = np.isfinite(lo).all(axis=1) & np.isfinite(hi).all(axis=1)
-    if not finite.any():
-        return mask
-    gmin = lo[finite].min(axis=0)
-    gmax = hi[finite].max(axis=0)
-    span = np.maximum(gmax - gmin, 1e-9)
-    cell_lo = np.clip(((lo - gmin) / span * cells).astype(np.int64), 0, cells - 1)
-    cell_hi = np.clip(((hi - gmin) / span * cells).astype(np.int64), 0, cells - 1)
-
-    buckets: dict[int, list[int]] = {}
-    for t in range(n):
-        if not finite[t]:
-            continue
-        for cy in range(cell_lo[t, 1], cell_hi[t, 1] + 1):
-            for cx in range(cell_lo[t, 0], cell_hi[t, 0] + 1):
-                buckets.setdefault(cy * cells + cx, []).append(t)
-
-    tested: set[tuple[int, int]] = set()
-    for members in buckets.values():
-        if len(members) < 2:
-            continue
-        for a in range(len(members)):
-            i = members[a]
-            for b in range(a + 1, len(members)):
-                j = members[b]
-                key = (i, j)
-                if key in tested:
-                    continue
-                tested.add(key)
-                if hi[i, 0] < lo[j, 0] or hi[j, 0] < lo[i, 0]:
-                    continue
-                if hi[i, 1] < lo[j, 1] or hi[j, 1] < lo[i, 1]:
-                    continue
-                if _clip_area(tri_uv[i], tri_uv[j]) > 1e-13:
-                    mask[i] = True
-                    mask[j] = True
-    return mask
-
-
-def _clip_area(a: np.ndarray, b: np.ndarray) -> float:
-    """Return the exact intersection area of two UV triangles, both re-wound CCW.
-
-    The zero-area guard is not defensive padding.  A collapsed clip triangle has
-    zero-length edges, and a zero-length edge's half-plane test is vacuously
-    true, so Sutherland-Hodgman clips *nothing* and hands back the subject
-    triangle's entire area -- reporting a pair that does not overlap at all as
-    fully overlapping.  The same bug was found and fixed in
-    ``tests/reference.py``.  It matters most on ``pinched``, whose whole purpose
-    is to carry exactly zero-area faces: without this guard that mesh renders as
-    a field of false red.
-    """
-    if _abs_area(a) <= 0.0 or _abs_area(b) <= 0.0:
-        return 0.0
-    a = _ccw(a)
-    b = _ccw(b)
-    poly = [tuple(p) for p in a]
-    for i in range(3):
-        p0, p1 = b[i], b[(i + 1) % 3]
-        ex, ey = p1[0] - p0[0], p1[1] - p0[1]
-        new = []
-        n = len(poly)
-        if n == 0:
-            return 0.0
-        for j in range(n):
-            c, d = poly[j], poly[(j + 1) % n]
-            sc = ex * (c[1] - p0[1]) - ey * (c[0] - p0[0])
-            sd = ex * (d[1] - p0[1]) - ey * (d[0] - p0[0])
-            if sc >= 0.0:
-                new.append(c)
-            if (sc >= 0.0) != (sd >= 0.0):
-                t = sc / (sc - sd)
-                new.append((c[0] + t * (d[0] - c[0]), c[1] + t * (d[1] - c[1])))
-        poly = new
-    if len(poly) < 3:
-        return 0.0
-    total = 0.0
-    for i in range(len(poly)):
-        x0, y0 = poly[i]
-        x1, y1 = poly[(i + 1) % len(poly)]
-        total += x0 * y1 - x1 * y0
-    return abs(total) * 0.5
-
-
-def _abs_area(tri: np.ndarray) -> float:
-    """Return the absolute UV area of a triangle."""
-    return abs(_signed_area(tri))
-
-
-def _signed_area(tri: np.ndarray) -> float:
-    """Return the signed UV area of a triangle; negative means clockwise."""
-    return 0.5 * float(
-        (tri[1][0] - tri[0][0]) * (tri[2][1] - tri[0][1])
-        - (tri[1][1] - tri[0][1]) * (tri[2][0] - tri[0][0])
-    )
-
-
-def _ccw(tri: np.ndarray) -> np.ndarray:
-    """Return the triangle wound counter-clockwise."""
-    return tri if _signed_area(tri) >= 0.0 else np.asarray([tri[0], tri[2], tri[1]])
+    return corpus.overlapping_triangle_mask(tri_uv, cells=cells)
 
 
 def island_labels(sample) -> np.ndarray:
