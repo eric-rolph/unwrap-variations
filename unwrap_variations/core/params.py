@@ -353,15 +353,23 @@ PARAM_SPACE: dict[str, ParamSpec] = {
     "minimize_stretch_iters": ParamSpec("int", 0, 60, weight=0.8),
     "average_islands_scale": ParamSpec("bool", weight=0.5),
     # Distortion ceiling for chart merging
-    # (:func:`unwrap_variations.core.charts.merge_charts`).  The range starts
-    # *below* 1.0 on purpose: ``stretch_l2 >= 1.0`` is a theorem, so any value
-    # under it makes every merge unsatisfiable and reproduces the unmerged
-    # layout exactly.  ORGANIC.md section 5 requires that layout to stay
-    # reachable from the grid so a benchmark can attribute the gain to merging
-    # rather than to the whole pipeline at once, and a bound that merely
-    # *discourages* merging would not prove anything.  The Halton fill therefore
-    # spends 62% of its samples with merging off and 38% with it on.
-    "max_stretch": ParamSpec("float", 0.0, 1.6, weight=1.5),
+    # (:func:`unwrap_variations.core.charts.merge_charts`).
+    #
+    # The range starts *below* 1.0 on purpose: ``stretch_l2 >= 1.0`` is a
+    # theorem, so any value under it makes every merge unsatisfiable and
+    # reproduces the unmerged layout exactly.  ORGANIC.md section 5 requires
+    # that layout to stay reachable from the grid so a benchmark can attribute
+    # the gain to merging rather than to the whole pipeline at once, and a bound
+    # that merely *discourages* merging would not prove anything.
+    #
+    # It ends at 3.0 because the optimum on Suzanne is measured at **2.5**, well
+    # past the 1.6 this first carried: sweeping three starting candidates on
+    # Blender 5.1.2 with everything else fixed, ``chart12`` scores 43.59 at 1.25
+    # and 49.96 at 2.5, and ``chart4`` 40.18 against 47.40.  It does *not* go
+    # further, because the same sweep shows a real frontier rather than a
+    # monotone dial: at 4.0 both of those collapse (``stretch_l2`` 1.56, mean
+    # angle distortion 15.3 degrees) and score below not merging at all.
+    "max_stretch": ParamSpec("float", 0.0, 3.0, weight=1.5),
 }
 
 
@@ -437,13 +445,22 @@ ARCHETYPES: tuple[dict[str, Any], ...] = (
     },
     # Six charts, conformal: the "cube map" answer, and the one that carries a
     # closed smooth surface.
-    chart_recipe(6, method="ANGLE_BASED"),
+    # ``max_stretch`` here and on the twelve-chart entry below are what make the
+    # pinned core actually *span* the merge dial.  A ten-slot grid is filled
+    # entirely from this list and never reaches the quasi-random fill that
+    # samples PARAM_SPACE, so without a spread written in, every candidate would
+    # share one bound and the grid could not find the frontier.  The pinned six
+    # therefore carry {0.0 (off), 1.25, 1.25, 1.25, 2.5, 2.5}: an unmerged
+    # control, the conservative default, and the aggressive end.  2.5 is not
+    # tuning to Suzanne for its own sake -- it is the far end of the useful
+    # range, past which the measured sweep shows the layout collapsing.
+    chart_recipe(6, method="ANGLE_BASED", max_stretch=2.5),
     # Three big charts relaxed for stretch: the fewest cuts that still avoid a
     # folded-over layout on an organic model.
     chart_recipe(3, method="MINIMUM_STRETCH", chart_seed=3, iterations=30),
     # Twelve charts: small, flat, fold-free - the safe pick on a lumpy organic
     # model where a coarse chart folds over itself.
-    chart_recipe(12, method="ANGLE_BASED", chart_seed=11),
+    chart_recipe(12, method="ANGLE_BASED", chart_seed=11, max_stretch=2.5),
     # Few, well-placed cuts from the dual-graph solver. On a faceted mesh this
     # is the isometric polyhedral net, and nothing else in the set produces it:
     # a cube comes out as its 7-edge cross, one island, stretch exactly 1.0.

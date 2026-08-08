@@ -130,15 +130,14 @@ _MERGE_OFF_BELOW = 1.0
 #: re-evaluation cycle from spinning.
 _MAX_QUEUE_POPS = 1_000_000
 
-#: Descent budget used to *screen* a candidate merge, against the flattener's
-#: own default of 32.
+#: Fraction of the flattener's own descent budget used to *screen* a candidate.
 #:
-#: Measured on Suzanne: the merge stage costs 11.1 s, of which 11.11 s -- more
-#: than 99% -- is inside ``flatten_chart``.  Nothing else registers: the exact
-#: disk test is 0.02 s across 57 calls, certification 0.03 s, the evaluator
-#: 0.01 s.  So the only lever on the cost is how much flattening happens, and
-#: the flattener's cost is very close to linear in its iteration count (on a
-#: 200-triangle chart: 81 ms at 32 iterations, 20 ms at 8, 12 ms at 4).
+#: Measured on Suzanne: the merge stage's cost is >99% inside ``flatten_chart``.
+#: Nothing else registers -- the exact disk test is 0.02 s across 57 calls,
+#: certification 0.03 s, the evaluator 0.01 s -- and the flattener's cost is very
+#: close to linear in its iteration count (on a 166-triangle union: 19 ms at 16
+#: iterations, 41 ms at 32, 128 ms at 128, 255 ms at 256).  So the only lever on
+#: the cost is how much descent happens per candidate.
 #:
 #: Screening cheaply is **conservative, not a weakened gate**.  Fewer descent
 #: iterations leave a chart *more* distorted, so a screened candidate's measured
@@ -147,9 +146,22 @@ _MAX_QUEUE_POPS = 1_000_000
 #: accepted, and can never make it accept one a full flatten would have
 #: rejected.  Losing a merge costs seam length; admitting a bad one costs the
 #: artist a broken chart, and only the second is unacceptable.  Accepted merges
-#: are then re-flattened at full quality before their UVs are pasted, so the
+#: are then re-flattened at the full budget before their UVs are pasted, so the
 #: layout that ships is never the screening one.
-_SCREEN_ITERS = 8
+_SCREEN_FRACTION = 8
+
+#: Screening budget when the flattener's own default cannot be read.
+#:
+#: This is a *fraction* rather than a constant because a constant already went
+#: stale once and did so silently.  It was set to 8 against a flattener whose
+#: default was 32; the flattener later moved its default to 256 and got faster
+#: per iteration, at which point 8 iterations left a 166-triangle union at
+#: ``stretch_l2 = 1.486`` against 1.116 at 32 -- so every candidate blew the 1.25
+#: bound and Suzanne merged **nothing** while still spending the time to find
+#: that out.  A screening budget too coarse for its flattener does not fail
+#: loudly; it just quietly stops merging.  Tracking the ratio instead means the
+#: two move together.
+_SCREEN_ITERS_FALLBACK = 32
 
 #: Maximum number of grid insertions the fallback boundary-crossing test will
 #: make before giving up and reporting "not certified".
@@ -915,6 +927,27 @@ def _resolve_flatten(flatten: Callable[..., Any] | None) -> Callable[..., Any] |
     return flatten_chart
 
 
+def _screen_iters() -> int:
+    """Return the screening descent budget, tracking the flattener's own default.
+
+    Read from :mod:`unwrap_variations.core.flatten` when it is importable so the
+    two stay in proportion; see :data:`_SCREEN_ITERS_FALLBACK` for the regression
+    that made tracking rather than pinning the right call.
+    """
+    default = None
+    try:
+        from . import flatten as flatten_mod  # noqa: PLC0415 - optional sibling
+
+        default = getattr(flatten_mod, "_DEFAULT_ITERS", None)
+    except BaseException:  # noqa: BLE001 - the module may not exist yet
+        default = None
+    try:
+        budget = int(default) // _SCREEN_FRACTION
+    except (TypeError, ValueError):
+        return _SCREEN_ITERS_FALLBACK
+    return max(16, budget)
+
+
 def _resolve_certify(certify: Callable[..., Any] | None) -> Callable[..., Any] | None:
     """Return the injectivity certifier, or ``None`` to use the local fallback."""
     if certify is not None:
@@ -1615,7 +1648,7 @@ def merge_charts(
     uvs: np.ndarray | None = None,
     topo: "seam_mod.EdgeTopology | None" = None,
     max_merges: int | None = None,
-    screen_iters: int | None = _SCREEN_ITERS,
+    screen_iters: int | None = -1,
     time_budget: float = 0.0,
 ) -> tuple[np.ndarray, MergeReport]:
     """Greedily merge adjacent charts while each merge stays a disk and in bounds.
@@ -1663,12 +1696,14 @@ def merge_charts(
         max_merges: Optional cap on the number of merges, for tests and for
             bounding the cost on a very large mesh.
         screen_iters: Descent budget for *screening* candidates, handed to the
-            flattener as ``iters=`` when it accepts one.  Accepted merges are
-            re-flattened at the flattener's own default before their UVs are
-            used, so the layout that ships is always the full-quality one.
-            ``None`` screens at full quality too, which is 4x slower and,
-            because screening cheaply can only reject more, admits at most the
-            same merges plus a few borderline ones.  See :data:`_SCREEN_ITERS`.
+            flattener as ``iters=`` when it accepts one.  The default ``-1``
+            means "an eighth of the flattener's own budget" (see
+            :func:`_screen_iters`); ``None`` screens at full quality, which on
+            Suzanne is 3.3x slower for one extra merge.  Accepted merges are
+            always re-flattened at full quality before their UVs are used, so
+            the layout that ships is never the screening one, and because
+            screening cheaply can only reject more, no value here can admit a
+            merge that full-quality screening would have refused.
         time_budget: Seconds after which no *new* candidate pair is screened;
             ``0`` means no limit.  Merges already screened and admissible are
             still taken, and an in-flight flatten is never interrupted, so the
@@ -1709,6 +1744,9 @@ def merge_charts(
         report.message = "merging disabled (max_stretch %.4f < 1.0)" % bound
         report.seconds = time.perf_counter() - started
         return labels, report
+
+    if screen_iters is not None and int(screen_iters) < 0:
+        screen_iters = _screen_iters()
 
     solver = _resolve_flatten(flatten)
     if solver is None:
@@ -1895,46 +1933,75 @@ def _greedy_merge(
             return final
         return screened
 
-    heap: list[tuple[float, int, int, int, int, int]] = []
-    seq = 0
+    # Two heaps, not one, and this is the difference between the lazy queue
+    # working and being decorative.
+    #
+    # ``pending`` holds pairs nobody has flattened yet, keyed by shared boundary
+    # length; ``ready`` holds screened, admissible pairs keyed by their measured
+    # benefit ratio.  A single heap has to enter an unflattened pair at *some*
+    # numeric priority, and the only safe one -- ``shared / eps`` -- is about
+    # 1e5 times any real ratio, so every unflattened pair outranks every
+    # measured one and the queue degenerates into "flatten everything, then sort".
+    # Measured on a 121-chart Suzanne candidate that was 703 flattens and 16.6 s.
+    #
+    # Split in two, the comparison is made at pop time against
+    # ``shared_top / best_added``, where ``best_added`` is the smallest added
+    # distortion any admissible merge has actually shown.  That divisor is a
+    # running estimate, not a proof, so the *ordering* is a heuristic -- which is
+    # all it ever was, and is a different thing from the gates: every merge that
+    # is accepted has still been flattened and measured in full.
+    pending: list[tuple[float, int, int, int, int]] = []
+    ready: list[tuple[float, int, int, int, int]] = []
+    best_added = math.inf
 
-    def push(a: int, b: int, ratio: float, evaluated: bool) -> None:
-        """Enter a pair on the heap, stamped with both endpoints' versions."""
-        nonlocal seq
+    def stamp(a: int, b: int) -> tuple[int, int, int, int]:
+        """Return the pair, ordered, with both endpoints' current versions."""
         lo, hi = (a, b) if a < b else (b, a)
-        heapq.heappush(
-            heap,
-            (-ratio, lo, hi, int(version[lo]), int(version[hi]), seq if evaluated else -1),
+        return lo, hi, int(version[lo]), int(version[hi])
+
+    def live(entry) -> bool:
+        """Return whether a heap entry still describes two current charts."""
+        _, a, b, va, vb = entry
+        return (
+            alive[a] and alive[b]
+            and int(version[a]) == va and int(version[b]) == vb
+            and shared[a].get(b, 0.0) > min_gain
         )
-        seq += 1
+
+    def peel(heap) -> None:
+        """Drop stale entries from the top of a heap."""
+        while heap and not live(heap[0]):
+            heapq.heappop(heap)
 
     for a in range(k):
         for b, length in shared[a].items():
             if b > a and length > min_gain:
-                push(a, b, length / _DISTORTION_EPS, False)
+                heapq.heappush(pending, (-length, *stamp(a, b)))
 
     steps: list[MergeStep] = []
     seam_left = graph.seam_length
     pops = 0
-    while heap and pops < _MAX_QUEUE_POPS:
+    while pops < _MAX_QUEUE_POPS:
         pops += 1
-        neg_ratio, a, b, va, vb, stamp = heapq.heappop(heap)
-        if not alive[a] or not alive[b]:
-            continue
-        if int(version[a]) != va or int(version[b]) != vb:
-            continue
-        length = shared[a].get(b, 0.0)
-        if length <= min_gain:
-            report.rejected_gain += 1
-            continue
+        peel(pending)
+        peel(ready)
+        if not pending and not ready:
+            break
 
-        if stamp < 0:
+        take_ready = bool(ready)
+        if take_ready and pending:
+            bound = -pending[0][0] / max(best_added, _DISTORTION_EPS)
+            take_ready = -ready[0][0] >= bound
+
+        if not take_ready:
             if deadline is not None and time.perf_counter() >= deadline:
-                # Out of time for *new* screening.  Already-screened pairs stay
-                # on the heap and can still be accepted, so the run ends on a
+                # Out of time for *new* screening.  Pairs already screened stay
+                # on ``ready`` and can still be accepted, so the run ends on a
                 # prefix of the greedy sequence rather than on a half-merge.
-                report.out_of_time += 1
+                report.out_of_time += len(pending)
+                pending.clear()
                 continue
+            _, a, b, _, _ = heapq.heappop(pending)
             candidate, ratio = evaluate_pair(a, b)
             if not candidate.ok:
                 counter = {
@@ -1945,11 +2012,14 @@ def _greedy_merge(
                 }.get(candidate.code, "rejected_injectivity")
                 setattr(report, counter, getattr(report, counter) + 1)
                 continue
-            push(a, b, ratio, True)
+            added = shared[a].get(b, 0.0) / ratio if ratio > 0.0 else math.inf
+            if added > 0.0:
+                best_added = min(best_added, added)
+            heapq.heappush(ready, (-ratio, *stamp(a, b)))
             continue
 
-        # An evaluated entry at the top of the heap has the highest true ratio,
-        # because every unevaluated entry sits at an upper bound of its own.
+        neg_ratio, a, b, _, _ = heapq.heappop(ready)
+        length = shared[a].get(b, 0.0)
         screened = cache[(tuple(sorted(members[a] + members[b])), screen_iters)]
         if not screened.ok:  # pragma: no cover - defensive
             continue
@@ -1995,7 +2065,7 @@ def _greedy_merge(
 
         for other, extra in shared[a].items():
             if alive[other] and extra > min_gain:
-                push(a, other, extra / _DISTORTION_EPS, False)
+                heapq.heappush(pending, (-extra, *stamp(a, other)))
 
         if max_merges is not None and len(steps) >= int(max_merges):
             break

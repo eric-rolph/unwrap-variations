@@ -242,7 +242,7 @@ Hard requirements for `evaluate`:
 
 ```python
 SEAM_STRATEGIES = ("NONE", "EXISTING", "SHARP", "ANGLE", "CURVATURE",
-                   "DUAL_GRAPH", "SMART")
+                   "DUAL_GRAPH", "CONCAVE", "SMART")
 
 def compute_seams(sample: UVMeshSample, strategy: str, *,
                   angle_deg: float = 30.0,
@@ -273,9 +273,28 @@ def compute_seams(sample: UVMeshSample, strategy: str, *,
   > implementation therefore protects a dangling cut sharper than
   > `curvature_threshold`, and restores a closed component's raw cut wholesale
   > if the peel empties it. Open components prune normally.
+- `CONCAVE` -- added by the organic-mesh work (`docs/ORGANIC.md` section 7).
+  Weight every edge by its length scaled **down** where the dihedral is
+  concave, then cut the topological minimum that makes each shell a disk:
+  shortest weighted paths joining boundary loops, a tree-cotree loop per
+  handle, or a path between two curvature extremes on a closed shell. Further
+  cuts are added only where a curvature measurement demands them. Disk-ness is
+  proved, not assumed, by the exact Euler test on the **cut** surface
+  (`seams.cut_topology`).
+
+  > **Two facts this rests on, both measured.** First, `edge_dihedral_deg` is
+  > `arccos` of a dot product and therefore carries **no sign at all** -- a
+  > cube's convex 90 and an L-solid's concave 90 are the same number. The sign
+  > comes from the new `edge_signed_dihedral_deg`, which is positive for
+  > convex. Second, an Euler count over the *uncut* mesh cannot see a slit, so
+  > it calls a slit sphere `chi = 2`; and `sample.n_edges` is the quad mesh's
+  > edge count and omits the tessellation diagonals. Either mistake makes the
+  > disk test silently vacuous.
 - Must handle **non-manifold** edges (>2 incident faces) and boundary edges
   (1 face) without raising — boundary edges are never seams.
-- Pure numpy/stdlib. No `bpy`.
+- Pure numpy/stdlib. No `bpy`. No `scipy` either (ORGANIC.md section 0.5):
+  `CONCAVE`'s shortest paths are a `heapq` Dijkstra over a numpy CSR built in
+  this module.
 
 ---
 

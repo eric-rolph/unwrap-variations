@@ -668,6 +668,22 @@ class TestScreening:
         assert 5 in seen, "screening must ask for the cheap budget"
         assert None in seen, "an accepted merge must be re-flattened at full quality"
 
+    def test_the_default_budget_tracks_the_flatteners_own(self, monkeypatch):
+        """A pinned constant already went stale here once, silently.
+
+        The screening budget was 8 against a flattener defaulting to 32.  When
+        that default moved to 256, 8 iterations left every candidate over the
+        distortion bound and Suzanne merged nothing at all -- while still paying
+        for the screening that found out.  The budget is a ratio for that reason.
+        """
+        flatten_mod = import_or_skip("unwrap_variations.core.flatten")
+        monkeypatch.setattr(flatten_mod, "_DEFAULT_ITERS", 256, raising=False)
+        assert charts._screen_iters() == 32
+        monkeypatch.setattr(flatten_mod, "_DEFAULT_ITERS", 32, raising=False)
+        assert charts._screen_iters() == 16
+        monkeypatch.setattr(flatten_mod, "_DEFAULT_ITERS", "nonsense", raising=False)
+        assert charts._screen_iters() == charts._SCREEN_ITERS_FALLBACK
+
     def test_a_flattener_without_an_iters_argument_still_works(self):
         """An injected stub must not have to grow an argument it does not use."""
         sample = quad_grid(2, 1)

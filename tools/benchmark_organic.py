@@ -93,6 +93,17 @@ SHARP_ANGLE_RAD = 0.523599
 SCORER_FILES = ("unwrap_variations/core/metrics.py", "unwrap_variations/core/evaluator.py")
 
 
+def say(message: str = "") -> None:
+    """Print one line and flush it.
+
+    Blender block-buffers Python stdout when it is redirected to a file, so an
+    unflushed long run looks identical to a hung one for its entire duration.
+    A harness that takes an hour has to show progress while it takes it.
+    """
+    print(message)
+    sys.stdout.flush()
+
+
 def _load(module_name: str, filename: str):
     """Import a sibling ``tools/`` script by path (``tools/`` is not a package)."""
     key = "unwrap_variations_%s" % module_name
@@ -497,38 +508,39 @@ def main() -> int:
         else:
             before_note = "no unwrap_variations package under %s" % root
 
-    print("ORGANIC CORPUS BENCHMARK -- Blender %s, numpy %s"
+    say("ORGANIC CORPUS BENCHMARK -- Blender %s, numpy %s"
           % (bpy.app.version_string, np.__version__))
-    print("preset %r | seed %d | %d candidates | median of %d runs [min-max]"
+    say("preset %r | seed %d | %d candidates | median of %d runs [min-max]"
           % (args.preset, args.seed, args.count, repeats))
-    print("A verdict requires the median margin to exceed the FULL combined spread")
-    print("and to exceed %.1f point; anything else is a tie." % MIN_MARGIN)
+    say("A verdict requires the median margin to exceed the FULL combined spread")
+    say("and to exceed %.1f point; anything else is a tie." % MIN_MARGIN)
     if repeats < 2:
-        print("WARNING: --repeats 1 produces a sample, not a measurement. Do not publish it.")
-    print()
-    print("BEFORE column: %s" % before_note)
-    print("  after  root %s  engine.py %s" % (after.root, after.engine_hash))
+        say("WARNING: --repeats 1 produces a sample, not a measurement. Do not publish it.")
+    say()
+    say("BEFORE column: %s" % before_note)
+    say("  after  root %s  engine.py %s" % (after.root, after.engine_hash))
     if before is not None:
-        print("  before root %s  engine.py %s" % (before.root, before.engine_hash))
+        say("  before root %s  engine.py %s" % (before.root, before.engine_hash))
+        say("  before package resolved to %s" % before.package_file())
         if before.engine_hash == after.engine_hash:
-            print("  WARNING: identical engine.py in both roots -- the before column is")
-            print("           measuring the same code and cannot show an improvement.")
+            say("  WARNING: identical engine.py in both roots -- the before column is")
+            say("           measuring the same code and cannot show an improvement.")
         same_scorer = before.scorer_hashes() == after.scorer_hashes()
-        print("  scorer (metrics.py, evaluator.py): before %s  after %s  -> %s"
+        say("  scorer (metrics.py, evaluator.py): before %s  after %s  -> %s"
               % (before.scorer_hashes(), after.scorer_hashes(),
                  "IDENTICAL" if same_scorer else "DIFFERENT"))
         if not same_scorer:
-            print("  WARNING: THE SCORER MOVED between the two roots.  ORGANIC.md rule 1")
-            print("           freezes core/metrics.py for this work.  Both columns are")
-            print("           still scored by the CURRENT evaluator, so the table below")
-            print("           remains internally consistent, but any claim that the")
-            print("           before numbers match a previously published table is void.")
-    print()
+            say("  WARNING: THE SCORER MOVED between the two roots.  ORGANIC.md rule 1")
+            say("           freezes core/metrics.py for this work.  Both columns are")
+            say("           still scored by the CURRENT evaluator, so the table below")
+            say("           remains internally consistent, but any claim that the")
+            say("           before numbers match a previously published table is void.")
+    say()
 
     wanted = [n.strip() for n in args.meshes.split(",") if n.strip()] or list(corpus.NAMES)
     unknown = [n for n in wanted if n not in corpus.NAMES]
     if unknown:
-        print("ERROR: unknown mesh(es): %s" % ", ".join(unknown))
+        say("ERROR: unknown mesh(es): %s" % ", ".join(unknown))
         return 1
 
     rows = []
@@ -572,7 +584,7 @@ def main() -> int:
             timeouts["after"] += int(timed)
 
         if not max(counts):
-            print("%-17s GENERATION PRODUCED NOTHING" % name)
+            say("%-17s GENERATION PRODUCED NOTHING" % name)
             empty.append(name)
             continue
 
@@ -596,35 +608,35 @@ def main() -> int:
         if timeouts["after"] or timeouts["before"]:
             note = "  TIMED OUT: before %d/%d, after %d/%d repeats" % (
                 timeouts["before"], repeats, timeouts["after"], repeats)
-        print("%-17s measured (%d tris, %.1fs median generation)%s"
+        say("%-17s measured (%d tris, %.1fs median generation)%s"
               % (name, mesh.n_tris, statistics.median(seconds), note))
 
-    print()
+    say()
     _print_baseline_table(rows, args)
-    print()
+    say()
     _print_before_after_table(rows, before is not None)
-    print()
+    say()
     _print_timings(rows)
 
     if empty:
-        print()
-        print("FAILED: no candidates at all for: %s" % ", ".join(empty))
+        say()
+        say("FAILED: no candidates at all for: %s" % ", ".join(empty))
         return 1
-    print()
-    print("DONE")
+    say()
+    say("DONE")
     return 0
 
 
 def _print_baseline_table(rows, args) -> None:
     """Print the after-versus-single-pass table, in the published format."""
     width = 118
-    print("=" * width)
-    print("TABLE 1 -- best-of-%d against a single pass, on the organic corpus" % args.count)
-    print("=" * width)
-    print("%-17s %-7s %-20s %-20s %-20s %-20s %s"
-          % ("mesh", "tris", "smart_project", "unwrap+sharp", "xatlas",
-             "best-of-%d (after)" % args.count, "verdict"))
-    print("-" * width)
+    say("=" * width)
+    say("TABLE 1 -- best-of-%d against a single pass, on the organic corpus" % args.count)
+    say("=" * width)
+    say("%-17s %-7s %-20s %-22s %-20s %-20s %s"
+        % ("mesh", "tris", "smart_project", "unwrap+sharp", "xatlas",
+           "best-of-%d (after)" % args.count, "verdict"))
+    say("-" * width)
     record = {"WIN": 0, "tie": 0, "LOSS": 0, "n/a": 0}
     for row in rows:
         baseline = [
@@ -632,61 +644,61 @@ def _print_baseline_table(rows, args) -> None:
         ]
         label, margin, noise = verdict(row["after"], baseline)
         record[label] += 1
-        print("%-17s %-7d %-20s %-20s %-20s %-20s %-4s %+6.1f (noise %.1f) %d/%d"
+        say("%-17s %-7d %-20s %-22s %-20s %-20s %-4s %+6.1f (noise %.1f) %d/%d"
               % (row["mesh"], row["tris"], band(row["smart"]),
                  band(row["unwrap"]) + (" *" if row["stock"] else ""),
                  band(row["xatlas"]), band(row["after"]),
                  label, margin, noise, row["filled"], args.count))
-    print("-" * width)
-    print("RECORD: %d wins, %d ties, %d losses"
+    say("-" * width)
+    say("RECORD: %d wins, %d ties, %d losses"
           % (record["WIN"], record["tie"], record["LOSS"]))
     if any(row["stock"] for row in rows):
-        print("* the unwrap+sharp baseline did nothing measurable on this mesh: a")
-        print("  30-degree sharpness threshold selected no edges, uv.unwrap got no cuts,")
-        print("  failed to solve, and still reported FINISHED. What that cell contains is")
-        print("  the mesh's pre-existing UV map, not a single-pass unwrap.")
+        say("* the unwrap+sharp baseline did nothing measurable on this mesh: a")
+        say("  30-degree sharpness threshold selected no edges, uv.unwrap got no cuts,")
+        say("  failed to solve, and still reported FINISHED. What that cell contains is")
+        say("  the mesh's pre-existing UV map, not a single-pass unwrap.")
     missing = [row["mesh"] for row in rows if not row["xatlas"]]
     if missing:
-        print("xatlas column empty on %d mesh(es): %s"
+        say("xatlas column empty on %d mesh(es): %s"
               % (len(missing), rows[0]["xatlas_reason"] if rows else "?"))
 
 
 def _print_before_after_table(rows, have_before: bool) -> None:
     """Print the before-versus-after table, the one that answers the question."""
     width = 96
-    print("=" * width)
-    print("TABLE 2 -- did the organic-mesh work help?  before against after")
-    print("=" * width)
+    say("=" * width)
+    say("TABLE 2 -- did the organic-mesh work help?  before against after")
+    say("=" * width)
     if not have_before:
-        print("NO BEFORE COLUMN WAS MEASURED.")
-        print("Pass --before-ref e0360e5 (or --before-root PATH). Without it this")
-        print("script cannot show that any of the organic work improved anything, and")
-        print("a table of current numbers on its own is not evidence that it did.")
+        say("NO BEFORE COLUMN WAS MEASURED.")
+        say("Pass --before-ref e0360e5 (or --before-root PATH). Without it this")
+        say("script cannot show that any of the organic work improved anything, and")
+        say("a table of current numbers on its own is not evidence that it did.")
         return
-    print("%-17s %-20s %-20s %s" % ("mesh", "before", "after", "verdict"))
-    print("-" * width)
+    say("%-17s %-20s %-20s %s" % ("mesh", "before", "after", "verdict"))
+    say("-" * width)
     record = {"WIN": 0, "tie": 0, "LOSS": 0, "n/a": 0}
     for row in rows:
         label, margin, noise = verdict(row["after"], row["before"])
         record[label] += 1
-        print("%-17s %-20s %-20s %-4s %+6.1f (noise %.1f)"
+        say("%-17s %-20s %-20s %-4s %+6.1f (noise %.1f)"
               % (row["mesh"], band(row["before"]), band(row["after"]), label, margin, noise))
-    print("-" * width)
-    print("RECORD vs BEFORE: %d improved, %d unchanged, %d regressed"
+    say("-" * width)
+    say("RECORD vs BEFORE: %d improved, %d unchanged, %d regressed"
           % (record["WIN"], record["tie"], record["LOSS"]))
     if record["LOSS"]:
-        print("A REGRESSION IS A BUG, not a trade-off: ORGANIC.md rule 2 says no stage")
-        print("may make a candidate worse.")
+        say("A REGRESSION IS A BUG, not a trade-off: ORGANIC.md rule 2 says no stage")
+        say("may make a candidate worse.")
 
 
 def _print_timings(rows) -> None:
     """Print per-mesh generation cost next to mesh size."""
-    print("=" * 60)
-    print("TIMINGS -- median seconds for one best-of-N generation")
-    print("=" * 60)
-    print("%-17s %-9s %s" % ("mesh", "tris", "seconds"))
+    say("=" * 60)
+    say("TIMINGS -- median seconds for one best-of-N generation")
+    say("=" * 60)
+    say("%-17s %-9s %s" % ("mesh", "tris", "seconds"))
     for row in rows:
-        print("%-17s %-9d %.2f" % (row["mesh"], row["tris"], row["seconds"]))
+        say("%-17s %-9d %.2f" % (row["mesh"], row["tris"], row["seconds"]))
 
 
 if __name__ == "__main__":

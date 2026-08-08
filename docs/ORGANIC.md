@@ -76,6 +76,13 @@ Ceilings, holding everything else fixed:
 | **overlap + seam** | **81.3** |
 | overlap + seam + packing | 88.2 |
 
+> **This table is optimistic and was corrected during the build. Read 0.7
+> before planning against it.** "Holding everything else fixed" is not
+> achievable by an actual repair: removing the overlap costs 0.0599 of penalty
+> elsewhere (angle +0.0205, area +0.0191, packing +0.0134, stretch +0.0069), so
+> the measured result of a real overlap fix is **40.18, not 42.7**. Every row
+> is wrong in the same direction and by the same mechanism.
+
 Seam targets, assuming overlap is fixed:
 
 | target score | required `seam_ratio` | required `seam_length` |
@@ -155,7 +162,77 @@ interpreter; it stays a CLI-only optional backend.
 This is a hard constraint, not a preference. A module that imports scipy will
 pass every test you run in your own CPython and fail for every user.
 
-### 0.6 Rules inherited from ARCHITECTURE.md that bite here
+### 0.6 Corrections found during the build
+
+Section 0 was measured before the work started, and the work found parts of it
+wrong. These supersede anything above that contradicts them. Recording them
+here rather than silently editing, because which claims turned out to be false
+is itself useful.
+
+**The ceiling table in 0.2 is optimistic.** See the note under it. A real
+overlap fix scores 40.18, not 42.7, because the terms are not independent.
+
+**The fold is in TWO charts, not one.** 0.3 says "one region of a chart lapping
+over a distant region of the same chart", singular. Measured: chart 9 carries
+0.000439 over 2 pairs, chart 10 carries 0.000903 over 14, and there are **3**
+boundary crossings, not 1. All 16 pairs are intra-chart; none straddle two
+charts, so the "fold not packing collision" conclusion stands.
+
+**0.3 understates its own case.** Certifying all ten candidates on both
+Blenders: **every one has `flipped_tris = 0`**, and **9 of the 10 overlap**
+(0.00012 to 0.220, up to 387 boundary crossings). A flip check is blind not
+merely to the winner's defect but to every defect this pipeline produces on
+Suzanne.
+
+**Section 4.1's definition of `globally_injective` is insufficient.**
+`locally_injective and boundary_crossings == 0` admits at least three
+non-injective layouts: a chart nested wholly inside another (containment
+produces no crossings at all); a bowtie, which has `chi == 1` *and* a single
+boundary cycle, so it passes the obvious disk test while one lobe sits inside
+the other; and a closed chart, which has **zero** boundary loops and therefore
+trivially zero crossings while overlapping itself completely. The shipped
+definition is `locally_injective and boundary_crossings == 0 and
+non_disk_charts == 0 and overlap_area == 0.0`, with disk defined as `chi == 1`
+**and** exactly one boundary loop **and** no edge with more than two incident
+triangles **and** no loop revisiting a UV vertex.
+
+**Section 4.2's fixed iteration budget is actively harmful.** Certification is
+**not monotone in iterations** even though energy is. Measured on chart 9:
+energy 18.371 -> 4.041 at 32 iterations (certifies clean) -> 4.034 at 64 (**2
+crossings**) -> 4.030 at 128 (2 crossings). A fixed 128-iteration budget
+certifies nothing, falls through to the fixed-boundary fallback and returns
+energy 17.977 -- **4.4x worse as a direct result of asking for more
+iterations**. The fix is to certify every 16 iterations and keep the
+lowest-energy passing iterate.
+
+**Mean-value weights are not symmetric,** so "`SparseSym` + CG + Floater" as
+4.2 words it cannot be taken literally. Resolved by symmetrising
+`(w_ij + w_ji)/2`: Tutte/Floater needs only positive convex-combination
+weights, not symmetry, so the injectivity guarantee survives.
+
+**4.2's "never return a layout that fails certification" conflicts with Rule 2**
+at the layout level, because the *input* fails certification. Resolved by
+scope: per-*chart*, nothing uncertified is ever written; per-*layout*, Rule 2
+wins and an unimprovable input is returned untouched.
+
+**The baseline in section 0 is no longer reproducible from
+`engine.generate(count=10, seed=1)`.** Adding the `CONCAVE` strategy changed
+the recipe grid, so the 14-island / 0.0013421 layout is no longer the winner.
+It is still generated, and it is pinned as a fixture; **any acceptance
+criterion phrased as "the winning layout from seed 1" is a moving target and
+must be restated against the fixture.** The pre-work baseline for benchmarking
+purposes is a pristine worktree at commit `e0360e5`, not `refine_layouts=False`
+on current code -- the latter reads 39.97 on Suzanne, because the new seam
+strategies lift the un-refined path too.
+
+**A pre-existing bug in the naive oracle.** `tests/reference.py::tri_overlap_area`
+returned 0.5 -- the subject triangle's entire area -- for a pair that does not
+overlap at all, because a collapsed clip triangle has zero-length edges and a
+zero-length edge's half-plane test is vacuously true, so it clipped nothing. It
+survived because every `reference_metrics` call in `test_evaluator.py` passes
+`do_overlap=False`. Fixed with an exact zero-area guard and a regression test.
+
+### 0.7 Rules inherited from ARCHITECTURE.md that bite here
 
 Re-stated because they have already cost this project real bugs:
 

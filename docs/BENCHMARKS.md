@@ -389,3 +389,168 @@ Besides the table it prints two things worth reading:
 Run it on both supported Blender versions before publishing. The scores should
 match; if they do not, that is a bug and it is more interesting than the
 benchmark.
+
+---
+
+## 7. The organic corpus
+
+Everything above is measured on seven Blender primitives. Primitives are the
+right corpus for the claim in [section 1](#1-what-is-actually-being-claimed) --
+reproducible anywhere, no download, covering the topologies that break
+unwrappers -- and they are the wrong corpus for judging an unwrapper on the
+work artists actually do. A sphere and a cube are the shapes every unwrapper is
+already tuned for. Suzanne is the only organic mesh in that table, and she is
+one data point.
+
+`docs/ORGANIC.md` section 8 therefore specifies a second corpus, eight meshes
+built procedurally in-script, and a second benchmark that answers a harder
+question than the one above.
+
+### 7.1 The corpus
+
+Built by [`tools/organic_corpus.py`](../tools/organic_corpus.py). No downloads:
+the implicit surfaces are polygonised by a marching-tetrahedra routine written
+in that file, and the analytic ones come from explicit vertex arrays.
+
+| mesh | tris | shells | chi | why it is hard |
+| --- | ---: | ---: | ---: | --- |
+| `suzanne` | 968 | 3 | 0, 1, 1 | creases, ears, two boundary loops, three shells -- the reference case |
+| `suzanne_sub2` | 15744 | 3 | 0, 1, 1 | same shape at scale; tests everything quadratic or worse |
+| `blob_limbs` | 7608 | 1 | 2 | metaball creature, five protruding limbs -- chart-per-limb decomposition |
+| `displaced_sphere` | 1280 | 1 | 2 | closed genus 0 with **no sharp edge anywhere**; `SHARP` selects nothing |
+| `torus_knot` | 5808 | 1 | 0 | genus 1 with an organic cross-section; needs two cuts before any parameterisation exists |
+| `hand` | 9280 | 1 | 2 | five protrusions close together -- charts that collide in UV even when each is fine |
+| `folded_ribbon` | 1752 | 1 | 1 | ships a UV layout that is locally injective and globally **not** |
+| `pinched` | 320 | 1 | 2 | zero-area faces, slivers, coincident vertices -- robustness only |
+
+Every entry carries pinned invariants (vertex and triangle count, shell count,
+Euler characteristic and boundary-edge count per shell) and `build()` verifies
+them, so a corpus regression fails at build time rather than surfacing later as
+a mysteriously moved benchmark cell.
+
+**Determinism was measured, not assumed.** All eight meshes come out
+bit-identical on Blender 4.5.4 (numpy 1.26.4, Python 3.11) and Blender 5.1.2
+(numpy 2.3.4, Python 3.13) -- vertex arrays, triangle arrays and content
+digests. Against an unrelated numpy build (2.2.6 on scipy-openblas)
+connectivity is still bit-identical everywhere and the two implicit meshes are
+bit-identical too; only the three meshes that call `np.linalg.norm` or libm's
+`cos` differ, by 1 to 3 ULP (max 6.7e-16), which is far too small to move an
+invariant.
+
+`folded_ribbon` deserves its own note, because it is the entry that makes the
+injectivity work testable at all. `docs/ORGANIC.md` section 0.3 established
+that Suzanne's overlap is **not** a flip: all 968 signed UV areas are positive,
+the map is locally injective everywhere, and the chart boundary still laps over
+a distant part of itself. `folded_ribbon` reproduces that defect deliberately
+and minimally -- its UV layout follows an Archimedean spiral whose radial pitch
+(0.1257) is smaller than the ribbon's width (0.18), so the turns *must* overlap,
+while the half-width stays more than three times below the smallest radius of
+curvature, so no triangle can invert. Both properties are asserted when the mesh
+is built. The corpus also ships the same ribbon unrolled flat, as the control:
+a certifier that answered "broken" unconditionally would pass every defect test
+and then reject every good layout a user has.
+
+### 7.2 Oracles
+
+Three, all in `tests/reference.py`, all deliberately naive:
+
+- **Topology** -- `reference_shell_topology`, shell count and Euler
+  characteristic from the triangle soup with plain dicts and sets. It shares no
+  code with the vectorised version in `tools/organic_corpus.py`, and a test
+  asserts they agree shell for shell on every corpus mesh. Every `chi` quoted in
+  ORGANIC.md section 0.1 rests on that agreement.
+- **Layout metrics** -- `reference_layout_metrics`, covering the fields
+  `reference_metrics` did not: packing efficiency (by an exact
+  coordinate-compression sweep over the union of island bounding boxes rather
+  than the evaluator's rasterisation), UV coverage, seam ratio, texel-density
+  spread, UV bounds and the out-of-bounds count.
+- **Injectivity** -- the naive all-pairs pass, cross-checked against the runtime
+  certifier on every corpus mesh.
+
+### 7.3 Visual regression
+
+[`tools/render_uv_report.py`](../tools/render_uv_report.py) renders what the
+harness measures. For every corpus mesh and every variant it writes the UV
+layout as a PNG -- islands filled with distinct colours, island boundaries and
+seam-flagged edges drawn, and every triangle in a real overlap outlined in red,
+confirmed by exact convex clipping rather than a separating-axis test -- plus
+the mesh itself checker-textured from three fixed camera angles, and an index
+page tying the pictures to the numbers.
+
+This exists because of the 276-island Suzanne in
+[section 4.1](#41-what-changed-since-the-provisional-table). That layout scored
+well on distortion by shattering the mesh into confetti. No metric in the suite
+caught it. Anybody looking at it would have, in a second.
+
+```bash
+blender -b --factory-startup --python tools/render_uv_report.py -- --out renders/
+```
+
+The UV panels are software-rasterised in numpy and written through
+`bpy.data.images`, because `docs/ARCHITECTURE.md` section 0 records that the
+`gpu` module raises `SystemError` in background mode. The 3D views use EEVEE,
+whose identifier differs between the supported builds (`BLENDER_EEVEE_NEXT` on
+4.5.4, `BLENDER_EEVEE` on 5.1.2) and is resolved by probing the enum rather
+than by branching on a version number.
+
+### 7.4 The before column is mandatory
+
+[`tools/benchmark_organic.py`](../tools/benchmark_organic.py) runs the corpus
+against `smart_project`, `unwrap+sharp`, `xatlas` where it is reachable, and
+best-of-N measured **twice**: once with the engine as it was before the
+organic-mesh work, and once with the engine as it is now.
+
+A table of current numbers, however good they look, is not evidence that the
+work helped. The before column is produced by importing a second copy of the
+`unwrap_variations` package from a pristine `git archive` of the pre-work
+commit, in the same Blender process, with `sys.modules` purged in between. Both
+columns are then scored by **one** evaluator, the current one, so the
+comparison measures generation and nothing else.
+
+Two guards are printed on every run:
+
+- the resolved package path and a hash of `core/engine.py` for each root, so a
+  reader can see the two columns really ran different code;
+- a hash of `core/metrics.py` and `core/evaluator.py` in both roots. ORGANIC.md
+  rule 1 freezes the scorer for this work; if it moved anyway, every margin is
+  meaningless and the script says so in capitals rather than quietly publishing
+  it. Hashes are taken after normalising line endings, because `git archive` on
+  Windows honours `core.autocrlf` and would otherwise make a byte-identical
+  `metrics.py` look changed on every single run.
+
+The verdict rule is the same one [section 4](#4-results) uses -- the median
+margin must clear both the full combined spread and a 1.0-point floor -- for
+the reason two benchmarks in one repository with two different definitions of a
+win is how a project ends up quoting whichever number flatters it.
+
+```bash
+blender -b --factory-startup --python tools/benchmark_organic.py -- \
+    --before-ref e0360e5 --repeats 5
+```
+
+Generation on this corpus is far more expensive than on the primitives, so the
+script cancels a single generation through the engine's own `should_cancel`
+probe after `--gen-timeout` seconds (default 300) and reports the timeout rather
+than hanging. A benchmark whose job is to catch a regression has to survive one.
+
+### 7.5 Reproducing ORGANIC.md section 0
+
+[`tools/diag_organic.py`](../tools/diag_organic.py) regenerates every measured
+number in that contract's section 0 -- Suzanne's per-shell topology computed
+twice by two independent implementations, the exact penalty decomposition and
+ceiling analysis, the overlap classification with a Monte-Carlo cross-check of
+the clipper, and the seam budget -- plus the corpus and oracle report.
+
+```bash
+blender -b --factory-startup --python tools/diag_organic.py -- --corpus
+```
+
+One correction is worth recording rather than burying. The scratch diagnostic
+that produced the section 0.4 seam table also contained an overlap pass, and
+that pass **reported zero overlap on Suzanne**: its Sutherland-Hodgman clipper
+tested the wrong side of each clip edge and never oriented its input, so it
+clipped every counter-clockwise pair away to nothing. Section 0.3's figure came
+from a second, correct implementation. `tools/diag_organic.py` keeps only the
+correct one and cross-checks it against Monte-Carlo integration, so a false
+clean bill of health on the most consequential measurement in the contract
+cannot happen silently again.

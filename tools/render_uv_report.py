@@ -787,12 +787,21 @@ def main() -> int:
             failures.append(name)
             continue
 
+        variant_ids = ["baseline", "bestofn"]
+        if mesh.uvs is not None:
+            # A mesh that ships its own layout gets that layout rendered too.
+            # For folded_ribbon this is the deliberate defect itself, and being
+            # able to look at it is the difference between believing the
+            # injectivity oracle and taking it on trust.
+            variant_ids.insert(0, "corpus")
         variants = []
-        for variant_id in ("baseline", "bestofn"):
+        for variant_id in variant_ids:
             bpy.ops.wm.read_factory_settings(use_empty=True)
             _setup_lighting()
             obj = corpus.to_object(mesh)
-            if variant_id == "baseline":
+            if variant_id == "corpus":
+                label = "corpus layout (as shipped)"
+            elif variant_id == "baseline":
                 label = variant_baseline(obj)
             else:
                 label, _report = variant_bestofn(

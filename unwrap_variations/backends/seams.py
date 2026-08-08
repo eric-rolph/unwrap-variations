@@ -35,7 +35,7 @@ Invariants honoured by *every* strategy
   being physically meaningful without re-filtering it.
 * A **non-manifold** edge (three or more incident faces) cannot lie in the
   interior of a 2-manifold chart, so the geometric strategies (``SHARP``,
-  ``ANGLE``, ``CURVATURE``, ``DUAL_GRAPH``) always cut it.
+  ``ANGLE``, ``CURVATURE``, ``DUAL_GRAPH``, ``CONCAVE``) always cut it.
 * Nothing raises.  Empty meshes, zero-edge meshes, degenerate triangles,
   out-of-range indices and NaN coordinates all yield a well-formed ``(E,)``
   boolean mask.
@@ -54,6 +54,23 @@ unmatched (diagonal) adjacencies as *uncuttable*, contracting the triangles of
 one n-gon into a single dual node.  Skipping either half of that silently
 produces seams along invisible diagonals, or charts that are split down the
 middle of a quad.
+
+Measuring a cut
+---------------
+
+``CONCAVE`` needs to know whether the cut it has made turns every chart into a
+disk, and there is exactly one way to ask that honestly: the Euler
+characteristic of the **cut** surface, ``chi = V - E + F``, per chart, over the
+triangulated submesh.  Two traps around it, both of which have real teeth:
+
+* ``sample.n_edges`` is the *quad* mesh's edge count and excludes tessellation
+  diagonals, so anything that reasons about cut length or Euler counts from it
+  is quietly wrong.  Nothing here uses it.
+* An Euler count taken over the *uncut* mesh cannot see a **slit** -- a cut
+  whose two sides stay in the same chart -- because both sides share the same
+  original vertices.  A slit sphere is a perfectly good disk and such a count
+  reports it as ``chi = 2``.  :func:`cut_topology` builds the cut surface
+  explicitly, welding corners only across sides that survive the cut.
 """
 
 from __future__ import annotations
@@ -1766,10 +1783,10 @@ class _ConcaveCutter:
             if hit < 0:
                 break
             path = _trace_edges(prev_v, prev_e, hit)
-            if self._mark_sides(g, path) == 0 and path:
-                # The whole path already lay on open sides; nothing to cut, so
-                # the loops are joined for free.  Still count it as progress.
-                pass
+            # A path that marks nothing still counts as progress: it means the
+            # route ran entirely along sides that were already open, so the two
+            # loops are joined for free.
+            self._mark_sides(g, path)
             added += 1
             self.joins += 1
             for side in path:
@@ -2099,10 +2116,20 @@ class _ConcaveCutter:
             self.open_by_spanning_tree(ct, chart)
 
         scale = min(max(_finite(curvature_threshold, 0.35), 0.02), 0.95)
+        # ``curvature_threshold`` has to move the answer on the mesh this
+        # strategy exists for, and on an absolute criterion alone it does not:
+        # Suzanne's head carries **188 radians** of interior absolute Gaussian
+        # curvature against a sphere's 4 pi, so every chart stays over every
+        # budget in the legal range and the cap decides everything.  Measured,
+        # thresholds 0.05 through 0.90 all produced the identical 27-chart cut.
+        # Letting the threshold spend the allowance as well makes it a single
+        # monotone "how hard should I cut" dial on every mesh, which is the
+        # same thing it means for ``CURVATURE`` and ``DUAL_GRAPH``.
+        allowance = max(2, int(round(max_extra_cuts * (1.0 - scale))))
         self.escalate(
             cone=scale * math.pi,
             chart_budget=scale * 4.0 * math.pi,
-            budget=max_extra_cuts,
+            budget=min(allowance, max_extra_cuts),
         )
         return rounds
 
