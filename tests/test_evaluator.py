@@ -878,3 +878,35 @@ def test_overlap_saturates_rather_than_reporting_clean_when_the_hash_gives_up(ev
         "health that injectivity.certify believes" % saturated
     )
     assert saturated > 0.0
+
+
+def test_organic_baseline_fixture_still_carries_the_contracts_numbers(evaluator):
+    """The layout ``docs/ORGANIC.md`` section 0 is measured against is pinned.
+
+    Section 0's figures were originally quoted as "the winner of
+    ``engine.generate(count=10, seed=1)``".  That stopped being reproducible the
+    moment the ``CONCAVE`` strategy entered the recipe grid, and two separate
+    pieces of work had acceptance criteria evaporate underneath them as a
+    result.  The layout itself is the thing worth pinning; the procedure that
+    happened to produce it is not.
+
+    If this test fails, the fixture changed -- not the engine.  Section 0 and
+    every acceptance criterion derived from it are measured against these exact
+    numbers, so they move together or not at all.
+    """
+    from tests.conftest import load_corpus
+
+    sample = load_corpus("suzanne_organic_baseline")
+    assert sample.n_tris == 968
+    assert sample.n_loops == 1968
+    assert sample.n_verts == 507
+
+    m = evaluator.evaluate(sample)
+    assert m.island_count == 14
+    assert m.flipped_tris == 0
+    assert m.degenerate_tris == 0
+    assert m.overlap_area == pytest.approx(0.0013420951, rel=1e-6), (
+        "ORGANIC.md 0.2 and 0.3 both quote this figure; it is the whole reason "
+        "the fold work exists"
+    )
+    assert m.stretch_l2 == pytest.approx(1.0164, abs=5e-4)
