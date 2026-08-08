@@ -1,0 +1,200 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Blender used for the headless integration harness. 4.5 LTS is the floor the
+  # project is verified against; bump both values together.
+  BLENDER_SERIES: "4.5"
+  BLENDER_VERSION: "4.5.4"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint + unit tests for the bpy-free core. No Blender involved.
+  # ---------------------------------------------------------------------------
+  lint-and-test:
+    name: "lint + pytest (py${{ matrix.python-version }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "ruff>=0.5" "pytest>=7.4" "numpy>=1.24"
+
+      - name: Ruff lint
+        run: ruff check --output-format=github .
+
+      - name: Ruff format check (advisory)
+        continue-on-error: true
+        run: ruff format --check --diff .
+
+      - name: Pytest (bpy-free core)
+        run: |
+          if [ -d tests ] && [ -n "$(find tests -name 'test_*.py' -print -quit)" ]; then
+            python -m pytest -ra
+          else
+            echo "No tests/test_*.py yet - skipping."
+          fi
+
+      - name: Assert the core imports without bpy
+        run: |
+          cat > /tmp/uvvar_no_bpy.py <<'PY'
+          """docs/ARCHITECTURE.md section 1.2: the core must not touch bpy."""
+          import importlib
+          import sys
+
+          # Poison the module table so any `import bpy` raises ImportError.
+          # A correctly guarded `try: import bpy / except ImportError:` survives.
+          sys.modules["bpy"] = None
+
+          MODULES = (
+              "unwrap_variations.core.params",
+              "unwrap_variations.core.meshdata",
+              "unwrap_variations.core.metrics",
+              "unwrap_variations.core.evaluator",
+              "unwrap_variations.backends.seams",
+          )
+
+          failures = []
+          for name in MODULES:
+              try:
+                  importlib.import_module(name)
+              except ModuleNotFoundError as ex:
+                  if (ex.name or "").startswith(name):
+                      print("SKIP (not written yet): {}".format(name))
+                      continue
+                  failures.append("{}: {}".format(name, ex))
+              except Exception as ex:
+                  failures.append("{}: {!r}".format(name, ex))
+              else:
+                  print("OK: {}".format(name))
+
+          for line in failures:
+              print("FAIL: {}".format(line))
+          sys.exit(1 if failures else 0)
+          PY
+          python /tmp/uvvar_no_bpy.py
+
+  # ---------------------------------------------------------------------------
+  # Packaging: manifest validation, archive build, install/enable, and the
+  # headless integration harness -- all on a real Blender.
+  # ---------------------------------------------------------------------------
+  blender:
+    name: "blender (package + headless tests)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache Blender
+        id: cache-blender
+        uses: actions/cache@v4
+        with:
+          path: ~/blender
+          key: blender-${{ env.BLENDER_VERSION }}-linux-x64
+
+      - name: Download Blender
+        if: steps.cache-blender.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          ARCHIVE="blender-${BLENDER_VERSION}-linux-x64.tar.xz"
+          PRIMARY="https://download.blender.org/release/Blender${BLENDER_SERIES}/${ARCHIVE}"
+          MIRROR="https://ftp.nluug.nl/pub/graphics/blender/release/Blender${BLENDER_SERIES}/${ARCHIVE}"
+          mkdir -p ~/blender
+          echo "Fetching ${PRIMARY}"
+          curl -fL --retry 3 --retry-delay 5 -o "/tmp/${ARCHIVE}" "${PRIMARY}" \
+            || { echo "Primary failed, falling back to ${MIRROR}"; \
+                 curl -fL --retry 3 --retry-delay 5 -o "/tmp/${ARCHIVE}" "${MIRROR}"; }
+          tar -xJf "/tmp/${ARCHIVE}" -C ~/blender --strip-components=1
+          rm -f "/tmp/${ARCHIVE}"
+
+      - name: Install Blender runtime libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libsm6 libice6 libxi6 libxxf86vm1 libxfixes3 libxrender1 \
+            libxkbcommon0 libxrandr2 libxinerama1 libxcursor1
+
+      - name: Report Blender version
+        run: |
+          echo "BLENDER=$HOME/blender/blender" >> "$GITHUB_ENV"
+          "$HOME/blender/blender" --version | head -3
+
+      - name: Validate the extension manifest
+        run: '"$BLENDER" --factory-startup --command extension validate unwrap_variations'
+
+      - name: Build the extension archive
+        run: |
+          python tools/build_extension.py --blender "$BLENDER" --output-dir dist --verbose
+          ls -l dist
+
+      - name: Install and enable the extension headlessly
+        run: |
+          set -euo pipefail
+          ZIP="$(ls dist/*.zip | grep -v -- '-legacy' | head -1)"
+          echo "Installing ${ZIP}"
+          cat > /tmp/uvvar_install_check.py <<'PY'
+          """Install the built archive into a scratch user repo and enable it."""
+          import os
+          import sys
+
+          import bpy
+
+          zip_path = os.environ["UVVAR_ZIP"]
+          bpy.ops.extensions.package_install_files(
+              filepath=zip_path,
+              repo="user_default",
+              enable_on_install=True,
+          )
+          module = "bl_ext.user_default.unwrap_variations"
+          enabled = module in bpy.context.preferences.addons
+          print("EXTENSION ENABLED:", enabled)
+          sys.exit(0 if enabled else 1)
+          PY
+          UVVAR_ZIP="$PWD/${ZIP}" "$BLENDER" -b --factory-startup \
+            --python /tmp/uvvar_install_check.py
+
+      - name: Headless integration harness
+        run: |
+          if [ -f tools/run_blender_tests.py ]; then
+            "$BLENDER" -b --factory-startup --python tools/run_blender_tests.py
+          else
+            echo "tools/run_blender_tests.py not present yet - skipping."
+          fi
+
+      - name: Upload the built archives
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unwrap-variations-extension
+          path: dist/*.zip
+          if-no-files-found: warn

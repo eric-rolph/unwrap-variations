@@ -16,7 +16,7 @@ import json
 import math
 import random
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 __all__ = [
     "UnwrapParams",
@@ -182,7 +182,7 @@ class UnwrapParams:
         version of the add-on must still open in an older one, so unrecognised
         keys are dropped rather than raising.
         """
-        known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
+        known = set(cls.__dataclass_fields__)  # type: ignore[attr-defined]
         clean: dict[str, Any] = {}
         for key, value in dict(data or {}).items():
             if key in known:

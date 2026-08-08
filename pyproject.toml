@@ -1,0 +1,103 @@
+# Tooling metadata for UnwrapVariations.
+#
+# IMPORTANT: this file does NOT make the add-on pip-installable, and it is not
+# meant to. UnwrapVariations is a Blender add-on: it is distributed as an
+# extension archive built from `unwrap_variations/blender_manifest.toml` (see
+# `tools/build_extension.py`) and it runs inside Blender's own Python.
+#
+# `pyproject.toml` exists so that ruff and pytest have a single, discoverable
+# configuration for the bpy-free core, which is unit-tested in plain CPython.
+# There is deliberately no `[build-system]` table.
+
+[project]
+name = "unwrap-variations"
+version = "0.1.0"
+description = "Blender add-on that generates, scores and compares many UV unwraps side by side"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "Eric Rolph", email = "ericrolph@gmail.com" }]
+keywords = ["blender", "addon", "uv", "unwrap", "texturing"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Plugins",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+
+# Blender ships numpy already; this pin only describes what the bpy-free core
+# needs when the tests run outside Blender.
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "ruff>=0.5"]
+
+[project.urls]
+Homepage = "https://github.com/eric-rolph/unwrap-variations"
+Source = "https://github.com/eric-rolph/unwrap-variations"
+Issues = "https://github.com/eric-rolph/unwrap-variations/issues"
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+# Blender 4.2 ships Python 3.11; 5.1 ships 3.13. 3.11 is the floor, so target it.
+target-version = "py311"
+extend-exclude = ["dist", "artifacts", ".uvvar_tmp"]
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "W",   # pycodestyle warnings
+  "F",   # pyflakes
+  "I",   # isort
+  "B",   # flake8-bugbear
+  "C4",  # flake8-comprehensions
+  "SIM", # flake8-simplify
+]
+# "UP" (pyupgrade) is deliberately NOT selected. It fires ~50 times on
+# `core/params.py` and `core/meshdata.py` -- printf-style formatting and quoted
+# annotations -- and docs/ARCHITECTURE.md sections 2 and 3 pin those modules as
+# "WRITTEN, do not change". A rule nobody is allowed to satisfy is a rule that
+# only ever makes CI red. Enable it in a dedicated cleanup pass, not here.
+
+ignore = [
+  # docs/ARCHITECTURE.md section 1.4 requires every failure to be contained, so
+  # `try: <bpy call> except Exception: pass` is the house pattern at the bpy
+  # edge. `contextlib.suppress` reads no better there and hides the intent.
+  "SIM105",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Package inits re-export names for the public surface.
+"unwrap_variations/**/__init__.py" = ["F401"]
+# Test helpers legitimately shadow builtins and use bare asserts.
+"tests/**" = ["B011"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["unwrap_variations"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+  "slow: marks tests that take more than a second",
+  "perf: performance budget checks (see docs/ARCHITECTURE.md section 4)",
+]

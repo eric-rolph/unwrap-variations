@@ -392,6 +392,51 @@ raising.
 individual metric floats) that mirrors the store for UI drawing. The UI reads
 **only** the CollectionProperty, never the numpy store.
 
+## 11b. Runtime module name and the bpy-free precondition
+
+Two cross-worker rules that are easy to violate silently. Both are contract.
+
+**The installed package is not called `unwrap_variations`.** Installed as a
+4.2+ extension it is `bl_ext.user_default.unwrap_variations`. Therefore:
+
+- Every intra-package import **must be relative** (`from ..core import params`).
+  An absolute `import unwrap_variations.core.params` inside the add-on raises at
+  runtime once installed, even though it works fine from a source checkout.
+- `__init__.py` must key preferences off `__package__` / `__name__`, never the
+  literal string `"unwrap_variations"`. `AddonPreferences.bl_idname` must be
+  `__package__`.
+- The manifest `id` **must** equal the package directory name.
+
+**`__init__.py` must not import `bpy` at module top level.** Importing any core
+module (`import unwrap_variations.core.params`) executes the package
+`__init__.py` first. A top-level `import bpy` there breaks plain-CPython pytest
+and voids the bpy-free guarantee in section 1.2 for the entire core. Guard it:
+
+```python
+try:
+    import bpy
+except ImportError:      # running outside Blender, e.g. under pytest
+    bpy = None
+```
+
+or keep every `bpy` touch inside functions. CI enforces this by poisoning
+`sys.modules["bpy"]` and importing the core modules.
+
+## 11c. Packaging
+
+The deliverable is a Blender extension archive, not a wheel.
+
+- `unwrap_variations/blender_manifest.toml` lives **next to `__init__.py`**,
+  because the package directory *is* the extension source directory.
+- Build and validate with Blender itself:
+  `blender --command extension validate unwrap_variations` and
+  `blender --command extension build --source-dir unwrap_variations`.
+- `tags` must come from Blender's controlled 32-entry add-on vocabulary.
+  `tagline` and every `[permissions]` description are capped at 64 characters
+  and may not end in a period.
+- Version lives in **two** places that must move together:
+  `blender_manifest.toml` `version` and `pyproject.toml` `version`.
+
 ## 12. Naming, style, tests
 
 - `UVVAR_` prefix on every registered class (`UVVAR_OT_`, `UVVAR_PT_`, `UVVAR_PG_`).

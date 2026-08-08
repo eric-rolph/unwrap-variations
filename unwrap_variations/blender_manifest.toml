@@ -1,0 +1,70 @@
+# Blender extension manifest (Blender 4.2+).
+#
+# This file lives INSIDE the add-on package directory because that directory is
+# the extension source directory: `blender --command extension build` requires
+# `blender_manifest.toml` to sit next to `__init__.py`, and the resulting archive
+# places both at the archive root.
+#
+# Validate with:
+#   blender --factory-startup --command extension validate unwrap_variations
+# Build with:
+#   python tools/build_extension.py
+#
+# The same directory doubles as a legacy (pre-4.2) add-on folder; `__init__.py`
+# carries `bl_info` for that path and Blender 4.2+ simply ignores it.
+
+schema_version = "1.0.0"
+
+id = "unwrap_variations"
+version = "0.1.0"
+name = "Unwrap Variations"
+tagline = "Generate, score and compare many UV unwraps side by side"
+maintainer = "Eric Rolph <ericrolph@gmail.com>"
+type = "add-on"
+
+website = "https://github.com/eric-rolph/unwrap-variations"
+
+# GPL is required: the add-on links against Blender's Python API.
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+copyright = [
+  "2026 Eric Rolph",
+]
+
+# Tags must come from Blender's controlled vocabulary for add-ons, which is
+# `scripts/modules/_bpy_internal/extensions/tags.py` in the Blender install.
+# Verified identical in 4.5.4 and 5.1.2.
+tags = [
+  "UV",
+  "Mesh",
+  "Modeling",
+]
+
+# 4.2.0 is the first release with extension support. No upper bound: the add-on
+# is verified on 4.5.4 LTS and 5.1.2, and `blender_version_max` is an exclusive
+# bound that would lock out future releases for no benefit.
+blender_version_min = "4.2.0"
+
+# `platforms` is deliberately omitted. Omitting it means "every platform", which
+# is correct for a pure-Python add-on with no compiled dependencies. Listing
+# platforms only makes sense alongside platform-specific `wheels`, and any
+# platform not listed becomes uninstallable. The valid values, if ever needed:
+#   platforms = ["windows-x64", "windows-arm64", "macos-x64", "macos-arm64",
+#                "linux-x64", "linux-arm64"]
+#
+# `wheels` is likewise omitted: numpy ships inside Blender (verified 1.26.4 on
+# 4.5), and xatlas is absent by design and is reached out-of-process.
+
+[permissions]
+files = "Temporary files exchanged with out-of-process unwrap backends"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "*.pyc",
+  "*.pyo",
+  ".DS_Store",
+  ".ruff_cache/",
+  ".pytest_cache/",
+]

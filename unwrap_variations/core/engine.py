@@ -196,6 +196,118 @@ def derive_uv_seams(
     return out
 
 
+def dead_layout_reason(uvs: np.ndarray, previous: np.ndarray | None = None) -> str:
+    """Return why ``uvs`` is not a usable layout, or ``""`` when it is fine.
+
+    This exists because of a verified and genuinely nasty Blender behaviour:
+    **``bpy.ops.uv.unwrap`` returns ``{'FINISHED'}`` even when it fails.**  On a
+    closed mesh with no seams it prints "Unwrap failed to solve 1 of 1
+    island(s)" to the console, leaves the previous UVs completely untouched, and
+    still reports success.  Trusting the operator's return status therefore
+    scores a candidate that did nothing at all, and -- worse -- it inherits
+    whatever UVs the previous candidate left behind, so it can silently
+    duplicate a neighbour's result.
+
+    Six of ten slots on an icosphere were dead this way before this check
+    existed, every one of them reported as a valid candidate.
+
+    The check is deliberately at the engine level rather than inside a single
+    backend: it protects every backend, including third-party ones, and costs
+    a few microseconds against a solver that costs milliseconds.
+
+    Args:
+        uvs: ``(L, 2)`` candidate UVs.
+        previous: Optional UVs the mesh carried before this attempt.  When the
+            result is bit-identical to them, the solver almost certainly did
+            nothing.
+
+    Returns:
+        A human-readable reason, or the empty string when the layout is usable.
+    """
+    arr = np.asarray(uvs, dtype=np.float64)
+    if arr.size == 0:
+        return "backend produced no UVs"
+    if not np.isfinite(arr).all():
+        return "layout contains NaN or infinite coordinates"
+
+    span = arr.max(axis=0) - arr.min(axis=0)
+    if float(span.max()) <= 1e-9:
+        # Every UV collapsed onto a single point. This is what an unsolved
+        # unwrap leaves behind on a freshly created (zero-filled) UV layer.
+        return "unwrap produced a degenerate layout (all UVs coincident)"
+
+    if previous is not None:
+        prev = np.asarray(previous, dtype=np.float64)
+        if prev.shape == arr.shape and np.array_equal(prev, arr):
+            return "unwrap left the UVs unchanged (solver reported success but did nothing)"
+    return ""
+
+
+#: Solvers that need the surface cut open into disks before they can run.
+_SEAM_DRIVEN = ("ANGLE_BASED", "CONFORMAL", "MINIMUM_STRETCH")
+
+
+def repair_recipe(
+    params: UnwrapParams,
+    sample: UVMeshSample,
+    topo: "seam_mod.EdgeTopology",
+) -> tuple[UnwrapParams, str]:
+    """Rewrite a recipe that provably cannot work on *this* mesh.
+
+    A closed surface has no boundary, so a seam-driven solver given an empty
+    seam set has no disk to flatten and simply gives up -- and, because Blender
+    reports success anyway (see :func:`dead_layout_reason`), the slot is wasted
+    silently.  On an icosphere that was six of ten slots.
+
+    Rather than let the artist pay for dead slots, escalate the seam strategy to
+    ``DUAL_GRAPH``, which is guaranteed to produce a cut on a closed component
+    because it cuts the complement of a spanning forest of the face dual graph.
+
+    This is deliberately conservative: it only fires when the strategy yields
+    *no* seams at all on a mesh with *no* boundary, which is exactly the case
+    that cannot succeed.  Anything that might work is left untouched.
+
+    Args:
+        params: The recipe to check.
+        sample: The mesh it will run against.
+        topo: Prebuilt edge topology for ``sample``.
+
+    Returns:
+        ``(params, note)``. ``note`` is empty when nothing was changed.
+    """
+    if params.method not in _SEAM_DRIVEN:
+        return params, ""
+    if sample.n_edges == 0:
+        return params, ""
+    try:
+        if bool(topo.boundary_mask().any()):
+            # An open surface can always be flattened without extra cuts.
+            return params, ""
+        mask = seam_mod.compute_seams(
+            sample,
+            params.seam_strategy,
+            angle_deg=params.seam_angle_deg,
+            curvature_threshold=params.curvature_threshold,
+            existing=sample.edge_seam,
+            seed=params.seed,
+        )
+        if bool(np.asarray(mask).any()):
+            return params, ""
+    except Exception:  # noqa: BLE001 - a probe failure must not kill the run
+        return params, ""
+
+    # Derive a distinct seed from the original recipe so that several recipes
+    # escalating at once produce *different* dual-graph cuts instead of
+    # collapsing onto one identical signature and being de-duplicated away.
+    # Different seeds give genuinely different (and equally valid) cut sets.
+    spread = int(params.signature()[:8], 16) & 0x3FFFFFFF
+    return (
+        params.replace(seam_strategy="DUAL_GRAPH", seed=spread),
+        "%s yields no seams on a closed mesh; escalated to DUAL_GRAPH"
+        % params.seam_strategy,
+    )
+
+
 def _resolve_backend_id(params: UnwrapParams, allowed: Sequence[str] | None) -> str:
     """Pick the backend for ``params``, honouring an optional allow-list."""
     wanted = params.backend or "blender_native"
@@ -251,6 +363,10 @@ def _run_recipes(
 
         topo = seam_mod.build_edge_topology(sample)
         total = max(len(recipes), 1)
+        # Tracks the last layout a backend produced, so a solver that
+        # silently does nothing and inherits it can be detected.
+        previous_uvs: np.ndarray | None = None
+        seen_signatures: set[str] = set()
 
         for i, params in enumerate(recipes):
             if should_cancel is not None:
@@ -267,6 +383,18 @@ def _run_recipes(
                              % (i + 1, total, params.describe()))
                 except Exception:  # noqa: BLE001 - UI callback is advisory
                     pass
+
+            # Rewrite recipes that cannot possibly work on this mesh, and
+            # de-duplicate: an escalation can collide with an existing recipe.
+            params, note = repair_recipe(params, sample, topo)
+            if note:
+                report.warnings.append("%s: %s" % (params.describe(), note))
+            if params.signature() in seen_signatures:
+                report.failures.append(
+                    (params, "duplicate of another candidate after repair")
+                )
+                continue
+            seen_signatures.add(params.signature())
 
             backend_id = _resolve_backend_id(params, backends)
             try:
@@ -295,6 +423,16 @@ def _run_recipes(
                      % (uvs.shape[0], sample.n_loops))
                 )
                 continue
+
+            # Blender can report success while doing nothing at all; see
+            # dead_layout_reason. Compare against the previous candidate's UVs
+            # too, because an unsolved unwrap silently inherits them.
+            dead = dead_layout_reason(uvs, previous_uvs)
+            if dead:
+                report.failures.append((params, dead))
+                previous_uvs = uvs
+                continue
+            previous_uvs = uvs
 
             try:
                 seam_mask = derive_uv_seams(sample, topo, uvs)
@@ -364,7 +502,30 @@ def _rank_in_place(candidates: list[Candidate], weights: ScoreWeights) -> None:
     for i, cand in enumerate(candidates):
         cand.index = i
         # Recorded on the candidate so the UI can badge it without recomputing.
-        setattr(cand, "pareto", id(cand) in front)
+        cand.pareto = id(cand) in front  # type: ignore[attr-defined]
+
+
+#: How many refill rounds `generate` will run before giving up on reaching the
+#: requested candidate count. Each round costs real solver time, so this is a
+#: guard against pathological meshes where almost every recipe fails.
+_MAX_REFILL_ROUNDS = 4
+
+
+def _merge(into: GenerationReport, part: GenerationReport, cap: int) -> None:
+    """Fold one batch's results into the accumulating report, up to `cap`."""
+    seen = {c.signature for c in into.candidates}
+    for cand in part.candidates:
+        if len(into.candidates) >= cap:
+            break
+        if cand.signature in seen:
+            continue
+        seen.add(cand.signature)
+        into.candidates.append(cand)
+    into.failures.extend(part.failures)
+    for note in part.warnings:
+        if note not in into.warnings:
+            into.warnings.append(note)
+    into.seconds += part.seconds
 
 
 def generate(
@@ -399,18 +560,48 @@ def generate(
         ``failures`` to find out what went wrong.
     """
     weights = weights or ScoreWeights.preset("balanced")
-    recipes = sample_grid(max(int(count), 0), seed=int(seed), base=base)
-    report = _run_recipes(
-        obj,
-        recipes,
-        weights=weights,
-        backends=backends,
-        progress=progress,
-        should_cancel=should_cancel,
-        compute_overlap=compute_overlap,
-        parent_signature=None,
-        generation=0,
-    )
+    target = max(int(count), 0)
+    if target == 0:
+        return GenerationReport()
+
+    # Deliver `target` USABLE candidates, not `target` attempts. Recipes that a
+    # given mesh cannot solve are rejected rather than shown as dead slots, so
+    # without a refill pass a closed mesh would hand back a half-empty grid.
+    report = GenerationReport()
+    tried: set[str] = set()
+    round_seed = int(seed)
+    for attempt in range(_MAX_REFILL_ROUNDS):
+        want = target - len(report.candidates)
+        if want <= 0:
+            break
+        # Over-request on refills: some fraction will fail again.
+        batch = sample_grid(
+            want if attempt == 0 else want * 2, seed=round_seed, base=base
+        )
+        batch = [p for p in batch if p.signature() not in tried]
+        tried.update(p.signature() for p in batch)
+        if not batch:
+            round_seed += 977
+            continue
+
+        part = _run_recipes(
+            obj,
+            batch,
+            weights=weights,
+            backends=backends,
+            progress=progress if attempt == 0 else None,
+            should_cancel=should_cancel,
+            compute_overlap=compute_overlap,
+            parent_signature=None,
+            generation=0,
+        )
+        _merge(report, part, target)
+        if part.cancelled:
+            report.cancelled = True
+            break
+        round_seed += 977
+
+    _rank_in_place(report.candidates, weights)
     if store and report.candidates:
         _commit(obj, report)
     return report
