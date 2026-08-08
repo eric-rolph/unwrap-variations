@@ -1,13 +1,8 @@
 # Benchmarks
 
-> **Status: PROVISIONAL.** The numbers in this file were measured on
-> **2026-08-07** against a work-in-progress build. Two things are still moving:
-> the scoring weights are being retuned -- and because every column here is
-> scored by the same scorer, a weight change moves **all** of them -- and work
-> is underway on the icosphere loss and on candidate diversity for closed
-> meshes. Treat these figures as a direction of travel, not as a published
-> result. Regeneration instructions are in
-> [section 6](#6-regenerating-this-table).
+> Measured **2026-08-07**, median of 5 runs, verified identical on Blender
+> **4.5.4 LTS** and **5.1.2** -- every cell, both versions. Regeneration
+> instructions are in [section 6](#6-regenerating-this-table).
 
 This file is the single source of truth for every performance and quality
 number the project claims. The README quotes only the headline record and two
@@ -50,19 +45,24 @@ That is it. Specifically **not** claimed:
 | Repeats | 5 per column -- see [section 3](#3-blenders-uv-operators-are-not-deterministic) for why this is mandatory |
 | Script | [`tools/benchmark_bestofn.py`](../tools/benchmark_bestofn.py) |
 
-**The scores matched between 4.5.4 and 5.1.2.** That cross-version agreement is
-itself a result: the ranking a user sees does not appear to depend on which
-supported Blender they run. It is subject to the same sampling caveat as
-everything else here, and the cross-version comparison has not yet been re-run
-under the repeated methodology.
+**Every cell is identical on 4.5.4 and 5.1.2**, verified under the repeated
+methodology below. That cross-version agreement is itself a result: the ranking
+a user sees does not depend on which supported Blender they run.
 
-**No timing figures are published yet**, and the reason is not that generation
-is slow. Two performance bugs that dominated wall-clock time -- roughly a
-second of pure overhead per candidate, and a refill loop that repeated its
-setup on every round -- have since been fixed, and cost is once again monotonic
-in candidate count. But the engine is still under active change, so any number
-measured today would be obsolete by the next build. Timings will be published
-alongside the final table rather than guessed at now.
+### 2.1 A note on timing
+
+**There is no single "generation takes N seconds" figure, and quoting one would
+be misleading.** Generation cost is dominated by Blender's packer, whose cost
+runs *inverse* to island count -- a layout with few large islands is far more
+expensive to pack than one with many small ones. So the same candidate count on
+two meshes of similar size can differ by orders of magnitude.
+
+What can be stated, because it was measured: a packing pathology on small
+meshes took a **12-triangle cube from 11.6s to 0.013s** and a **62-triangle
+cone from 31.6s to 0.017s** once fixed. Suzanne, at 968 triangles, takes
+**6.6s** and keeps full-quality packing because it sits above the small-mesh
+threshold where the workaround applies. Generation cost is monotonic in
+candidate count.
 
 The three columns are:
 
@@ -131,73 +131,111 @@ absolute floor of 1.0 point. Everything else is a tie.
 That is a deliberately conservative rule for a benchmark whose whole purpose is
 to be believed: if our best-of-N result and the baseline could have swapped
 places on a different roll of Blender's non-deterministic packer, it is a tie.
-The record below is 3 wins, 3 ties, 1 loss under either this rule or the
-looser half-spread variant, so nothing here depends on the choice.
 
 <!-- BEGIN BENCHMARK TABLE - regenerate wholesale, never hand-edit a cell -->
 
-Blender 4.5.4, `balanced` preset, `seed=1`, 10 candidates, 5 repeats.
+`balanced` preset, `seed=1`, 10 candidates, 5 repeats. **Identical on Blender
+4.5.4 LTS and 5.1.2 -- every cell, both versions.**
 
-| mesh | `smart_project` | `unwrap+sharp` | **best-of-10** | verdict | noise | grid filled |
-| --- | ---: | ---: | ---: | --- | ---: | ---: |
-| cylinder | 25.4 [25.4-25.4] | 0.0 [0.0-0.0] | **84.6** [84.6-84.6] | **WIN +59.2** | 0.0 | 10/10 |
-| suzanne | 13.0 [13.0-13.0] | 13.7 [13.7-13.7] | **42.3** [42.3-42.3] | **WIN +28.6** | 0.0 | 10/10 |
-| torus | 49.1 [49.1-49.1] | 36.5 [36.5-36.5] | **54.8** [54.8-54.8] | **WIN +5.7** | 0.0 | 8/10 |
-| cone | 74.4 [74.4-74.4] | 80.7 [80.7-80.7] | 81.5 [81.5-81.5] | tie +0.8 | 0.0 | 10/10 |
-| cube | 88.9 [88.9-88.9] | 88.9 [88.9-88.9] | 88.9 [88.9-88.9] | tie +0.0 | 0.0 | 10/10 |
-| sphere | 72.1 [72.1-72.1] | 52.8 [52.8-52.8] | 72.1 [72.1-72.7] | tie -0.0 | 0.6 | 8/10 |
-| icosphere | 66.6 [66.6-66.6] | 73.3 [73.3-73.3] | 66.6 [66.6-66.6] | **LOSS -6.7** | 0.0 | 8/10 |
+| mesh | `smart_project` | `unwrap+sharp` | **best-of-10** | verdict | grid filled |
+| --- | ---: | ---: | ---: | --- | ---: |
+| cylinder | 36.9 [36.9-36.9] | 0.0 [0.0-0.0] | **72.1** [72.1-72.1] | **WIN +35.3** | 10/10 |
+| torus | 29.7 [29.7-29.7] | 33.2 [33.2-33.2] `*` | **50.1** [50.1-50.1] | **WIN +16.8** | 10/10 |
+| suzanne | 9.4 [9.4-9.4] | 8.8 [8.8-8.8] | **23.2** [23.2-23.2] | **WIN +13.8** | 10/10 |
+| sphere | 57.3 [57.3-57.3] | 45.5 [45.5-45.5] | **66.4** [66.4-66.4] | **WIN +9.1** | 10/10 |
+| icosphere | 50.4 [50.4-50.4] | 63.2 [63.2-63.2] | **66.0** [66.0-66.0] | **WIN +2.8** | 10/10 |
+| cone | 60.0 [60.0-60.0] | 73.7 [73.7-73.7] | 74.7 [74.7-74.7] | tie +0.9 | 10/10 |
+| cube | 70.3 [70.3-70.3] | 70.3 [70.3-70.3] | 70.9 [70.9-70.9] | tie +0.6 | 10/10 |
 
-**Record: 3 wins, 3 ties, 1 loss.**
+**Record: 5 wins, 2 ties, 0 losses.** Run-to-run spread was **0.1 points or
+less on every cell**, so every verdict here clears the spread rule by a wide
+margin and rests on the 1.0-point floor instead.
+
+`*` The `unwrap+sharp` baseline **did nothing measurable** on this mesh -- see
+[section 4.2](#42-three-things-not-to-read-into-this-table), caveat 3. The flag
+is conservative and under-reports: the sphere and icosphere rows are affected
+too.
 
 <!-- END BENCHMARK TABLE -->
 
-### 4.1 What changed, and why the record got worse
+### 4.1 What changed since the provisional table
 
-An earlier single-run version of this benchmark reported **5 wins, 1 tie, 1
-loss**. That was wrong, and the correction is worth stating plainly rather than
-quietly swapping the table:
+An earlier provisional version of this table reported **3 wins, 3 ties, 1
+loss**, with an outright loss on the icosphere and only 7-8 of 10 candidate
+slots filled on closed meshes. Both problems are fixed. Stating the changes
+plainly, rather than quietly swapping the table:
 
-- **sphere** was reported as a **+0.6 win**. Its best-of-10 column varies
-  between 72.1 and 72.7 across runs -- a spread of 0.6 -- so a 0.6 margin is
-  indistinguishable from a different roll of Blender's packer. **Demoted to a
-  tie.**
-- **cone** was reported as a **+0.8 win**. That margin is stable, but 0.8
-  points out of 100 is not a difference anyone can see on a model. It falls
-  below the 1.0-point floor. **Demoted to a tie.**
+**The icosphere loss is gone, and every mesh now fills 10/10 slots.** The root
+cause was a dead code path. `repair_recipe` -- the escalation that rewrites a
+recipe which provably cannot work on a given mesh -- called
+`topo.boundary_mask()`, but `boundary_mask` is a `@property` returning an
+array, not a method. The call raised `TypeError` straight into a bare
+`except Exception`, which swallowed it. **The entire repair path had never
+fired once.** On a UV sphere that was silently wasting six slots in ten.
+Alongside the fix, a chart-clustering cut was added (see
+[section 4.4](#44-how-a-dead-recipe-gets-repaired)) which guarantees every
+component is opened into disks.
 
-Neither result changed. The standard for calling something a win changed, and
-the honest record is 3 wins, 3 ties, 1 loss. That is the number this project
-should be judged on.
+**Absolute scores are NOT comparable with the provisional table.** The scoring
+weights were retuned -- seam 0.6 to 1.8, overlap 2.0 to 1.0, packing 0.8 to
+0.7 -- and because all three columns share one scorer, both baseline columns
+moved too, exactly as they should. Suzanne's `smart_project` baseline reading
+of 13.0 became 9.4 for that reason and not because Blender got worse. Compare
+verdicts across the two tables if you like; do not compare cell values.
 
-### 4.2 The loss: icosphere
+**The winning layouts got dramatically simpler.** Island counts of the
+top-ranked candidate fell from `[276, 6, 11, 6, 6, 5, 24]` to
+`[14, 3, 6, 4, 1, 3, 4]`. The 276-island Suzanne winner -- a layout that scored
+well on distortion by shattering the mesh into confetti, and which nobody
+would have accepted -- is now 14 islands. Raising the seam weight is what did
+it, and it is the clearest evidence in this document that the weights, not just
+the search, decide what "best" means.
 
-Best-of-10 **loses** on the icosphere, scoring 66.6 against `unwrap+sharp`'s
-73.3 -- a 6.7-point deficit that is well outside the noise and is not going to
-be argued away. This is a real result and it is not being buried.
+### 4.2 Three things not to read into this table
 
-A subdivided icosphere has no creases: every dihedral angle is shallow and
-near-uniform, so the heuristics that make the winning rows work have nothing to
-grip. Meanwhile the sharp-edge baseline degenerates into something close to
-"cut nothing much and let ABF relax", which on a uniformly curved closed
-surface happens to be a good answer -- note that it produces a single island at
-L2 1.0090, better than anything in our grid.
+The record is 5 wins, 2 ties, 0 losses. Three caveats limit what that means,
+and none of them is a footnote.
 
-Note also the **grid filled** column: the icosphere is one of three meshes where
-a 10-candidate grid comes back with only 8 usable candidates. The three meshes
-that fail to fill the grid -- sphere, torus, icosphere -- are exactly the three
-that tie or lose. Those are closed meshes, and this is believed to be one root
-cause rather than two problems: the search is not producing enough viable
-diversity on closed surfaces. Work in progress.
+**1. Do not quote the cube or the cone as wins.** They are +0.6 and +0.9, both
+below the 1.0-point floor, and both are recorded as ties. A separate agent's
+harness scored this corpus **7 wins, 0 ties, 0 losses**; the number published
+here is the smaller one, from the stricter rule. The cube in particular is
+effectively a coin flip: every dual arc on a cube ties, so which of the eleven
+cross-net unfoldings you get is decided by the seed.
 
-Two honest readings, and both are true:
+**2. Suzanne scores 23.2 out of 100. That is not a good unwrap.** It beats both
+baselines by 13.8 points and it is 14 islands rather than 276, so the *relative*
+result is real. But nobody should look at 23/100 and call the absolute result
+acceptable. The residual is a high seam ratio plus a small genuine self-fold.
+An organic mesh with ears, creases and a closed hollow interior is the hardest
+thing in this corpus and the add-on does not yet solve it well.
 
-1. Best-of-N is a search. A search with a fixed budget over a
-   heuristic-seeded space can lose to a well-chosen single pass, and this is
-   what that looks like.
-2. Raising the candidate count is the mitigation available today, not a fix. A
-   fix means a seam strategy aimed at smooth closed meshes, which does not
-   exist yet -- see [Limitations](../README.md#limitations-and-known-issues).
+**3. The `unwrap+sharp` column is not a real unwrap on smooth closed meshes.**
+This is the caveat that most affects how the table should be read. A 30-degree
+sharpness threshold selects **no edges at all** on a sphere, torus or
+icosphere. `uv.unwrap` therefore receives no cuts, fails to solve, and -- per
+the [section 0 behaviour](ARCHITECTURE.md) -- still reports `FINISHED` while
+leaving the existing layout alone. Measured stretch L2 before and after:
+
+| mesh | L2 before | L2 after |
+| --- | ---: | ---: |
+| sphere | 1.1767 | 1.1767 |
+| torus | 1.5230 | 1.5230 |
+| icosphere | 1.0090 | 1.0090 |
+
+Unchanged, to four decimal places. What that column actually contains on those
+three rows is **the primitive's own stock UV map**. For the icosphere that is
+the shipped icosahedron-net layout, which is a genuinely good piece of work --
+so the icosphere row is us beating `primitive_ico_sphere_add`'s built-in UVs,
+not beating a single-pass unwrap. That cuts both ways: it overstates the
+baseline on the icosphere and understates it on the torus.
+
+The script flags these cells with `*`. Detection compares the measured *score*
+rather than the raw UV bytes, because a failed unwrap can still leave the
+layout flipped or rescaled by packing while every distortion metric stays
+invariant. The flag is deliberately conservative and currently catches only the
+torus; the sphere and icosphere differ in packing-related metrics after a
+rescale and slip past it.
 
 ### 4.3 The most instructive row: the cylinder that cannot be unwrapped
 
@@ -220,22 +258,71 @@ overlap area 6.6e-03 -- and reports `{'FINISHED'}` anyway. That is the same
 
 Blender did exactly what it was asked to do. The lesson is not that the
 operator is broken; it is that **"mark the sharp edges" is not a general
-strategy**. Applied blindly it can silently produce an unusable unwrap that
-still reports success. Trying several strategies and measuring the result is
-how you catch that -- which is the clearest single argument for this add-on
-that the corpus produces.
+strategy**. This corpus catches it failing in two entirely different ways:
 
-The `DUAL_GRAPH` strategy exists for this case specifically: it cuts the
+| Failure mode | Where | What happens |
+| --- | --- | --- |
+| Selects the **wrong** edges | cylinder, cone | 64 rim seams, none lengthwise. The tube is never opened, and the solver produces L2 30.6 while reporting success |
+| Selects **no** edges | sphere, torus, icosphere | Nothing is cut, the solver fails outright, and the stock UV map is left in place unchanged -- see [caveat 3](#42-three-things-not-to-read-into-this-table) |
+
+Neither failure announces itself. In both cases `uv.unwrap` returns
+`{'FINISHED'}`. Trying several strategies and measuring the result is how you
+catch that, and it is the clearest single argument for this add-on that the
+corpus produces.
+
+Two strategies exist for this case specifically. `DUAL_GRAPH` cuts the
 *complement* of a spanning forest of the face dual graph, so by construction it
-cannot leave a component un-openable.
+cannot leave a component un-openable. The engine's chart cut goes further and
+proves disk-ness outright -- next section.
 
-### 4.4 Overlap is a metric because baselines really do produce it
+### 4.4 How a dead recipe gets repaired
+
+Some recipes provably cannot work on a given mesh, and the honest thing to do
+with a wasted candidate slot is to notice and fix it rather than fill it with a
+failure. Two cases are decidable before any solver runs:
+
+- **A closed surface with an empty seam set.** No boundary means no disk to
+  flatten. The solver gives up and, because Blender reports success anyway,
+  the slot is wasted silently. On a UV sphere this was six slots in ten.
+- **`EXISTING` on a mesh with no marked seams.** The recipe's whole premise --
+  "respect what the artist marked" -- is void.
+
+Both escalate to a **chart cut**, which is what raised every mesh in the table
+to 10/10 filled slots:
+
+1. **Cluster the polygon normals.** Area-weighted k-means seeded from a
+   Fibonacci lattice of directions -- Cohen-Steiner's variational shape
+   approximation with the proxy fixed to a plane normal. It lands cuts on the
+   creases of a hard-surface model and on the "cube map" boundaries of a smooth
+   one.
+2. **Cut between clusters, and absorb the slivers.** The boundary of a face
+   partition is a set of closed loops, which is why this cut is short where a
+   spanning-tree cut is long. One cluster can land in several disconnected
+   places, so charts below a fraction of the mean area are merged back into
+   their largest neighbour. Measured on Suzanne at 3 clusters: 52 islands
+   scoring 15.6 became 8 islands.
+3. **Bisect until every chart is a disk.** Clustering cannot guarantee
+   disk-ness -- the top half of a torus is an annulus, and a solver handed an
+   annulus either fails or folds it over itself (measured overlap 7.9e-03 on
+   the icosphere). So each chart's Euler characteristic is computed exactly
+   from three bincounts, `chi = F - U + Vint`, and any chart with `chi != 1` is
+   split along its principal axis and retested. An annulus becomes two disks in
+   one round.
+
+The cluster count and seed rotation are derived from the recipe's own
+signature, so several recipes escalating in the same run produce genuinely
+different charts rather than collapsing onto one layout and being
+de-duplicated away.
+
+### 4.5 Overlap is a metric because baselines really do produce it
 
 On Suzanne, the `smart_project` baseline leaves **42 overlapping triangle
 pairs**. Overlapping UVs silently corrupt baked normal and light maps, so
-overlap area is one of the axes candidates are ranked on, and it carries a hard
-step penalty rather than a proportional one -- a layout with any overlap at all
-drops below an otherwise-equal clean layout.
+overlap area is one of the axes candidates are ranked on. It carries a flat
+step penalty *on top of* a proportional one, which is what makes it a hard
+defect rather than merely an expensive one: a layout with any overlap at all
+drops a full multiplicative notch below an otherwise-equal clean layout, no
+matter how good the rest of it looks.
 
 For contrast, xatlas produced **zero** overlaps everywhere on the same corpus.
 

@@ -308,38 +308,65 @@ so on a symmetric mesh different seeds give you genuinely different but equally
 valid cuts. On a cube every join ties, so each seed produces a different one of
 the classic cube unfoldings.
 
-## Does it actually help?
+### When a recipe cannot work, it gets rewritten
 
-> **These figures are provisional (measured 2026-08-07).** The scoring weights
-> are being retuned, and because all three columns share one scorer, a weight
-> change moves every number. Do not quote them as settled.
-> [docs/BENCHMARKS.md](docs/BENCHMARKS.md) is the one place any benchmark
-> number lives.
+Some recipes are provably dead on a given mesh before any solver runs -- most
+often "no seams at all" on a closed surface, which leaves the solver no disk to
+flatten. Blender reports success anyway, so the slot would otherwise be wasted
+on a layout that silently never changed. On a UV sphere that was six slots in
+ten.
+
+The engine detects those cases and escalates them to an automatic **chart cut**
+instead of spending the slot: cluster the polygon normals into compact charts,
+cut along the cluster boundaries (which are closed loops, so the cut is short),
+then bisect any chart that is not topologically a disk until it is. Disk-ness
+is decided exactly, by Euler characteristic, not estimated -- which is what
+stops the solver being handed an annulus and folding it over itself.
+
+You do not select this; it happens when a recipe would otherwise be wasted, and
+the substitution is reported in the candidate's message. Different recipes
+escalating in the same run derive their cluster count from their own signature,
+so they produce genuinely different charts rather than collapsing onto one
+layout.
+
+## Does it actually help?
 
 Measured, not asserted. Best-of-10 against Blender's own single-pass
 unwrappers, across seven primitives, with all three columns scored by the same
-evaluator, each measured five times and reported as a median.
+evaluator, each measured five times and reported as a median. **Identical on
+Blender 4.5.4 LTS and 5.1.2 -- every cell, both versions.**
 
-**Record: 3 wins, 3 ties, 1 loss.**
+**Record: 5 wins, 2 ties, 0 losses.**
 
-- **Best case:** cylinder, **+59.2** points over the best baseline -- the
+- **Best case:** cylinder, **+35.3** points over the best baseline -- the
   topology case described above.
-- **Worst case:** icosphere, where best-of-10 **loses by 6.7 points** to a
-  plain sharp-edge unwrap. A smooth closed mesh has no creases for the seam
-  heuristics to grip, and the sharp-edge baseline degenerates into "cut almost
-  nothing and let the solver relax", which happens to be a good answer there.
-- **Two former wins are now ties.** An earlier single-run version of this
-  benchmark claimed 5 wins. The sphere's +0.6 margin turned out to be smaller
-  than that mesh's own run-to-run variation, and the cone's +0.8 is too small
-  to see on a model. Both were demoted. 3/3/1 is the honest record.
+- **Smallest win:** icosphere, +2.8. See the caveat below before reading
+  much into that one.
+- **The cube and the cone are ties, not wins.** They come in at +0.6 and +0.9,
+  below the 1.0-point floor for calling something a win. A different harness
+  scored this corpus 7/0/0; the stricter number is the one published. The cube
+  is effectively a coin flip decided by which cross-net unfolding the seed
+  picks.
 
-The scores matched between Blender 4.5.4 and 5.1.2, so the ranking you see does
-not appear to depend on which supported version you run. No timing figures are
-published yet: the engine is still under active change, so any number measured
-today would be obsolete by the next build.
+Three things that record does **not** mean:
 
-Full table, methodology, the competitive context against xatlas, and
-regeneration instructions: **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
+1. **Suzanne scores 23.2 out of 100.** That beats both baselines by 13.8 and it
+   is 14 islands rather than the 276 an earlier build produced, so the relative
+   result is real -- but 23/100 is not a good unwrap and should not be sold as
+   one. Organic meshes are the hardest case here and are not solved.
+2. **On smooth closed meshes the `unwrap+sharp` baseline is not a real
+   unwrap.** A 30-degree threshold selects no edges on a sphere, torus or
+   icosphere, so `uv.unwrap` gets no cuts, fails, and leaves the mesh's stock
+   UV map in place while reporting success. Stretch L2 is unchanged to four
+   decimals. The icosphere row is therefore us beating
+   `primitive_ico_sphere_add`'s built-in icosahedron-net UVs -- a genuinely
+   good layout, but not a single-pass unwrap.
+3. **Scores are not comparable across builds.** The scoring weights are tuned
+   as the project develops, and because all three columns share one scorer, a
+   weight change moves every number including the baselines.
+
+Full table, methodology, the competitive context against xatlas, timing notes
+and regeneration instructions: **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
 
 **What is not claimed.** This does not beat xatlas or RizomUV on raw
 distortion, and it is not trying to. On the same corpus with the same scorer,
@@ -412,17 +439,16 @@ it found, or exactly what to set if it found neither.
 
 Listed because you will hit them, not because they are theoretical.
 
-- **The icosphere case loses.** Best-of-10 is beaten by 6.7 points by a single
-  sharp-edge unwrap on smooth closed meshes with no creases. There is no seam
-  strategy aimed at that case yet. Raising the candidate count is a mitigation,
-  not a fix.
-- **Not every slot fills, and it correlates with the losses.** On closed meshes
-  -- sphere, torus, icosphere -- a 10-candidate grid currently comes back with
-  8 usable candidates; the rest are recipes the solver could not complete.
-  Those are exactly the three meshes that tie or lose in the benchmark, which
-  points at one root cause rather than two problems: not enough viable
-  diversity on closed surfaces. Failed slots are shown with a reason rather
-  than hidden.
+- **Organic meshes are not solved.** Suzanne's best candidate scores 23.2 out
+  of 100. It beats both Blender baselines, but that is a low absolute number
+  and the honest read is that a mesh with ears, creases and a closed hollow
+  interior is still hard for this add-on. The residual is a high seam ratio
+  plus a small genuine self-fold.
+- **Generation cost is dominated by Blender's packer**, whose cost runs inverse
+  to island count, so a layout with few large islands is far more expensive to
+  pack than one with many small ones. There is no meaningful single
+  "generation takes N seconds" figure; expect it to vary by orders of magnitude
+  between meshes of similar size.
 - **The same seed does not give byte-identical results.** Blender's own UV
   operators are non-deterministic, so re-running Generate reshuffles the
   candidates slightly. See
