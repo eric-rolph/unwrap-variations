@@ -601,3 +601,35 @@ Refinement is score-gated and cannot make a candidate worse, so the cost buys
 quality rather than risk -- but it is real, and it is why **Refine Layouts is an
 artist-facing toggle** rather than an unconditional behaviour. A user who wants
 the old speed can have it, at the old quality.
+
+---
+
+## 10. What it looks like
+
+The clearest evidence in this document is not a number. Suzanne, same mesh,
+same scorer, `seed=1`, rendered by `tools/render_uv_report.py`:
+
+| before | after |
+| --- | --- |
+| ![before](images/organic_suzanne_before.png) | ![after](images/organic_suzanne_after.png) |
+| `smart_project` baseline: **100 islands**, score 9.42, overlapping triangles outlined in red | best-of-10 with refinement: **7 islands**, score 46.28, **zero** overlap |
+
+Seven compact charts with simple boundaries -- cranium, face, two ears, jaw and
+the two eyeballs -- against a hundred fragments. This is the difference the
+metrics are trying to describe, and it is worth looking at directly, because a
+score of 46 sounds mediocre while the picture does not.
+
+### 10.1 The failure the pictures found
+
+![hand](images/organic_hand_limitation.png)
+
+The `hand` corpus mesh, best-of-10: one giant palm chart and roughly 167 sliver
+ribbons, scoring 17.99. **The score said "bad"; only the render said
+"shredded".** That distinction is the entire argument for shipping a visual
+regression alongside a benchmark.
+
+The immediate cause was a merge screening budget tuned on a 968-triangle
+Suzanne and applied unchanged to a 9280-triangle mesh, which is fixed -- the
+budget now scales with triangle count. The residual is real and open: five
+close protrusions defeat the chart decomposition, and `hand` remains the worst
+mesh in the corpus. It is in the corpus precisely so that stays visible.

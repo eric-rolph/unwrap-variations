@@ -497,15 +497,23 @@ def test_island_labels_weld_on_the_evaluators_tolerance(meshes):
         drawn = int(render.island_labels(sample).max()) + 1
         assert drawn == evaluate(sample, compute_overlap=False).island_count, name
 
-    # The tolerance is relative, so a layout and the same layout at a millionth
-    # of the size have the same islands.  An absolute round-to-7 lattice fuses
-    # the small one into a handful of cells and reports far fewer.
+    # The failure in miniature: two triangles joined only through a shared
+    # vertex whose two UVs differ by 6e-8 and straddle a 1e-7 rounding
+    # boundary.  Round-to-7 splits them and reports two islands; the evaluator
+    # and the relative rule both report one.
+    verts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+                      [1.0, 1.0, 0.0], [2.0, 1.0, 0.0]])
+    tris = np.array([[0, 1, 2], [2, 3, 4]])
+    uvs = np.array([[0.10, 0.10], [0.30, 0.10], [0.05000002, 0.40],
+                    [0.05000008, 0.40], [0.30, 0.60], [0.50, 0.60]])
+    hair = make_sample(verts, tris, uvs=uvs, name="hairline")
+    assert evaluate(hair, compute_overlap=False).island_count == 1
+    assert int(render.island_labels(hair).max()) + 1 == 1
+
+    # And islands that are genuinely apart stay apart.
     scattered = _scattered_islands(24)
-    full = int(render.island_labels(scattered).max()) + 1
-    tiny = scattered.with_uvs(scattered.uvs * 1e-6)
-    assert full == 24
-    assert int(render.island_labels(tiny).max()) + 1 == full
-    assert evaluate(tiny, compute_overlap=False).island_count == full
+    assert int(render.island_labels(scattered).max()) + 1 == 24
+    assert evaluate(scattered, compute_overlap=False).island_count == 24
 
 
 def test_island_labels_survive_a_broken_layout(meshes):
