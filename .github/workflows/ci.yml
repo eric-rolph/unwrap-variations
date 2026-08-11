@@ -68,7 +68,16 @@ jobs:
           cat > /tmp/uvvar_no_bpy.py <<'PY'
           """docs/ARCHITECTURE.md section 1.2: the core must not touch bpy."""
           import importlib
+          import os
           import sys
+
+          # The repo root, NOT the directory this script happens to live in.
+          # This step used to run from /tmp, so sys.path[0] was /tmp and the
+          # package was not importable at all -- every module came back "No
+          # module named 'unwrap_variations'". It had never once run green,
+          # because a ruff failure earlier in the job always short-circuited
+          # the run before reaching it.
+          sys.path.insert(0, os.environ.get("GITHUB_WORKSPACE", os.getcwd()))
 
           # Poison the module table so any `import bpy` raises ImportError.
           # A correctly guarded `try: import bpy / except ImportError:` survives.
@@ -80,6 +89,15 @@ jobs:
               "unwrap_variations.core.metrics",
               "unwrap_variations.core.evaluator",
               "unwrap_variations.backends.seams",
+              # The organic-mesh modules. These matter most: the flattener and
+              # the chart merger are pure numerics that would be very easy to
+              # write against bpy by accident, and docs/ORGANIC.md section 0.5
+              # turns on them staying importable in plain CPython.
+              "unwrap_variations.core.linalg",
+              "unwrap_variations.core.flatten",
+              "unwrap_variations.core.injectivity",
+              "unwrap_variations.core.charts",
+              "unwrap_variations.core.refine",
           )
 
           failures = []
