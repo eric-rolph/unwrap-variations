@@ -1,8 +1,8 @@
 # Benchmarks
 
-> Measured **2026-08-07**, median of 5 runs, verified identical on Blender
-> **4.5.4 LTS** and **5.1.2** -- every cell, both versions. Regeneration
-> instructions are in [section 6](#6-regenerating-this-table).
+> Measured **2026-08-08**, median of 5 runs, on Blender **4.5.4 LTS** and
+> **5.1.2**. Every cell matches across the two versions except the sphere;
+> regeneration instructions are in [section 6](#6-regenerating-this-table).
 
 This file is the single source of truth for every performance and quality
 number the project claims. The README quotes only the headline record and two
@@ -20,14 +20,17 @@ The claim is narrow on purpose:
 
 That is it. Specifically **not** claimed:
 
-- Not that this beats [xatlas](https://github.com/jpcy/xatlas) or RizomUV on
-  raw distortion. It does not, and it could not: the solvers doing the work
-  here are Blender's own. Measured on the same corpus with the same scorer,
-  xatlas 0.0.11 is genuinely better than Blender native on distortion --
-  Suzanne L2 **1.0077** against Blender's **1.0298**, torus **1.0037** against
-  **1.0296**, hard-surface test mesh **1.0006** against **1.0119**. Where this
-  add-on differs is that it searches, measures and ranks; a single unwrapper,
-  however good, does not.
+- Not that this is a better *solver* than [xatlas](https://github.com/jpcy/xatlas)
+  or RizomUV. It could not be: the solvers doing the work here are Blender's
+  own. What this add-on adds is search, measurement and ranking, which a single
+  unwrapper does not do at all.
+
+  An earlier version of this file claimed xatlas beats Blender native on raw
+  distortion, with Suzanne L2 1.0077. **That number was wrong and is corrected
+  in [section 5](#5-competitive-context-measured-not-quoted)** -- re-measured,
+  xatlas gets 1.5190 on Suzanne. The narrower point survives: xatlas is an
+  excellent library built for a different job, and on a lightmap workload the
+  comparison would look different from the one in section 5.
 - Not that it is fast in absolute terms. Ten candidates cost roughly ten
   unwraps plus ten evaluations. The claim is that the *iteration loop* is
   faster than doing the same exploration by hand, not that the arithmetic is
@@ -45,9 +48,13 @@ That is it. Specifically **not** claimed:
 | Repeats | 5 per column -- see [section 3](#3-blenders-uv-operators-are-not-deterministic) for why this is mandatory |
 | Script | [`tools/benchmark_bestofn.py`](../tools/benchmark_bestofn.py) |
 
-**Every cell is identical on 4.5.4 and 5.1.2**, verified under the repeated
-methodology below. That cross-version agreement is itself a result: the ranking
-a user sees does not depend on which supported Blender they run.
+**Every cell matches across 4.5.4 and 5.1.2 except the sphere** (68.7 against
+70.8), verified under the repeated methodology below. An earlier edition
+claimed *every* cell agreed, and that is no longer true: refinement re-solves
+merged charts through Blender's own ABF, and ARCHITECTURE.md section 0 records
+that an identical mesh, identical seams and an identical call give different
+UVs on 4.5 and 5.1 for multi-island meshes. The *verdicts* are identical on
+both versions, which is the part a user relies on.
 
 ### 2.1 A note on timing
 
@@ -59,10 +66,17 @@ two meshes of similar size can differ by orders of magnitude.
 
 What can be stated, because it was measured: a packing pathology on small
 meshes took a **12-triangle cube from 11.6s to 0.013s** and a **62-triangle
-cone from 31.6s to 0.017s** once fixed. Suzanne, at 968 triangles, takes
-**6.6s** and keeps full-quality packing because it sits above the small-mesh
-threshold where the workaround applies. Generation cost is monotonic in
+cone from 31.6s to 0.017s** once fixed. Generation cost is monotonic in
 candidate count.
+
+**Refinement changed the shape of this cost, and the change is large.** Ten
+candidates on Suzanne went from **6.1s to roughly 34s**, because merging charts
+and re-solving them costs several times the original unwrap. On bigger organic
+meshes it is larger still -- `blob_limbs` at 7.6k triangles takes about 92s and
+`hand` at 9.3k about 234s. The work is score-gated and so cannot make a
+candidate worse, but it is not free, and that is why **Refine Layouts is a
+toggle in the UI** rather than an unconditional behaviour. Turning it off
+restores the old speed at the old quality.
 
 The three columns are:
 
@@ -134,27 +148,43 @@ places on a different roll of Blender's non-deterministic packer, it is a tie.
 
 <!-- BEGIN BENCHMARK TABLE - regenerate wholesale, never hand-edit a cell -->
 
-`balanced` preset, `seed=1`, 10 candidates, 5 repeats. **Identical on Blender
-4.5.4 LTS and 5.1.2 -- every cell, both versions.**
+`balanced` preset, `seed=1`, 10 candidates, 5 repeats, measured on **both**
+Blender 4.5.4 LTS and 5.1.2. Figures below are 5.1.2; the one cell that
+differs between versions is called out underneath.
 
 | mesh | `smart_project` | `unwrap+sharp` | **best-of-10** | verdict | grid filled |
 | --- | ---: | ---: | ---: | --- | ---: |
-| cylinder | 36.9 [36.9-36.9] | 0.0 [0.0-0.0] | **72.1** [72.1-72.1] | **WIN +35.3** | 10/10 |
-| torus | 29.7 [29.7-29.7] | 33.2 [33.2-33.2] `*` | **50.1** [50.1-50.1] | **WIN +16.8** | 10/10 |
-| suzanne | 9.4 [9.4-9.4] | 8.8 [8.8-8.8] | **23.2** [23.2-23.2] | **WIN +13.8** | 10/10 |
-| sphere | 57.3 [57.3-57.3] | 45.5 [45.5-45.5] | **66.4** [66.4-66.4] | **WIN +9.1** | 10/10 |
-| icosphere | 50.4 [50.4-50.4] | 63.2 [63.2-63.2] | **66.0** [66.0-66.0] | **WIN +2.8** | 10/10 |
-| cone | 60.0 [60.0-60.0] | 73.7 [73.7-73.7] | 74.7 [74.7-74.7] | tie +0.9 | 10/10 |
-| cube | 70.3 [70.3-70.3] | 70.3 [70.3-70.3] | 70.9 [70.9-70.9] | tie +0.6 | 10/10 |
+| suzanne | 9.4 [9.4-9.4] | 8.8 [8.8-8.8] | **50.0** [50.0-50.0] | **WIN +40.5** | 10/10 |
+| cylinder | 36.9 [36.9-36.9] | 0.0 [0.0-0.0] | **70.8** [70.8-70.8] | **WIN +33.9** | 10/10 |
+| torus | 29.7 [29.7-29.7] | 33.2 [33.2-33.2] `*` | **53.2** [53.2-53.2] | **WIN +19.9** | 10/10 |
+| sphere | 57.3 [57.3-57.3] | 45.5 [45.5-45.5] | **68.7** [68.7-68.7] `+` | **WIN +11.4** | 10/10 |
+| cube | 70.3 [70.3-70.3] | 70.3 [70.3-70.3] | **79.0** [79.0-79.0] | **WIN +8.8** | 10/10 |
+| icosphere | 50.4 [50.4-50.4] | 63.2 [63.2-63.2] | **71.4** [71.4-71.4] | **WIN +8.2** | 10/10 |
+| cone | 60.0 [60.0-60.0] | 73.7 [73.7-73.7] | 74.6 [74.6-74.6] | tie +0.9 | 10/10 |
 
-**Record: 5 wins, 2 ties, 0 losses.** Run-to-run spread was **0.1 points or
-less on every cell**, so every verdict here clears the spread rule by a wide
-margin and rests on the 1.0-point floor instead.
+**Record: 6 wins, 1 tie, 0 losses**, identical on both versions. Run-to-run
+spread is **0.0 on every cell on 4.5.4, and 0.0 on every cell except the
+sphere's 0.1 on 5.1.2**, so every verdict rests on the 1.0-point floor rather
+than on the spread rule.
+
+**Suzanne is the headline: 23.2 to 50.0.** That mesh was the whole reason for
+this round of work -- see [ORGANIC.md](ORGANIC.md) -- and it moves from the
+worst row in the table to a +40.5 margin, with `overlap_area` at exactly 0 and
+7 islands instead of 14. The cube also converts from a tie to a win.
 
 `*` The `unwrap+sharp` baseline **did nothing measurable** on this mesh -- see
 [section 4.2](#42-three-things-not-to-read-into-this-table), caveat 3. The flag
 is conservative and under-reports: the sphere and icosphere rows are affected
 too.
+
+`+` **The one cell that is not identical across versions.** The sphere reads
+**68.7 on 5.1.2 and 70.8 on 4.5.4**. Every other cell matches exactly. The
+previous edition of this table claimed every cell was identical on both
+versions, and that claim no longer holds -- refinement re-solves merged charts
+through Blender's own ABF, and ARCHITECTURE.md section 0 records that identical
+mesh, seams and call produce different UVs on 4.5 and 5.1 for multi-island
+meshes. Nothing here depends on the two agreeing; it was worth stating when it
+was true and is worth retracting now that it is not.
 
 <!-- END BENCHMARK TABLE -->
 
@@ -193,22 +223,24 @@ the search, decide what "best" means.
 
 ### 4.2 Three things not to read into this table
 
-The record is 5 wins, 2 ties, 0 losses. Three caveats limit what that means,
+The record is 6 wins, 1 tie, 0 losses. Three caveats limit what that means,
 and none of them is a footnote.
 
-**1. Do not quote the cube or the cone as wins.** They are +0.6 and +0.9, both
-below the 1.0-point floor, and both are recorded as ties. A separate agent's
-harness scored this corpus **7 wins, 0 ties, 0 losses**; the number published
-here is the smaller one, from the stricter rule. The cube in particular is
-effectively a coin flip: every dual arc on a cube ties, so which of the eleven
-cross-net unfoldings you get is decided by the seed.
+**1. Do not quote the cone as a win.** It is +0.9, below the 1.0-point floor,
+and is recorded as a tie. The cube was a tie at +0.6 in the previous edition
+and is now a +8.8 win, because chart merging collapses its net to two islands.
 
-**2. Suzanne scores 23.2 out of 100. That is not a good unwrap.** It beats both
-baselines by 13.8 points and it is 14 islands rather than 276, so the *relative*
-result is real. But nobody should look at 23/100 and call the absolute result
-acceptable. The residual is a high seam ratio plus a small genuine self-fold.
-An organic mesh with ears, creases and a closed hollow interior is the hardest
-thing in this corpus and the add-on does not yet solve it well.
+**2. Suzanne scores 50.0 out of 100, up from 23.2.** That is a +40.5 margin
+over the better baseline, `overlap_area` at exactly 0 where it used to carry a
+genuine self-fold, and 7 islands instead of 14. It is the result of a
+dedicated round of work documented in [ORGANIC.md](ORGANIC.md).
+
+It is still not a *good* unwrap in absolute terms, and the reason is measured
+rather than hand-waved: the residual is seam length (0.296 of penalty) and
+angle distortion (0.192), and those two oppose each other. Merging Suzanne to
+six charts inherently costs about 8.6 degrees of mean angle distortion, up
+from 3.75 at fourteen charts. ORGANIC.md section 9.1 works through why 60 is
+not reachable on this frontier.
 
 **3. The `unwrap+sharp` column is not a real unwrap on smooth closed meshes.**
 This is the caveat that most affects how the table should be read. A 30-degree
@@ -328,23 +360,96 @@ For contrast, xatlas produced **zero** overlaps everywhere on the same corpus.
 
 ## 5. Competitive context (measured, not quoted)
 
-From the same corpus, scored by the same reference implementation. This is
-context for where the add-on sits, not a claim about it.
+> **This section was wrong and has been re-measured.** The previous version
+> reported xatlas beating Blender native on distortion with **Suzanne L2
+> 1.0077 against 1.0298**. That figure is not reproducible against this
+> Suzanne by either of our two independent implementations. It is corrected
+> below rather than quietly deleted, because it was a competitive claim in a
+> public repository and someone may have relied on it.
 
-| engine | Suzanne L2 | torus L2 | hard-surface L2 | overlaps |
-| --- | ---: | ---: | ---: | --- |
-| Blender `smart_project` | 1.0298 | 1.0296 | 1.0119 | 42 pairs on Suzanne |
-| xatlas 0.0.11 | **1.0077** | **1.0037** | **1.0006** | 0 everywhere |
+Everything here is scored by `unwrap_variations.core.evaluator` with the
+shipped `balanced` weights -- the same code that judges our own candidates, so
+the comparison is apples-to-apples by construction. Meshes are exported from
+Blender 5.1.2; `core/` is `bpy`-free, so xatlas output is measured with no
+translation layer and no special pleading.
 
-Blender native does win on the sphere (1.0237 against xatlas's 1.0346), and it
-is far better integrated.
+| mesh | ours | xatlas 0.0.11 | ours L2 | xatlas L2 | ours seam ratio | xatlas seam ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| suzanne | **23.19** | 1.29 | **1.0164** | 1.5190 | **8.956** | 14.171 |
+| sphere | **66.43** | 55.72 | **1.0071** | 1.0346 | **3.508** | 4.630 |
+| torus | **52.30** | 34.96 | **1.0035** | 1.0323 | **6.383** | 9.650 |
+| icosphere | **66.04** | 28.25 | **1.0042** | 1.0288 | **3.777** | 4.869 |
+
+The "ours" column is the pre-organic-work baseline (commit `e0360e5`), which
+is the fairest thing to compare a single-pass tool against; the current
+engine scores considerably higher (see section 4).
+
+### 5.1 Why the old number was wrong, and why the evaluator is not
+
+The obvious suspicion is that our two implementations disagree. They do not.
+Computing Sander L2 from the naive `tests/reference.py` singular values, the
+slow obvious way, against `core/evaluator.py` on identical UV buffers:
+
+| layout | `core/evaluator.py` | naive `tests/reference.py` | delta |
+| --- | ---: | ---: | ---: |
+| xatlas | 1.5190 | 1.5190 | 2.2e-16 |
+| ours | 1.0164 | 1.0164 | 2.2e-16 |
+| Suzanne stock UVs | 1.4124 | 1.4124 | 8.9e-16 |
+
+Machine precision on all three, so **the evaluator is sound and every other
+number in this file stands**. What does not stand is the old xatlas row.
+
+Two further checks, because a surprising competitive result deserves them:
+
+- **Per-chart scale is not the explanation.** A global stretch metric can
+  conflate per-chart distortion with inter-chart scale variation, and xatlas's
+  texel density is far less uniform than ours (`texel_density_cv` 0.428 against
+  0.055). Rescaling every xatlas chart to the global mean texel density before
+  measuring makes Suzanne **worse**, 1.5190 to 1.9904. The distortion is real
+  and per-chart.
+- **Tuning does not rescue it.** `padding=4 resolution=2048` gives L2 1.804;
+  `padding=8 resolution=4096 brute_force=True` likewise. xatlas simply shatters
+  Suzanne into 42+ islands.
+
+### 5.2 Scoring xatlas fairly requires unmirroring its charts first
+
+Measured naively, xatlas scores **0.02** on Suzanne with **521 of 968 triangles
+flagged flipped**. That is our harness, not xatlas.
+
+xatlas orients each chart to its own surface normal, so roughly half its charts
+come out mirrored relative to the source winding. Measured on Suzanne: 66
+charts, **zero with mixed winding** -- every chart is internally consistent, so
+this is a convention difference and not a defect. `UVMetrics.flipped_tris`
+counts any negative signed UV area, which scores a mirrored-but-perfect chart
+as 100% broken. The numbers above reflect each such chart being reflected about
+its own bounding-box centre first, which fixes winding without moving it.
+
+**This is a latent issue in our own evaluator, not only in the comparison
+harness.** Mirrored UVs are a standard production technique for saving texture
+space, and we would currently report an artist's mirrored asset as
+catastrophically broken. It is a no-op on every layout we ourselves produce
+(all report `flipped_tris` 0), so it changes no number in this file, and it is
+tracked as a separate change rather than folded in here.
+
+### 5.3 This is not a fair fight on xatlas's home ground
+
+Worth stating plainly. xatlas exists to build lightmap and texture atlases,
+where many small charts are exactly the right answer. Our `balanced` weights
+charge 1.8 per unit of `seam_ratio` because an artist pays for every cut by
+hand. Scoring an atlas generator with an artist's weights penalises it for
+doing its job well.
+
+The honest claim is narrow: **under the weights this add-on ships, on this
+corpus, we win every mesh.** On Suzanne xatlas's raw distortion is genuinely
+worse too, which is not a weighting artefact -- but on a lightmap workload the
+comparison would look different, and nobody should read this table as "xatlas
+is bad".
 
 **xatlas 0.0.11 segfaulted** on a 130k-triangle sphere on Windows / CPython
 3.13, with valid in-range indices -- a hard crash, not a Python exception. This
-is stated as a factual observation about why this add-on isolates its backends
-and treats a backend failure as a skipped candidate: a backend that dies must
-take the candidate down, never Blender. It is not a criticism of xatlas, which
-is an excellent library and beats Blender's own solver on distortion above.
+is recorded as the reason this add-on isolates its backends and treats a
+backend failure as a skipped candidate: a backend that dies must never take
+Blender with it. It is not a criticism of xatlas.
 
 ## 6. Regenerating this table
 
@@ -389,3 +494,179 @@ Besides the table it prints two things worth reading:
 Run it on both supported Blender versions before publishing. The scores should
 match; if they do not, that is a bug and it is more interesting than the
 benchmark.
+
+---
+
+## 7. The organic corpus
+
+Everything above is measured on seven Blender primitives. Primitives are the
+right corpus for the claim in [section 1](#1-what-is-actually-being-claimed) --
+reproducible anywhere, no download, covering the topologies that break
+unwrappers -- and they are the wrong corpus for judging an unwrapper on the
+work artists actually do. A sphere and a cube are the shapes every unwrapper is
+already tuned for. Suzanne is the only organic mesh in that table, and she is
+one data point.
+
+`docs/ORGANIC.md` section 8 therefore specifies a second corpus, eight meshes
+built procedurally in-script, and a second benchmark that answers a harder
+question than the one above.
+
+### 7.1 The corpus
+
+Built by [`tools/organic_corpus.py`](../tools/organic_corpus.py). No downloads:
+the implicit surfaces are polygonised by a marching-tetrahedra routine written
+in that file, and the analytic ones come from explicit vertex arrays.
+
+| mesh | tris | shells | chi | why it is hard |
+| --- | ---: | ---: | ---: | --- |
+| `suzanne` | 968 | 3 | 0, 1, 1 | creases, ears, two boundary loops, three shells -- the reference case |
+| `suzanne_sub2` | 15744 | 3 | 0, 1, 1 | same shape at scale; tests everything quadratic or worse |
+| `blob_limbs` | 7608 | 1 | 2 | metaball creature, five protruding limbs -- chart-per-limb decomposition |
+| `displaced_sphere` | 1280 | 1 | 2 | closed genus 0 with **no sharp edge anywhere**; `SHARP` selects nothing |
+| `torus_knot` | 5808 | 1 | 0 | genus 1 with an organic cross-section; needs two cuts before any parameterisation exists |
+| `hand` | 9280 | 1 | 2 | five protrusions close together -- charts that collide in UV even when each is fine |
+| `folded_ribbon` | 1752 | 1 | 1 | ships a UV layout that is locally injective and globally **not** |
+| `pinched` | 320 | 1 | 2 | zero-area faces, slivers, coincident vertices -- robustness only |
+
+Every entry carries pinned invariants (vertex and triangle count, shell count,
+Euler characteristic and boundary-edge count per shell) and `build()` verifies
+them, so a corpus regression fails at build time rather than surfacing later as
+a mysteriously moved benchmark cell.
+
+**Determinism was measured, not assumed.** All eight meshes come out
+bit-identical on Blender 4.5.4 (numpy 1.26.4, Python 3.11) and Blender 5.1.2
+(numpy 2.3.4, Python 3.13) -- vertex arrays, triangle arrays and content
+digests. Against unrelated numpy builds (2.2.6 and 2.5.1 on pip's
+scipy-openblas), connectivity is bit-identical everywhere and five of the six
+numpy meshes are bit-identical outright. Only `torus_knot` still drifts, by
+1 ULP (2.2e-16), far too small to move an invariant.
+
+The cause was isolated rather than guessed, and an earlier version of this
+paragraph got it wrong. It is not `np.linalg.norm` and it is not libm's `cos`:
+stepping through the builders and hashing each intermediate, `np.linalg.norm`
+over an axis, `np.cos`, `np.sin` and `np.einsum` all agree bit for bit on every
+build tested. **Every divergence traces to a BLAS call.** `displaced_sphere`
+and `pinched` drifted solely because `_band_limited_bumps` projected with
+`normals @ directions.T`, a `dgemm`; written out as three multiplies it is
+bit-identical everywhere and identical to what the matmul produced under
+Blender, so no digest moved. What is left in `torus_knot` is `np.dot` on
+3-vectors and `np.linalg.norm` on a single vector -- `ddot` and `dnrm2` -- inside
+the rotation-minimising frame.
+
+`folded_ribbon` deserves its own note, because it is the entry that makes the
+injectivity work testable at all. `docs/ORGANIC.md` section 0.3 established
+that Suzanne's overlap is **not** a flip: all 968 signed UV areas are positive,
+the map is locally injective everywhere, and the chart boundary still laps over
+a distant part of itself. `folded_ribbon` reproduces that defect deliberately
+and minimally -- its UV layout follows an Archimedean spiral whose radial pitch
+(0.1257) is smaller than the ribbon's width (0.18), so the turns *must* overlap,
+while the half-width stays more than three times below the smallest radius of
+curvature, so no triangle can invert. Both properties are asserted when the mesh
+is built. The corpus also ships the same ribbon unrolled flat, as the control:
+a certifier that answered "broken" unconditionally would pass every defect test
+and then reject every good layout a user has.
+
+### 7.2 Oracles
+
+Three, all in `tests/reference.py`, all deliberately naive:
+
+- **Topology** -- `reference_shell_topology`, shell count and Euler
+  characteristic from the triangle soup with plain dicts and sets. It shares no
+  code with the vectorised version in `tools/organic_corpus.py`, and a test
+  asserts they agree shell for shell on every corpus mesh. Every `chi` quoted in
+  ORGANIC.md section 0.1 rests on that agreement.
+- **Layout metrics** -- `reference_layout_metrics`, covering the fields
+  `reference_metrics` did not: packing efficiency (by an exact
+  coordinate-compression sweep over the union of island bounding boxes rather
+  than the evaluator's rasterisation), UV coverage, seam ratio, texel-density
+  spread, UV bounds and the out-of-bounds count.
+- **Injectivity** -- the naive all-pairs pass, cross-checked against the runtime
+  certifier on every corpus mesh.
+
+### 7.3 Visual regression
+
+[`tools/render_uv_report.py`](../tools/render_uv_report.py) renders what the
+harness measures. For every corpus mesh and every variant it writes the UV
+layout as a PNG -- islands filled with distinct colours, island boundaries and
+seam-flagged edges drawn, and every triangle in a real overlap outlined in red,
+confirmed by exact convex clipping rather than a separating-axis test -- plus
+the mesh itself checker-textured from three fixed camera angles, and an index
+page tying the pictures to the numbers.
+
+This exists because of the 276-island Suzanne in
+[section 4.1](#41-what-changed-since-the-provisional-table). That layout scored
+well on distortion by shattering the mesh into confetti. No metric in the suite
+caught it. Anybody looking at it would have, in a second.
+
+```bash
+blender -b --factory-startup --python tools/render_uv_report.py -- --out renders/
+```
+
+The UV panels are software-rasterised in numpy and written through
+`bpy.data.images`, because `docs/ARCHITECTURE.md` section 0 records that the
+`gpu` module raises `SystemError` in background mode. The 3D views use EEVEE,
+whose identifier differs between the supported builds (`BLENDER_EEVEE_NEXT` on
+4.5.4, `BLENDER_EEVEE` on 5.1.2) and is resolved by probing the enum rather
+than by branching on a version number.
+
+### 7.4 The before column is mandatory
+
+[`tools/benchmark_organic.py`](../tools/benchmark_organic.py) runs the corpus
+against `smart_project`, `unwrap+sharp`, `xatlas` where it is reachable, and
+best-of-N measured **twice**: once with the engine as it was before the
+organic-mesh work, and once with the engine as it is now.
+
+A table of current numbers, however good they look, is not evidence that the
+work helped. The before column is produced by importing a second copy of the
+`unwrap_variations` package from a pristine `git archive` of the pre-work
+commit, in the same Blender process, with `sys.modules` purged in between. Both
+columns are then scored by **one** evaluator, the current one, so the
+comparison measures generation and nothing else.
+
+Two guards are printed on every run:
+
+- the resolved package path and a hash of `core/engine.py` for each root, so a
+  reader can see the two columns really ran different code;
+- a hash of `core/metrics.py` and `core/evaluator.py` in both roots. ORGANIC.md
+  rule 1 freezes the scorer for this work; if it moved anyway, every margin is
+  meaningless and the script says so in capitals rather than quietly publishing
+  it. Hashes are taken after normalising line endings, because `git archive` on
+  Windows honours `core.autocrlf` and would otherwise make a byte-identical
+  `metrics.py` look changed on every single run.
+
+The verdict rule is the same one [section 4](#4-results) uses -- the median
+margin must clear both the full combined spread and a 1.0-point floor -- for
+the reason two benchmarks in one repository with two different definitions of a
+win is how a project ends up quoting whichever number flatters it.
+
+```bash
+blender -b --factory-startup --python tools/benchmark_organic.py -- \
+    --before-ref e0360e5 --repeats 5
+```
+
+Generation on this corpus is far more expensive than on the primitives, so the
+script cancels a single generation through the engine's own `should_cancel`
+probe after `--gen-timeout` seconds (default 300) and reports the timeout rather
+than hanging. A benchmark whose job is to catch a regression has to survive one.
+
+### 7.5 Reproducing ORGANIC.md section 0
+
+[`tools/diag_organic.py`](../tools/diag_organic.py) regenerates every measured
+number in that contract's section 0 -- Suzanne's per-shell topology computed
+twice by two independent implementations, the exact penalty decomposition and
+ceiling analysis, the overlap classification with a Monte-Carlo cross-check of
+the clipper, and the seam budget -- plus the corpus and oracle report.
+
+```bash
+blender -b --factory-startup --python tools/diag_organic.py -- --corpus
+```
+
+One correction is worth recording rather than burying. The scratch diagnostic
+that produced the section 0.4 seam table also contained an overlap pass, and
+that pass **reported zero overlap on Suzanne**: its Sutherland-Hodgman clipper
+tested the wrong side of each clip edge and never oriented its input, so it
+clipped every counter-clockwise pair away to nothing. Section 0.3's figure came
+from a second, correct implementation. `tools/diag_organic.py` keeps only the
+correct one and cross-checks it against Monte-Carlo integration, so a false
+clean bill of health on the most consequential measurement in the contract
+cannot happen silently again.

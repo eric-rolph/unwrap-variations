@@ -49,6 +49,7 @@ SEAM_STRATEGIES = (
     "ANGLE",
     "CURVATURE",
     "DUAL_GRAPH",
+    "CONCAVE",
     "SMART",
 )
 
@@ -86,6 +87,7 @@ class UnwrapParams:
     curvature_threshold: float = 0.35
     minimize_stretch_iters: int = 0
     average_islands_scale: bool = False
+    max_stretch: float = 1.25
     seed: int = 0
     extra: Mapping[str, Any] = field(default_factory=dict)
 
@@ -116,6 +118,13 @@ class UnwrapParams:
             "pack_rotate": bool(self.pack_rotate),
             "pack_shape_method": self.pack_shape_method,
             "average_islands_scale": bool(self.average_islands_scale),
+            # Chart merging runs after every method, projections included, so
+            # this belongs in the identity of every recipe.  Two candidates that
+            # differ only in whether their islands are merged are genuinely
+            # different layouts, and collapsing them here would mean the grid
+            # could never hold both -- which
+            # ``docs/ORGANIC.md`` section 5 requires it to.
+            "max_stretch": round(float(self.max_stretch), 4),
             "extra": dict(self.extra),
         }
         if self.method == "SMART_PROJECT":
@@ -137,7 +146,7 @@ class UnwrapParams:
             elif self.seam_strategy == "CURVATURE":
                 d["seam_angle_deg"] = round(float(self.seam_angle_deg), 2)
                 d["curvature_threshold"] = round(float(self.curvature_threshold), 4)
-            elif self.seam_strategy == "DUAL_GRAPH":
+            elif self.seam_strategy in ("DUAL_GRAPH", "CONCAVE"):
                 d["curvature_threshold"] = round(float(self.curvature_threshold), 4)
                 d["seed"] = int(self.seed)
         return d
@@ -163,6 +172,7 @@ class UnwrapParams:
                 "ANGLE": "ang%.0f" % self.seam_angle_deg,
                 "CURVATURE": "curv%.2f" % self.curvature_threshold,
                 "DUAL_GRAPH": "dual",
+                "CONCAVE": "conc%.2f" % self.curvature_threshold,
                 "SMART": "smart",
             }.get(self.seam_strategy, self.seam_strategy[:6])
             charts = self.chart_clusters()
@@ -342,6 +352,24 @@ PARAM_SPACE: dict[str, ParamSpec] = {
     ),
     "minimize_stretch_iters": ParamSpec("int", 0, 60, weight=0.8),
     "average_islands_scale": ParamSpec("bool", weight=0.5),
+    # Distortion ceiling for chart merging
+    # (:func:`unwrap_variations.core.charts.merge_charts`).
+    #
+    # The range starts *below* 1.0 on purpose: ``stretch_l2 >= 1.0`` is a
+    # theorem, so any value under it makes every merge unsatisfiable and
+    # reproduces the unmerged layout exactly.  ORGANIC.md section 5 requires
+    # that layout to stay reachable from the grid so a benchmark can attribute
+    # the gain to merging rather than to the whole pipeline at once, and a bound
+    # that merely *discourages* merging would not prove anything.
+    #
+    # It ends at 3.0 because the optimum on Suzanne is measured at **2.5**, well
+    # past the 1.6 this first carried: sweeping three starting candidates on
+    # Blender 5.1.2 with everything else fixed, ``chart12`` scores 43.59 at 1.25
+    # and 49.96 at 2.5, and ``chart4`` 40.18 against 47.40.  It does *not* go
+    # further, because the same sweep shows a real frontier rather than a
+    # monotone dial: at 4.0 both of those collapse (``stretch_l2`` 1.56, mean
+    # angle distortion 15.3 degrees) and score below not merging at all.
+    "max_stretch": ParamSpec("float", 0.0, 3.0, weight=1.5),
 }
 
 
@@ -391,8 +419,23 @@ def chart_recipe(
 #: 4.5.4 it is what wins on all three (icosphere 80.4 against 66.8 for the best
 #: recipe available before, torus 75.3 against 53.8, sphere 81.7 against 72.7).
 ARCHETYPES: tuple[dict[str, Any], ...] = (
-    # Balanced conformal unwrap along sharp edges - the everyday default.
-    {"method": "ANGLE_BASED", "seam_strategy": "SHARP", "island_margin": 0.01},
+    # Balanced conformal unwrap along sharp edges - the everyday default, and
+    # the grid's pinned **unmerged control**.  ``max_stretch`` below 1.0 makes
+    # chart merging unsatisfiable (``stretch_l2 >= 1.0`` is a theorem), so this
+    # slot reproduces the pre-merge pipeline exactly.  ORGANIC.md section 5
+    # requires the unmerged layout to stay reachable so a benchmark can
+    # attribute the gain to merging; it has to be *here*, in the pinned leading
+    # archetypes, because a ten-slot grid is filled entirely from this list and
+    # never reaches the quasi-random fill that samples ``PARAM_SPACE``.
+    # ``1.0`` would *not* do: an exactly isometric merge -- two coplanar islands
+    # on a hard-surface model -- measures exactly 1.0 and is a free win worth
+    # keeping, so only a bound strictly below it means "off".
+    {
+        "method": "ANGLE_BASED",
+        "seam_strategy": "SHARP",
+        "island_margin": 0.01,
+        "max_stretch": 0.0,
+    },
     # Classic Smart UV Project at Blender's own default angle.
     {
         "method": "SMART_PROJECT",
@@ -402,13 +445,22 @@ ARCHETYPES: tuple[dict[str, Any], ...] = (
     },
     # Six charts, conformal: the "cube map" answer, and the one that carries a
     # closed smooth surface.
-    chart_recipe(6, method="ANGLE_BASED"),
+    # ``max_stretch`` here and on the twelve-chart entry below are what make the
+    # pinned core actually *span* the merge dial.  A ten-slot grid is filled
+    # entirely from this list and never reaches the quasi-random fill that
+    # samples PARAM_SPACE, so without a spread written in, every candidate would
+    # share one bound and the grid could not find the frontier.  The pinned six
+    # therefore carry {0.0 (off), 1.25, 1.25, 1.25, 2.5, 2.5}: an unmerged
+    # control, the conservative default, and the aggressive end.  2.5 is not
+    # tuning to Suzanne for its own sake -- it is the far end of the useful
+    # range, past which the measured sweep shows the layout collapsing.
+    chart_recipe(6, method="ANGLE_BASED", max_stretch=2.5),
     # Three big charts relaxed for stretch: the fewest cuts that still avoid a
     # folded-over layout on an organic model.
     chart_recipe(3, method="MINIMUM_STRETCH", chart_seed=3, iterations=30),
     # Twelve charts: small, flat, fold-free - the safe pick on a lumpy organic
     # model where a coarse chart folds over itself.
-    chart_recipe(12, method="ANGLE_BASED", chart_seed=11),
+    chart_recipe(12, method="ANGLE_BASED", chart_seed=11, max_stretch=2.5),
     # Few, well-placed cuts from the dual-graph solver. On a faceted mesh this
     # is the isometric polyhedral net, and nothing else in the set produces it:
     # a cube comes out as its 7-edge cross, one island, stretch exactly 1.0.
@@ -419,6 +471,28 @@ ARCHETYPES: tuple[dict[str, Any], ...] = (
         "island_margin": 0.005,
     },
     # ---- end of the always-tried core (see _ARCHETYPE_CORE) ----------------
+    # Concavity-weighted minimum cut: the organic-mesh answer, and the first
+    # entry of the shuffled tail.  It is the only strategy here that both
+    # *always* opens a closed surface and places its cuts where an artist
+    # would, so it is the natural counterpart to the chart cuts above -- those
+    # open a closed mesh too, but land their seams on cube-map boundaries in
+    # the middle of a face (BENCHMARKS.md section 4.4).
+    #
+    # The threshold is 0.15 and not the field default of 0.35 because it was
+    # measured, one recipe at a time on Blender 5.1.2 with refinement off:
+    # Suzanne 41.19 against 35.40, cone 63.38 against 49.31, cube 73.48 against
+    # 73.47, at the cost of sphere 62.58 against 68.45 and torus 52.26 against
+    # 59.45.  It has the higher mean and, more to the point, the higher
+    # *minimum* -- the top of the range is where this strategy gets dangerous
+    # (0.90 cuts Suzanne into 5 charts for a stretch of 5.25 and a score of
+    # 0.55), and a pinned archetype should not sit near that edge.  The grid
+    # samples the rest of the range itself.
+    {
+        "method": "ANGLE_BASED",
+        "seam_strategy": "CONCAVE",
+        "curvature_threshold": 0.15,
+        "island_margin": 0.01,
+    },
     # The cube-map charts relaxed for stretch: best texel-density uniformity.
     chart_recipe(6, method="MINIMUM_STRETCH", chart_seed=7, iterations=30),
     # Aggressive Smart Project: many small, low-distortion islands.
@@ -495,7 +569,7 @@ ARCHETYPES: tuple[dict[str, Any], ...] = (
 #: handful that carry the common cases are pinned to the front and only the tail
 #: is shuffled.  Measured across seeds 1, 2, 7 and 42 the winner is the same
 #: recipe on every mesh with this in place.
-_ARCHETYPE_CORE = 6
+_ARCHETYPE_CORE = 7
 
 #: Cluster counts and solvers the grid's quasi-random fill draws chart cuts
 #: from.  Kept separate from :data:`ARCHETYPES` because these exist to fill
@@ -596,9 +670,36 @@ def sample_grid(
 
     # Pin the leading archetypes so the grid's coverage does not depend on the
     # seed, and shuffle only the tail.  See _ARCHETYPE_CORE.
-    # Never pin more than two thirds of the slots, so a small grid still gets
-    # variety and a seed still means something.
-    core = min(_ARCHETYPE_CORE, max(1, (count * 2) // 3), len(ARCHETYPES))
+    # Never pin more than three quarters of the slots, so a small grid still
+    # gets variety and a seed still means something.
+    #
+    # This was two thirds, which capped a 10-slot grid at six pinned entries and
+    # left CONCAVE -- the organic-mesh strategy, at index 6 -- in the shuffled
+    # tail.  It then appeared in only 13 of 30 seeds, which made the flagship
+    # result partly luck.  Measured on Suzanne over seeds 1, 2, 3, 7 and 42,
+    # refinement on, Blender 5.1.2:
+    #
+    #   two thirds (CONCAVE unpinned): median 46.28, min 38.45, spread 10.00
+    #   three quarters (CONCAVE pinned): median 46.49, min 43.13, spread 5.32
+    #
+    # Same median, but the floor rises nearly five points and the spread halves.
+    # A user pressing Generate should not get 38 or 48 depending on a seed they
+    # never chose, so this trades a lucky maximum for a dependable one.
+    #
+    # It is not free, and the cost is not where it was expected.  The worry was
+    # that pinning a seventh archetype would squeeze out DUAL_GRAPH and hurt the
+    # cube and the cylinder; measured over the same five seeds, both are
+    # **unchanged to 0.00**.  The mesh that pays is the **torus**: median 55.92
+    # to 54.04, minimum 52.77 to 52.27.  The median drop crosses the 1.0-point
+    # floor the benchmark uses, so it is a real cost and not noise, although the
+    # two ranges do overlap and one five-seed sweep is thin evidence.
+    #
+    # Kept anyway, because the trade is heavily in favour: the torus loses 1.88
+    # of median while Suzanne gains 2.83 of median and **7.75 of minimum**, and
+    # organic meshes are the case this entire body of work exists to serve.
+    # Recorded rather than buried so anyone revisiting it starts from the
+    # measurement rather than from the intention.
+    core = min(_ARCHETYPE_CORE, max(1, (count * 3) // 4), len(ARCHETYPES))
     order = list(range(core))
     tail = list(range(core, len(ARCHETYPES)))
     if seed:

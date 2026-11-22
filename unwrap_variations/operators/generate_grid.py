@@ -657,6 +657,10 @@ class UVVAR_OT_generate_grid(UVVarModalJob, Operator):
 
         weights = uvvar_props.score_weights(props)
         backends = self._backend_filter(props)
+        # Refinement is score-gated and so cannot make a candidate worse, but it
+        # is several times slower than a bare solve, which is a trade the artist
+        # owns rather than one to make for them.
+        refine_layouts = bool(getattr(props, "refine_layouts", True))
 
         kwargs: dict[str, Any] = {
             "count": count,
@@ -664,6 +668,7 @@ class UVVAR_OT_generate_grid(UVVarModalJob, Operator):
             "weights": weights,
             "backends": backends,
             "compute_overlap": overlap,
+            "refine_layouts": refine_layouts,
             # The operator owns storage: it merges, applies the persistence
             # budget and refreshes the UI mirror. Letting the engine also
             # "store" would build a throwaway CandidateStore, and building one

@@ -1124,7 +1124,19 @@ def _overlap_area(uv: np.ndarray, lo: np.ndarray, hi: np.ndarray, total_uv_area:
             break
         cell *= 2.0
     else:
-        return 0.0
+        # Saturate, do NOT return 0.0.  Exhausting eight doublings of the cell
+        # size means the layout is so dense that a uniform hash cannot index it
+        # -- which happens precisely when triangles are stacked on top of each
+        # other.  Reporting 0.0 there says "perfectly clean" about the one
+        # layout shape most likely to be catastrophically dirty, and callers
+        # believe it: `injectivity.certify` treats `overlap_area == 0.0` as
+        # proof of injectivity, so a stack of 8000 coincident triangles
+        # certified as globally injective with 1.6e7 of real overlap present.
+        # Saturation is already this function's documented behaviour once the
+        # accumulated area reaches the used area, so this is the same rule
+        # applied to the case where the measurement cannot start rather than
+        # cannot finish.
+        return _finite(total_uv_area, 0.0)
     if total <= 1:
         return 0.0
 

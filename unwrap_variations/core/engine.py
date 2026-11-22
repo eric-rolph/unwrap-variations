@@ -34,6 +34,7 @@ import numpy as np
 
 from ..backends import seams as seam_mod
 from ..backends.base import UnwrapRequest, get_backend
+from . import refine as refine_mod
 from .candidate import Candidate, CandidateStore
 from .evaluator import evaluate
 from .meshdata import UVMeshSample
@@ -173,7 +174,9 @@ def derive_uv_seams(
     tv_b, tl_b = sample.tri_verts[fb], sample.tri_loops[fb]
     rows = np.arange(idx.size)
 
-    def corner_loops(tv: np.ndarray, tl: np.ndarray, vert: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def corner_loops(
+        tv: np.ndarray, tl: np.ndarray, vert: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Loop index of ``vert`` within each face, plus a found mask."""
         eq = tv == vert[:, None]
         found = eq.any(axis=1)
@@ -791,11 +794,17 @@ def _run_recipes(
     compute_overlap: bool,
     parent_signature: str | None,
     generation: int,
+    refine_layouts: bool = True,
 ) -> GenerationReport:
     """Execute a list of recipes against ``obj`` and return a ranked report.
 
     This is the shared body of :func:`generate` and :func:`branch`; the only
     thing that differs between them is how the recipe list was produced.
+
+    ``refine_layouts`` runs the post-solver chain in
+    :mod:`unwrap_variations.core.refine`.  It defaults to on because every
+    stage in it is score-gated and therefore cannot make a candidate worse; the
+    flag exists so a benchmark can measure the pre-refinement pipeline exactly.
     """
     from . import bridge  # imported lazily: only this path needs bpy
 
@@ -915,6 +924,37 @@ def _run_recipes(
                 continue
             previous_uvs = uvs
 
+            # Post-solver refinement: merge over-cut charts, repair folds. The
+            # chain scores every stage against the frozen scorer and discards
+            # any that does not improve it, so this can only help -- see
+            # refine.refine and docs/ORGANIC.md section 1, Rule 2.
+            if refine_layouts:
+                outcome = refine_mod.refine(
+                    sample,
+                    uvs,
+                    params=params,
+                    weights=weights,
+                    topo=topo,
+                    derive_seams=derive_uv_seams,
+                    # Packing needs bpy, which core/ may not import, so the
+                    # chain gets it as a callable. It is applied *inside* the
+                    # chain because a merged layout has to be repacked before
+                    # it is scored -- see refine.refine's `repack` argument.
+                    repack=lambda arr, p=params: _repack(obj, arr, sample, p),
+                    # Merging decides where to cut; ABF flattens better than
+                    # the fallback descent, so the merged cuts go back through
+                    # the real solver. Both results are measured and the better
+                    # one wins -- see refine.refine's `resolve` argument.
+                    resolve=lambda mask, p=params, b=backend: _resolve(
+                        obj, sample, mask, p, b
+                    ),
+                    compute_overlap=compute_overlap,
+                )
+                if outcome.changed:
+                    uvs = np.asarray(outcome.uvs, dtype=np.float32).reshape(-1, 2)
+                for note in outcome.notes:
+                    report.warnings.append("%s: %s" % (params.describe(), note))
+
             try:
                 seam_mask = derive_uv_seams(sample, topo, uvs)
                 measured = sample.with_uvs(uvs).with_seams(seam_mask)
@@ -958,6 +998,101 @@ def _run_recipes(
     _rank_in_place(report.candidates, weights)
     report.seconds = time.perf_counter() - started
     return report
+
+
+def _repack(obj: Any, uvs: np.ndarray, sample: UVMeshSample, params: UnwrapParams):
+    """Repack ``uvs`` with Blender's packer, or return ``None`` if it cannot run.
+
+    Delegates to :func:`backends.blender_native.repack_uvs`, which owns the two
+    packing fixes that are load-bearing and easy to lose (see ARCHITECTURE
+    section 0): the UV selection that stops 4.5 cancelling ``pack_islands``
+    outright, and the ``AABB`` shape-method substitution on small meshes.
+    """
+    try:
+        from ..backends.blender_native import repack_uvs
+    except Exception:  # noqa: BLE001 - no bpy, no repack; not an error
+        return None
+    try:
+        return repack_uvs(obj, uvs, params, sample.n_tris)
+    except Exception:  # noqa: BLE001 - repacking is an optimisation
+        return None
+
+
+#: Solver used when re-flattening a merged cut set. ABF is Blender's
+#: angle-preserving solver and is what makes the re-solve worth doing at all;
+#: the merge stage's own fallback flattener minimises symmetric Dirichlet
+#: energy, which is a different objective and measurably worse on angles.
+_RESOLVE_METHOD = "ANGLE_BASED"
+
+
+def _resolve(
+    obj: Any,
+    sample: UVMeshSample,
+    seam_mask: np.ndarray,
+    params: UnwrapParams,
+    backend: Any,
+):
+    """Re-run the backend against a caller-supplied cut set.
+
+    The refinement chain uses this to hand a merged chart partition back to
+    Blender's own solver.  Returns ``None`` on any failure, which simply means
+    the chain keeps whatever layout it already had.
+    """
+    try:
+        from dataclasses import replace as _replace
+
+        request_params = _replace(
+            params, seam_strategy="EXISTING", method=_RESOLVE_METHOD
+        )
+        result = backend.safe_unwrap(
+            UnwrapRequest(
+                obj_name=obj.name,
+                params=request_params,
+                sample=sample.with_seams(seam_mask),
+            )
+        )
+    except Exception:  # noqa: BLE001 - re-solving is an optimisation
+        return None
+    if not result.ok or result.uvs is None:
+        return None
+    arr = np.asarray(result.uvs, dtype=np.float64).reshape(-1, 2)
+    if arr.shape[0] != sample.n_loops or not np.isfinite(arr).all():
+        return None
+    # The solver reports success even when it did nothing (ARCHITECTURE
+    # section 0), so an unchanged buffer has to be caught here rather than
+    # trusted.
+    if dead_layout_reason(arr):
+        return None
+    return arr
+
+
+def _keep_better(
+    sample: UVMeshSample,
+    topo: Any,
+    current: np.ndarray,
+    candidate: np.ndarray,
+    weights: ScoreWeights,
+    compute_overlap: bool,
+) -> tuple[np.ndarray, str]:
+    """Return whichever of two layouts scores higher, and why.
+
+    Rule 2 of ``docs/ORGANIC.md`` applies to repacking exactly as it does to
+    the refinement stages: packing can in principle make a layout worse (it
+    rescales islands, which moves texel density and can introduce overlap), so
+    it is measured rather than assumed.
+    """
+    def measure(arr):
+        try:
+            measured = sample.with_uvs(arr).with_seams(derive_uv_seams(sample, topo, arr))
+            return score(evaluate(measured, compute_overlap=compute_overlap), weights)
+        except Exception:  # noqa: BLE001
+            return float("-inf")
+
+    before, after = measure(current), measure(candidate)
+    if after > before:
+        return np.asarray(candidate, dtype=np.float32).reshape(-1, 2), \
+            "improved %.2f -> %.2f" % (before, after)
+    return current, "discarded (%.2f -> %.2f)" % (before, after)
 
 
 def _rank_in_place(candidates: list[Candidate], weights: ScoreWeights) -> None:
@@ -1021,6 +1156,7 @@ def generate(
     should_cancel: CancelFn | None = None,
     compute_overlap: bool = True,
     store: bool = True,
+    refine_layouts: bool = True,
 ) -> GenerationReport:
     """Produce ``count`` distinct unwrap candidates for ``obj``.
 
@@ -1086,6 +1222,7 @@ def generate(
             compute_overlap=compute_overlap,
             parent_signature=None,
             generation=0,
+            refine_layouts=refine_layouts,
         )
         _merge(report, part, target)
         if part.cancelled:

@@ -45,12 +45,24 @@ from unwrap_variations.core.meshdata import UVMeshSample, make_sample  # noqa: E
 #: * ``sphere_planar``  - the deliberate bad-unwrap control: half its triangles
 #:                        flipped and heavy self-overlap.  Any metric suite that
 #:                        does not flag this loudly is broken.
+#: * ``suzanne_organic_baseline`` - the layout ``docs/ORGANIC.md`` section 0 is
+#:                        measured against: 14 islands, seam_ratio 8.9556,
+#:                        overlap_area 0.0013420951 concentrated in charts 9 and
+#:                        10, zero flipped triangles.  It is pinned here because
+#:                        it USED to be reproducible as
+#:                        ``engine.generate(count=10, seed=1)``'s winner and is
+#:                        not any more -- adding the ``CONCAVE`` strategy changed
+#:                        the recipe grid.  Two separate agents wrote acceptance
+#:                        criteria against "the seed-1 winner" and both had the
+#:                        ground move under them.  Pin the artefact, not the
+#:                        procedure that happened to produce it.
 CORPUS_NAMES = (
     "cube_project",
     "nonmanifold",
     "hardsurface",
     "sphere_smart",
     "sphere_planar",
+    "suzanne_organic_baseline",
 )
 
 #: Corpus meshes small enough for the O(T^2) reference overlap pass.

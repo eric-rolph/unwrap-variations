@@ -535,7 +535,11 @@ class CandidateStore:
             # Deleting the key first round-trips exactly.
             if hasattr(mesh, "pop"):
                 mesh.pop(self.ID_KEY, None)
-            elif self.ID_KEY in mesh.keys():
+            # noqa: SIM118 is deliberate. This branch exists for objects that
+            # are not full Blender IDs, and `.keys()` is the one membership
+            # interface every stand-in implements; `in` on an RNA type can be
+            # overridden to mean something else entirely.
+            elif self.ID_KEY in mesh.keys():  # noqa: SIM118
                 del mesh[self.ID_KEY]
             mesh[self.ID_KEY] = blob
         except Exception as exc:  # noqa: BLE001
